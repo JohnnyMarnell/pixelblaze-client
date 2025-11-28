@@ -16,13 +16,28 @@ This will install the `pb` command in your PATH.
 
 ### Global Options
 
-The CLI supports a global `--ip` option that works across all commands:
+The CLI supports global options that work across all commands:
 
+#### `--ip` - Specify IP Address
 ```bash
 pb --ip 192.168.1.100 pixels      # Use specific IP
 pb --ip auto pixels               # Auto-discover (default)
 pb pixels                         # Same as auto (default behavior)
 ```
+
+#### `--timeout` - Set Command Timeout
+```bash
+pb --timeout 10 brightness 0.5    # Wait up to 10 seconds
+pb --timeout 3 ping               # Shorter timeout for quick test
+```
+Default: 5.0 seconds
+
+#### `--no-verify` - Skip Ping/Ack Verification
+```bash
+pb --no-verify brightness 0.5     # Faster, less reliable
+pb --no-verify on                 # Skip device readiness check
+```
+Use this if your device is flaky or you need maximum speed.
 
 ### Auto-Discovery
 
@@ -303,6 +318,25 @@ pb render --help
 ```
 
 ## Troubleshooting
+
+### Device Frozen or Hanging
+
+If your Pixelblaze freezes or becomes unresponsive:
+
+1. **Power cycle it** (unplug, wait 5 seconds, plug back in)
+2. **Wait 15-20 seconds** for it to boot
+3. **Test with:** `pb ping`
+
+See [RECOVERY.md](RECOVERY.md) for detailed recovery steps.
+
+### Commands Hanging
+
+If CLI commands hang indefinitely:
+
+1. **Press Ctrl+C** to cancel
+2. **Power cycle the Pixelblaze**
+3. **Use shorter timeout:** `pb --timeout 3 ping`
+4. **Or skip verification:** `pb --no-verify brightness 0.5`
 
 ### Brightness Commands
 

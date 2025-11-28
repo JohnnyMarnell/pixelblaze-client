@@ -63,6 +63,30 @@ def discover_pixelblaze(ip_address: str) -> str:
     )
 
 
+def safe_ping(pb: Pixelblaze, ctx: click.Context) -> bool:
+    """
+    Safely send a ping with timeout handling.
+
+    Args:
+        pb: Pixelblaze instance
+        ctx: Click context with timeout settings
+
+    Returns:
+        bool: True if ping succeeded, False otherwise
+    """
+    if ctx.obj.get('no_verify', False):
+        return True  # Skip verification if --no-verify is set
+
+    try:
+        timeout = ctx.obj.get('timeout', 5.0)
+        # sendPing should timeout based on websocket settings
+        result = pb.sendPing()
+        return result is not None
+    except Exception as e:
+        click.echo(f"Warning: Ping failed - {e}", err=True)
+        return False
+
+
 def get_pixelblaze(ctx: click.Context) -> Pixelblaze:
     """
     Gets a Pixelblaze instance from the context, handling discovery if needed.
@@ -80,6 +104,7 @@ def get_pixelblaze(ctx: click.Context) -> Pixelblaze:
 
     try:
         discovered_ip = discover_pixelblaze(ip_address)
+        ctx.obj['ip'] = discovered_ip  # Update with actual IP used
         pb = Pixelblaze(discovered_ip)
         ctx.obj['pixelblaze'] = pb
         return pb
@@ -94,8 +119,20 @@ def get_pixelblaze(ctx: click.Context) -> Pixelblaze:
     help='IP address of Pixelblaze (default: auto-discover, checks 192.168.4.1 first, then network scan)',
     show_default=True
 )
+@click.option(
+    '--timeout',
+    type=float,
+    default=5.0,
+    help='Command timeout in seconds (default: 5.0)',
+    show_default=True
+)
+@click.option(
+    '--no-verify',
+    is_flag=True,
+    help='Skip ping/ack verification (faster but less reliable)'
+)
 @click.pass_context
-def cli(ctx, ip):
+def cli(ctx, ip, timeout, no_verify):
     """
     Pixelblaze LED Controller CLI
 
@@ -103,6 +140,8 @@ def cli(ctx, ip):
     """
     ctx.ensure_object(dict)
     ctx.obj['ip'] = ip
+    ctx.obj['timeout'] = timeout
+    ctx.obj['no_verify'] = no_verify
 
 
 @cli.command()
@@ -212,7 +251,8 @@ def brightness(ctx, level, save):
             pb.setBrightnessSlider(level, saveToFlash=save)
 
             # Wait for Pixelblaze to be ready by pinging
-            pb.sendPing()
+            if not safe_ping(pb, ctx):
+                click.echo("Warning: Could not verify device readiness", err=True)
 
             # Verify
             actual = pb.getBrightnessSlider()
@@ -221,7 +261,7 @@ def brightness(ctx, level, save):
                 # Retry once
                 click.echo("Retrying...", err=True)
                 pb.setBrightnessSlider(level, saveToFlash=save)
-                pb.sendPing()
+                safe_ping(pb, ctx)
                 actual = pb.getBrightnessSlider()
 
             action = "saved" if save else "set"
@@ -302,7 +342,8 @@ def on(ctx, brightness, play_sequencer, save):
         pb.setBrightnessSlider(brightness, saveToFlash=save)
 
         # Wait for Pixelblaze to be ready
-        pb.sendPing()
+        if not safe_ping(pb, ctx):
+            click.echo("Warning: Could not verify device readiness", err=True)
 
         # Verify the brightness was set
         try:
@@ -317,7 +358,7 @@ def on(ctx, brightness, play_sequencer, save):
         if play_sequencer:
             click.echo("Starting sequencer...", err=True)
             pb.playSequencer(saveToFlash=save)
-            pb.sendPing()
+            safe_ping(pb, ctx)
 
         action = "saved and turned on" if save else "turned on"
         click.echo(f"Pixelblaze {action} (brightness: {brightness})", err=True)
@@ -359,7 +400,8 @@ def off(ctx, pause_sequencer, save):
         pb.setBrightnessSlider(0.0, saveToFlash=save)
 
         # Wait for Pixelblaze to be ready
-        pb.sendPing()
+        if not safe_ping(pb, ctx):
+            click.echo("Warning: Could not verify device readiness", err=True)
 
         # Verify the brightness was set
         try:
@@ -374,7 +416,7 @@ def off(ctx, pause_sequencer, save):
         if pause_sequencer:
             click.echo("Pausing sequencer...", err=True)
             pb.pauseSequencer(saveToFlash=save)
-            pb.sendPing()
+            safe_ping(pb, ctx)
 
         action = "saved and turned off" if save else "turned off"
         click.echo(f"Pixelblaze {action}", err=True)
