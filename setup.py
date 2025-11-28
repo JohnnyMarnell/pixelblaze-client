@@ -29,8 +29,14 @@ setuptools.setup(
       "websocket-client",
       "requests",
       "pytz",
-      "mini-racer"
+      "mini-racer",
+      "click>=8.0"
     ],
     packages=["pixelblaze"],
     python_requires='>=3.9',
+    entry_points={
+        'console_scripts': [
+            'pb=pixelblaze.cli:main',
+        ],
+    },
 )
