@@ -63,28 +63,18 @@ def discover_pixelblaze(ip_address: str) -> str:
     )
 
 
-def safe_ping(pb: Pixelblaze, ctx: click.Context) -> bool:
+def safe_wait(ctx: click.Context, delay_ms: int = 150):
     """
-    Safely send a ping with timeout handling.
+    Wait a short time for the device to process, unless --no-verify is set.
 
     Args:
-        pb: Pixelblaze instance
-        ctx: Click context with timeout settings
-
-    Returns:
-        bool: True if ping succeeded, False otherwise
+        ctx: Click context
+        delay_ms: Milliseconds to wait (default 150ms)
     """
     if ctx.obj.get('no_verify', False):
-        return True  # Skip verification if --no-verify is set
+        return  # Skip wait if --no-verify is set
 
-    try:
-        timeout = ctx.obj.get('timeout', 5.0)
-        # sendPing should timeout based on websocket settings
-        result = pb.sendPing()
-        return result is not None
-    except Exception as e:
-        click.echo(f"Warning: Ping failed - {e}", err=True)
-        return False
+    time.sleep(delay_ms / 1000.0)
 
 
 def get_pixelblaze(ctx: click.Context) -> Pixelblaze:
@@ -246,26 +236,15 @@ def brightness(ctx, level, save):
             if not 0.0 <= level <= 1.0:
                 raise click.ClickException("Brightness must be between 0.0 and 1.0")
 
-            # Set brightness
+            # Set brightness (fire-and-forget command)
             click.echo(f"Setting brightness to {level}...", err=True)
             pb.setBrightnessSlider(level, saveToFlash=save)
 
-            # Wait for Pixelblaze to be ready by pinging
-            if not safe_ping(pb, ctx):
-                click.echo("Warning: Could not verify device readiness", err=True)
-
-            # Verify
-            actual = pb.getBrightnessSlider()
-            if abs(actual - level) > 0.02:
-                click.echo(f"Warning: Set to {level}, read back {actual:.2f}", err=True)
-                # Retry once
-                click.echo("Retrying...", err=True)
-                pb.setBrightnessSlider(level, saveToFlash=save)
-                safe_ping(pb, ctx)
-                actual = pb.getBrightnessSlider()
+            # Give the device time to process (small, smart delay)
+            safe_wait(ctx, delay_ms=150)
 
             action = "saved" if save else "set"
-            click.echo(f"Brightness {action} to {actual:.2f}", err=True)
+            click.echo(f"Brightness {action} to {level}", err=True)
 
     except Exception as e:
         raise click.ClickException(f"Failed to manage brightness: {e}")
@@ -337,28 +316,18 @@ def on(ctx, brightness, play_sequencer, save):
         raise click.ClickException("Brightness must be between 0.0 and 1.0")
 
     try:
-        # Set brightness
+        # Set brightness (fire-and-forget)
         click.echo(f"Setting brightness to {brightness}...", err=True)
         pb.setBrightnessSlider(brightness, saveToFlash=save)
 
-        # Wait for Pixelblaze to be ready
-        if not safe_ping(pb, ctx):
-            click.echo("Warning: Could not verify device readiness", err=True)
-
-        # Verify the brightness was set
-        try:
-            actual_brightness = pb.getBrightnessSlider()
-            if abs(actual_brightness - brightness) > 0.01:
-                click.echo(f"Warning: Brightness verification mismatch (set: {brightness}, actual: {actual_brightness})", err=True)
-        except:
-            # If verification fails, just continue
-            pass
+        # Small delay for processing
+        safe_wait(ctx, delay_ms=150)
 
         # Optionally start the sequencer
         if play_sequencer:
             click.echo("Starting sequencer...", err=True)
             pb.playSequencer(saveToFlash=save)
-            safe_ping(pb, ctx)
+            safe_wait(ctx, delay_ms=100)
 
         action = "saved and turned on" if save else "turned on"
         click.echo(f"Pixelblaze {action} (brightness: {brightness})", err=True)
@@ -395,28 +364,18 @@ def off(ctx, pause_sequencer, save):
     pb = get_pixelblaze(ctx)
 
     try:
-        # Set brightness to 0
+        # Set brightness to 0 (fire-and-forget)
         click.echo("Setting brightness to 0...", err=True)
         pb.setBrightnessSlider(0.0, saveToFlash=save)
 
-        # Wait for Pixelblaze to be ready
-        if not safe_ping(pb, ctx):
-            click.echo("Warning: Could not verify device readiness", err=True)
-
-        # Verify the brightness was set
-        try:
-            actual_brightness = pb.getBrightnessSlider()
-            if actual_brightness > 0.01:
-                click.echo(f"Warning: Brightness verification mismatch (expected: 0, actual: {actual_brightness})", err=True)
-        except:
-            # If verification fails, just continue
-            pass
+        # Small delay for processing
+        safe_wait(ctx, delay_ms=150)
 
         # Optionally pause the sequencer
         if pause_sequencer:
             click.echo("Pausing sequencer...", err=True)
             pb.pauseSequencer(saveToFlash=save)
-            safe_ping(pb, ctx)
+            safe_wait(ctx, delay_ms=100)
 
         action = "saved and turned off" if save else "turned off"
         click.echo(f"Pixelblaze {action}", err=True)

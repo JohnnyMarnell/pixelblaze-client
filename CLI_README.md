@@ -32,12 +32,12 @@ pb --timeout 3 ping               # Shorter timeout for quick test
 ```
 Default: 5.0 seconds
 
-#### `--no-verify` - Skip Ping/Ack Verification
+#### `--no-verify` - Skip Processing Delays
 ```bash
-pb --no-verify brightness 0.5     # Faster, less reliable
-pb --no-verify on                 # Skip device readiness check
+pb --no-verify brightness 0.5     # Skip 150ms delay (instant, but risky)
+pb --no-verify on                 # Maximum speed mode
 ```
-Use this if your device is flaky or you need maximum speed.
+Use this for rapid commands when you trust the device can keep up. **Warning:** May cause device instability if commands are sent too fast.
 
 ### Auto-Discovery
 
@@ -112,7 +112,7 @@ pb brightness 1         # Full brightness
 pb brightness 0.3 --save  # Set to 30% and save to flash
 ```
 
-This command uses the Pixelblaze ping/ack mechanism to ensure the device is ready before verification, eliminating the need for arbitrary delays.
+This command uses a smart 150ms delay to give the device time to process the command. Use `--no-verify` to skip the delay for maximum speed.
 
 #### `pixels` - Get or Set Pixel Count
 
@@ -351,26 +351,22 @@ pb on 0.5
 ```
 
 The `brightness` command includes:
-- Ping/ack handshake to ensure device readiness (no arbitrary delays!)
-- Automatic verification of the set value
-- Automatic retry if verification fails
-- Better error reporting
+- Smart 150ms delay for device processing
+- No aggressive verification (prevents device overload)
+- Simple, reliable operation
+- Optional `--no-verify` for speed
 
-### How It Works: Ping/Ack Mechanism
+### How It Works: Smart Delays
 
-Instead of using arbitrary `sleep()` delays, the CLI uses the Pixelblaze's built-in ping/ack protocol:
+Brightness commands in the Pixelblaze library are **fire-and-forget** - they send the command and return immediately without waiting for acknowledgment. To prevent device overload:
 
-1. Command is sent (e.g., set brightness)
-2. CLI sends a ping request
-3. CLI waits for acknowledgment from Pixelblaze
-4. Once ack is received, the device is ready
-5. Next command can be sent or value verified
+1. Command is sent (e.g., set brightness to 0.5)
+2. CLI waits 150ms for device to process
+3. Done!
 
-This is more reliable than fixed delays because:
-- It adapts to actual network latency
-- It waits for the device to actually be ready
-- It doesn't wait longer than necessary
-- It's the same mechanism the web UI uses
+**Why NOT ping/ack?** Because sending additional verification messages after a fire-and-forget command floods the device's websocket buffer, causing crashes. We learned this the hard way!
+
+**Why 150ms?** Testing showed this is enough time for the Pixelblaze to process the command without unnecessary waiting. You can skip it with `--no-verify` if you're confident your device can handle rapid commands.
 
 ## Architecture
 
