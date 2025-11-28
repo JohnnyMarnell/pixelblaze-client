@@ -106,6 +106,75 @@ def cli(ctx, ip):
 
 
 @cli.command()
+@click.option(
+    '--count',
+    '-c',
+    type=int,
+    default=5,
+    help='Number of pings to send (default: 5)'
+)
+@click.pass_context
+def ping(ctx, count):
+    """
+    Test connection latency to the Pixelblaze.
+
+    Sends ping requests and measures round-trip time to determine
+    network latency and Pixelblaze responsiveness.
+
+    \b
+    Examples:
+        pb ping              # Send 5 pings (default)
+        pb ping -c 10        # Send 10 pings
+        pb ping --count 3    # Send 3 pings
+    """
+    pb = get_pixelblaze(ctx)
+
+    click.echo(f"Pinging Pixelblaze at {ctx.obj['ip']}...\n", err=True)
+
+    times = []
+    successful = 0
+    failed = 0
+
+    for i in range(count):
+        try:
+            start = time.time()
+            response = pb.sendPing()
+            elapsed = (time.time() - start) * 1000  # Convert to milliseconds
+
+            if response is not None:
+                successful += 1
+                times.append(elapsed)
+                click.echo(f"Ping {i+1}: {elapsed:.2f}ms", err=True)
+            else:
+                failed += 1
+                click.echo(f"Ping {i+1}: timeout", err=True)
+
+            # Small delay between pings
+            if i < count - 1:
+                time.sleep(0.1)
+
+        except Exception as e:
+            failed += 1
+            click.echo(f"Ping {i+1}: error - {e}", err=True)
+
+    # Summary
+    if times:
+        min_time = min(times)
+        max_time = max(times)
+        avg_time = sum(times) / len(times)
+
+        click.echo(f"\n--- Ping statistics ---", err=True)
+        click.echo(f"Packets: Sent = {count}, Received = {successful}, Lost = {failed} ({failed*100//count}% loss)", err=True)
+        click.echo(f"Round-trip times: min = {min_time:.2f}ms, max = {max_time:.2f}ms, avg = {avg_time:.2f}ms", err=True)
+
+        # Output machine-readable average for scripting
+        click.echo(f"{avg_time:.2f}")
+    else:
+        click.echo(f"\nAll pings failed", err=True)
+        raise click.ClickException("Failed to ping Pixelblaze")
+
+
+@cli.command()
 @click.argument('level', type=float, required=False)
 @click.option(
     '--save',
@@ -142,8 +211,8 @@ def brightness(ctx, level, save):
             click.echo(f"Setting brightness to {level}...", err=True)
             pb.setBrightnessSlider(level, saveToFlash=save)
 
-            # Give the Pixelblaze time to process
-            time.sleep(0.35)
+            # Wait for Pixelblaze to be ready by pinging
+            pb.sendPing()
 
             # Verify
             actual = pb.getBrightnessSlider()
@@ -152,7 +221,7 @@ def brightness(ctx, level, save):
                 # Retry once
                 click.echo("Retrying...", err=True)
                 pb.setBrightnessSlider(level, saveToFlash=save)
-                time.sleep(0.35)
+                pb.sendPing()
                 actual = pb.getBrightnessSlider()
 
             action = "saved" if save else "set"
@@ -232,8 +301,8 @@ def on(ctx, brightness, play_sequencer, save):
         click.echo(f"Setting brightness to {brightness}...", err=True)
         pb.setBrightnessSlider(brightness, saveToFlash=save)
 
-        # Give the Pixelblaze time to process the brightness change
-        time.sleep(0.3)
+        # Wait for Pixelblaze to be ready
+        pb.sendPing()
 
         # Verify the brightness was set
         try:
@@ -248,7 +317,7 @@ def on(ctx, brightness, play_sequencer, save):
         if play_sequencer:
             click.echo("Starting sequencer...", err=True)
             pb.playSequencer(saveToFlash=save)
-            time.sleep(0.2)
+            pb.sendPing()
 
         action = "saved and turned on" if save else "turned on"
         click.echo(f"Pixelblaze {action} (brightness: {brightness})", err=True)
@@ -289,8 +358,8 @@ def off(ctx, pause_sequencer, save):
         click.echo("Setting brightness to 0...", err=True)
         pb.setBrightnessSlider(0.0, saveToFlash=save)
 
-        # Give the Pixelblaze time to process the brightness change
-        time.sleep(0.3)
+        # Wait for Pixelblaze to be ready
+        pb.sendPing()
 
         # Verify the brightness was set
         try:
@@ -305,7 +374,7 @@ def off(ctx, pause_sequencer, save):
         if pause_sequencer:
             click.echo("Pausing sequencer...", err=True)
             pb.pauseSequencer(saveToFlash=save)
-            time.sleep(0.2)
+            pb.sendPing()
 
         action = "saved and turned off" if save else "turned off"
         click.echo(f"Pixelblaze {action}", err=True)

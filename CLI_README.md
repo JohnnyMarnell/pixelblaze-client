@@ -36,6 +36,7 @@ When using `--ip auto` (the default), the CLI will:
 
 | Command | Purpose |
 |---------|---------|
+| `pb ping` | Test connection latency and readiness |
 | `pb brightness [LEVEL]` | Get or set brightness (0.0-1.0) |
 | `pb pixels [COUNT]` | Get or set the number of pixels |
 | `pb on [BRIGHTNESS]` | Turn on LEDs (default: full brightness) |
@@ -48,6 +49,37 @@ When using `--ip auto` (the default), the CLI will:
 | `pb render CODE` | Compile and run JavaScript pattern code |
 
 ### Commands
+
+#### `ping` - Test Connection Latency
+
+Test the connection to your Pixelblaze and measure latency:
+```bash
+pb ping              # Send 5 pings (default)
+pb ping -c 10        # Send 10 pings
+pb ping --count 3    # Send 3 pings
+```
+
+Output shows:
+- Individual ping times
+- Statistics (min/max/avg)
+- Packet loss percentage
+- Machine-readable average on last line
+
+Example output:
+```
+Pinging Pixelblaze at 192.168.1.157...
+
+Ping 1: 12.34ms
+Ping 2: 11.89ms
+Ping 3: 13.05ms
+Ping 4: 12.56ms
+Ping 5: 12.12ms
+
+--- Ping statistics ---
+Packets: Sent = 5, Received = 5, Lost = 0 (0% loss)
+Round-trip times: min = 11.89ms, max = 13.05ms, avg = 12.39ms
+12.39
+```
 
 #### `brightness` - Get or Set Brightness
 
@@ -65,7 +97,7 @@ pb brightness 1         # Full brightness
 pb brightness 0.3 --save  # Set to 30% and save to flash
 ```
 
-This command includes automatic verification and retry logic for reliable brightness control.
+This command uses the Pixelblaze ping/ack mechanism to ensure the device is ready before verification, eliminating the need for arbitrary delays.
 
 #### `pixels` - Get or Set Pixel Count
 
@@ -259,6 +291,7 @@ pb seq pause         # Pause on this one
 Get help on any command:
 ```bash
 pb --help
+pb ping --help
 pb brightness --help
 pb pixels --help
 pb on --help
@@ -284,12 +317,26 @@ pb on 0.5
 ```
 
 The `brightness` command includes:
-- 350ms delay for processing
+- Ping/ack handshake to ensure device readiness (no arbitrary delays!)
 - Automatic verification of the set value
 - Automatic retry if verification fails
 - Better error reporting
 
-All brightness commands now include delays and verification to ensure reliable operation over websocket connections.
+### How It Works: Ping/Ack Mechanism
+
+Instead of using arbitrary `sleep()` delays, the CLI uses the Pixelblaze's built-in ping/ack protocol:
+
+1. Command is sent (e.g., set brightness)
+2. CLI sends a ping request
+3. CLI waits for acknowledgment from Pixelblaze
+4. Once ack is received, the device is ready
+5. Next command can be sent or value verified
+
+This is more reliable than fixed delays because:
+- It adapts to actual network latency
+- It waits for the device to actually be ready
+- It doesn't wait longer than necessary
+- It's the same mechanism the web UI uses
 
 ## Architecture
 
