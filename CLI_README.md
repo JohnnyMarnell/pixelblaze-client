@@ -56,6 +56,9 @@ When using `--ip auto` (the default), the CLI will:
 | `pb pixels [COUNT]` | Get or set the number of pixels |
 | `pb on [BRIGHTNESS]` | Turn on LEDs (default: full brightness) |
 | `pb off` | Turn off LEDs (set brightness to 0) |
+| `pb pattern SEARCH` | Switch to pattern by name (partial match) |
+| `pb config` (or `cfg`) | Fetch and display all configuration |
+| `pb ws JSON` | Send arbitrary websocket JSON command |
 | `pb seq play` | Start/resume the pattern sequencer |
 | `pb seq pause` | Pause the pattern sequencer |
 | `pb seq next` | Advance to next pattern |
@@ -171,6 +174,62 @@ Turn off and save the state to flash (persistent across reboots):
 ```bash
 pb off --save
 ```
+
+#### `pattern` - Switch Patterns by Name
+
+Switch to a pattern using case-insensitive partial or regex matching:
+
+```bash
+pb pattern rainbow              # Match "Rainbow" or "rainbow wave"
+pb pattern "^glit"              # Match patterns starting with "glit"
+pb pattern fire --save          # Match and save selection to flash
+pb pattern "sound.*react"       # Regex match
+pb pattern "exact name" --exact # Require exact match
+```
+
+If no match is found, the command will show all available patterns.
+
+#### `config` (alias: `cfg`) - Fetch All Configuration
+
+Get a complete configuration dump from your Pixelblaze (like the web UI does):
+
+```bash
+pb config              # Pretty-printed JSON
+pb cfg                 # Short alias
+pb config --raw        # Raw JSON for scripting
+```
+
+This fetches:
+- Device configuration
+- Pattern list
+- Playlist
+- Sequencer settings
+- Hardware configuration
+
+Perfect for debugging or scripting.
+
+#### `ws` - Send Raw Websocket Commands
+
+Send arbitrary JSON commands directly to the websocket:
+
+```bash
+# Simple ping
+pb ws '{"ping":true}'
+
+# Get config (wait for response)
+pb ws '{"getConfig":true}' --expect config
+
+# Set brightness
+pb ws '{"brightness":0.5,"save":false}'
+
+# Switch pattern by ID
+pb ws '{"activeProgramId":"wPnJGj5d5hzgeLbZD","save":true}'
+
+# Get playlist
+pb ws '{"getPlaylist":"_defaultplaylist_"}' --expect playlist
+```
+
+Use `--expect` to wait for a specific response key. Without it, commands are fire-and-forget.
 
 #### `seq` - Sequencer Control Commands
 
@@ -292,6 +351,17 @@ pb seq play          # Start the sequencer
 ### Quick pattern shuffle:
 ```bash
 pb seq random        # Jump to random pattern
+pb pattern fire      # Switch to pattern with "fire" in name
+```
+
+### Get full config dump:
+```bash
+pb config > pixelblaze-config.json
+```
+
+### Advanced websocket commands:
+```bash
+pb ws '{"getConfig":true}' --expect config
 ```
 
 ### Manual pattern navigation:
@@ -311,6 +381,9 @@ pb brightness --help
 pb pixels --help
 pb on --help
 pb off --help
+pb pattern --help
+pb config --help
+pb ws --help
 pb seq --help
 pb seq play --help
 pb seq len --help

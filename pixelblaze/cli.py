@@ -11,6 +11,7 @@ import sys
 import socket
 import json
 import time
+import re
 import click
 from typing import Optional, Dict
 from pixelblaze.pixelblaze import Pixelblaze
@@ -568,6 +569,220 @@ def len(ctx, seconds, save):
 
     except Exception as e:
         raise click.ClickException(f"Failed to update playlist durations: {e}")
+
+
+@cli.command()
+@click.argument('search', type=str)
+@click.option(
+    '--save',
+    is_flag=True,
+    help='Save the pattern selection to flash memory'
+)
+@click.option(
+    '--exact',
+    is_flag=True,
+    help='Require exact match instead of partial regex match'
+)
+@click.pass_context
+def pattern(ctx, search, save, exact):
+    """
+    Switch to a pattern by name (case-insensitive partial match).
+
+    SEARCH is a string or regex pattern to match against pattern names.
+    The first matching pattern will be activated.
+
+    \b
+    Examples:
+        pb pattern rainbow              # Match "Rainbow" or "rainbow wave"
+        pb pattern "^glit"              # Match patterns starting with "glit"
+        pb pattern fire --save          # Match "fire" and save selection
+        pb pattern "sound.*react"       # Regex: "sound" followed by "react"
+        pb pattern exact --exact        # Exact match only (case-insensitive)
+    """
+    pb = get_pixelblaze(ctx)
+
+    try:
+        # Get all patterns
+        click.echo("Fetching pattern list...", err=True)
+        patterns = pb.getPatternList()
+
+        if not patterns:
+            raise click.ClickException("No patterns found on Pixelblaze")
+
+        # Search for matching pattern
+        pattern_regex = re.compile(search, re.IGNORECASE)
+        matched_id = None
+        matched_name = None
+
+        for pattern_id, pattern_name in patterns.items():
+            if exact:
+                # Exact match (case-insensitive)
+                if pattern_name.lower() == search.lower():
+                    matched_id = pattern_id
+                    matched_name = pattern_name
+                    break
+            else:
+                # Partial regex match
+                if pattern_regex.search(pattern_name):
+                    matched_id = pattern_id
+                    matched_name = pattern_name
+                    break
+
+        if not matched_id:
+            # Show available patterns for help
+            click.echo(f"\nNo pattern matching '{search}' found.", err=True)
+            click.echo("\nAvailable patterns:", err=True)
+            for pattern_name in sorted(patterns.values()):
+                click.echo(f"  - {pattern_name}", err=True)
+            raise click.ClickException(f"Pattern '{search}' not found")
+
+        # Switch to the pattern
+        click.echo(f"Switching to pattern: {matched_name}", err=True)
+        pb.setActivePattern(matched_id, saveToFlash=save)
+
+        # Small delay for processing
+        safe_wait(ctx, delay_ms=100)
+
+        action = "saved and activated" if save else "activated"
+        click.echo(f"Pattern '{matched_name}' {action}", err=True)
+
+    except Exception as e:
+        raise click.ClickException(f"Failed to switch pattern: {e}")
+
+
+@cli.command(
+    name='config',
+    # aliases=['cfg'] # why is this missing?
+)
+@click.option(
+    '--raw',
+    is_flag=True,
+    help='Output raw JSON instead of pretty-printed'
+)
+@click.pass_context
+def config_cmd(ctx, raw):
+    """
+    Fetch and display all configuration from the Pixelblaze.
+
+    This mimics the web UI's initial configuration fetch, retrieving:
+    - Device config
+    - Pattern list
+    - Playlist
+    - Sequencer settings
+    - And more
+
+    \b
+    Examples:
+        pb config              # Pretty-printed JSON
+        pb config --raw        # Raw JSON for scripting
+    """
+    pb = get_pixelblaze(ctx)
+
+    try:
+        click.echo("Fetching configuration...", err=True)
+
+        config_data = {}
+
+        # Get config settings
+        try:
+            config_data['config'] = pb.getConfigSettings()
+        except Exception as e:
+            click.echo(f"Warning: Could not fetch config: {e}", err=True)
+
+        # Get pattern list
+        try:
+            config_data['patterns'] = pb.getPatternList()
+        except Exception as e:
+            click.echo(f"Warning: Could not fetch patterns: {e}", err=True)
+
+        # Get playlist
+        try:
+            config_data['playlist'] = pb.getSequencerPlaylist()
+        except Exception as e:
+            click.echo(f"Warning: Could not fetch playlist: {e}", err=True)
+
+        # Get sequencer config
+        try:
+            config_data['sequencer'] = pb.getConfigSequencer()
+        except Exception as e:
+            click.echo(f"Warning: Could not fetch sequencer: {e}", err=True)
+
+        # Get hardware config
+        try:
+            config_data['hardware'] = pb.getHardwareConfig()
+        except Exception as e:
+            click.echo(f"Warning: Could not fetch hardware config: {e}", err=True)
+
+        # Output
+        if raw:
+            click.echo(json.dumps(config_data, separators=(',', ':')))
+        else:
+            click.echo(json.dumps(config_data, indent=2))
+
+    except Exception as e:
+        raise click.ClickException(f"Failed to fetch configuration: {e}")
+
+
+@cli.command()
+@click.argument('json_data', type=str)
+@click.option(
+    '--expect',
+    type=str,
+    help='Expected response key (e.g., "ack", "playlist")'
+)
+@click.option(
+    '--timeout',
+    type=float,
+    default=5.0,
+    help='Response timeout in seconds'
+)
+@click.pass_context
+def ws(ctx, json_data, expect, timeout):
+    """
+    Send arbitrary JSON to the Pixelblaze websocket.
+
+    JSON_DATA is the JSON object to send (as a string).
+
+    \b
+    Examples:
+        pb ws '{"ping":true}'
+        pb ws '{"getConfig":true}' --expect config
+        pb ws '{"brightness":0.5,"save":false}'
+        pb ws '{"activeProgramId":"abc123","save":true}'
+        pb ws '{"getPlaylist":"_defaultplaylist_"}' --expect playlist
+    """
+    pb = get_pixelblaze(ctx)
+
+    try:
+        # Parse the JSON
+        try:
+            json_obj = json.loads(json_data)
+        except json.JSONDecodeError as e:
+            raise click.ClickException(f"Invalid JSON: {e}")
+
+        click.echo(f"Sending: {json.dumps(json_obj, separators=(',', ':'))}", err=True)
+
+        # Send the websocket message
+        response = pb.wsSendJson(json_obj, expectedResponse=expect)
+
+        # Display response
+        if response is None:
+            click.echo("No response (fire-and-forget command)", err=True)
+        elif isinstance(response, bytes):
+            click.echo("Binary response:", err=True)
+            click.echo(response.hex())
+        else:
+            click.echo("Response:", err=True)
+            try:
+                # Try to pretty-print JSON response
+                response_json = json.loads(response)
+                click.echo(json.dumps(response_json, indent=2))
+            except:
+                # Not JSON, just print it
+                click.echo(response)
+
+    except Exception as e:
+        raise click.ClickException(f"Websocket command failed: {e}")
 
 
 @cli.command()
