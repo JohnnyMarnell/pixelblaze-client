@@ -254,20 +254,20 @@ def brightness(ctx, level, save):
 @cli.command()
 @click.argument('count', type=int, required=False)
 @click.option(
-    '--save',
+    '--no-save',
     is_flag=True,
-    help='Save the pixel count to flash memory (persistent across reboots)'
+    help='Do not save pixel count to flash (temporary change only)'
 )
 @click.pass_context
-def pixels(ctx, count, save):
+def pixels(ctx, count, no_save):
     """
     Get or set the number of pixels configured on the Pixelblaze.
 
     \b
     Examples:
         pb pixels              # Get current pixel count
-        pb pixels 300          # Set pixel count to 300 (temporary)
-        pb pixels 300 --save   # Set pixel count to 300 (saved to flash)
+        pb pixels 300          # Set pixel count to 300 (saved to flash)
+        pb pixels 300 --no-save   # Set pixel count to 300 (temporary only)
     """
     pb = get_pixelblaze(ctx)
 
@@ -276,11 +276,80 @@ def pixels(ctx, count, save):
             current_count = pb.getPixelCount()
             click.echo(f"{current_count}")
         else:
-            pb.setPixelCount(count, saveToFlash=save)
-            action = "saved" if save else "set"
+            pb.setPixelCount(count, saveToFlash=not no_save)
+            action = "set" if no_save else "saved"
             click.echo(f"Pixel count {action} to {count}", err=True)
     except Exception as e:
         raise click.ClickException(f"Failed to manage pixel count: {e}")
+
+
+@cli.command()
+@click.argument('mapfile', type=click.File('r'), required=False)
+@click.option(
+    '--coords',
+    is_flag=True,
+    help='Show pixel coordinates instead of map function code'
+)
+@click.option(
+    '--raw',
+    is_flag=True,
+    help='Output raw JSON instead of pretty-printed'
+)
+@click.option(
+    '--save',
+    is_flag=True,
+    help='Save the map to flash memory (persistent across reboots)'
+)
+@click.pass_context
+def map(ctx, mapfile, coords, raw, save):
+    """
+    Get or set the pixel map function.
+
+    MAPFILE is an optional JavaScript file to load as the map function.
+    If no file is provided, the current map function is displayed.
+
+    \b
+    Examples:
+        pb map                       # Get current map function
+        pb map map.js                # Set map from file
+        pb map --coords              # Show pixel coordinates (normalized 0-1)
+        pb map map.js --save         # Set map from file and save to flash
+        pb map --coords --raw        # Show coordinates as raw JSON
+    """
+    pb = get_pixelblaze(ctx)
+
+    try:
+        if mapfile is not None:
+            # Set map function from file
+            mapFunction = mapfile.read()
+            click.echo(f"Setting map function from {mapfile.name}...", err=True)
+            pb.setMapFunction(mapFunction)
+            safe_wait(ctx, delay_ms=200)
+
+            if save:
+                click.echo("Saving map to flash...", err=True)
+
+            action = "saved" if save else "set"
+            click.echo(f"Map function {action}", err=True)
+        else:
+            # Get current map
+            if coords:
+                # Show coordinates
+                click.echo("Fetching pixel coordinates...", err=True)
+                coordinates = pb.getMapCoordinates()
+
+                if raw:
+                    click.echo(json.dumps(coordinates, separators=(',', ':')))
+                else:
+                    click.echo(json.dumps(coordinates, indent=2))
+            else:
+                # Show map function (JavaScript code)
+                click.echo("Fetching map function...", err=True)
+                mapFunction = pb.getMapFunction()
+                click.echo(mapFunction)
+
+    except Exception as e:
+        raise click.ClickException(f"Failed to manage pixel map: {e}")
 
 
 @cli.command()
