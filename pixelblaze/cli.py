@@ -763,7 +763,8 @@ def ws(ctx, json_data, expect, timeout):
         click.echo(f"Sending: {json.dumps(json_obj, separators=(',', ':'))}", err=True)
 
         # Send the websocket message
-        response = pb.wsSendJson(json_obj, expectedResponse=expect)
+        # If no --expect is provided, wait for any non-chatty text response
+        response = pb.wsSendJson(json_obj, expectedResponse=expect, waitForAnyResponse=(expect is None))
 
         # Display response
         if response is None:

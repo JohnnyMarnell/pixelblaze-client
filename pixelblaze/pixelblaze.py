@@ -587,12 +587,13 @@ class Pixelblaze:
             except:
                 raise
 
-    def wsSendJson(self, command: dict, *, expectedResponse=None) -> Union[str, bytes, None]:
+    def wsSendJson(self, command: dict, *, expectedResponse=None, waitForAnyResponse=False) -> Union[str, bytes, None]:
         """Send a JSON-formatted command to the Pixelblaze, and optionally wait for a suitable response.
 
         Args:
             command (dict): A Python dictionary which will be sent to the Pixelblaze as a JSON command.
             expectedResponse (str, optional): If present, the initial key of the expected JSON response to the command. Defaults to None.
+            waitForAnyResponse (bool, optional): If True and expectedResponse is None, wait for any non-chatty text response. Defaults to False (fire-and-forget).
 
         Returns:
             Union[str, bytes, None]: The message received from the Pixelblaze (of type bytes for binaryMessageTypes, otherwise of type str), or None if a timeout occurred.
@@ -604,13 +605,14 @@ class Pixelblaze:
                 self._connection_maint()
                 self.ws.send(json.dumps(command, indent=None, separators=(',', ':')).encode("utf-8"))
 
-                if expectedResponse is None:
+                if expectedResponse is None and not waitForAnyResponse:
                     return None
 
                     # If the pipe broke while we were sending, restart from the beginning.
                 if self.connectionBroken: break
 
-                # Wait for the expected response.
+                # Wait for the expected response (or any non-chatty response if waitForAnyResponse=True).
+                response = None
                 while True:
                     # Loop until we get the right text response.
                     if type(expectedResponse) is str:
@@ -623,6 +625,10 @@ class Pixelblaze:
                     # Or the right binary response.
                     elif type(expectedResponse) is self.messageTypes:
                         response = self.wsReceive(binaryMessageType=expectedResponse)
+                        break
+                    # Or just accept any non-chatty text response.
+                    elif waitForAnyResponse:
+                        response = self.wsReceive(binaryMessageType=None)
                         break
                 # Now that we've got the right response, return it.
                 return response
