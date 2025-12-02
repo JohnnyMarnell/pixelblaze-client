@@ -207,12 +207,12 @@ def ping(ctx, count):
 @cli.command()
 @click.argument('level', type=float, required=False)
 @click.option(
-    '--save',
+    '--no-save',
     is_flag=True,
-    help='Save the brightness to flash memory (persistent across reboots)'
+    help='Do not save brightness to flash (temporary change only)'
 )
 @click.pass_context
-def brightness(ctx, level, save):
+def brightness(ctx, level, no_save):
     """
     Get or set the brightness level.
 
@@ -221,9 +221,9 @@ def brightness(ctx, level, save):
     \b
     Examples:
         pb brightness           # Get current brightness
-        pb brightness 0.5       # Set brightness to 50%
-        pb brightness 0 --save  # Set to 0 and save to flash
-        pb brightness 1         # Set to full brightness
+        pb brightness 0.5       # Set brightness to 50% (saved to flash)
+        pb brightness 0 --no-save  # Set to 0 (temporary only)
+        pb brightness 1         # Set to full brightness (saved to flash)
     """
     pb = get_pixelblaze(ctx)
 
@@ -239,12 +239,12 @@ def brightness(ctx, level, save):
 
             # Set brightness (fire-and-forget command)
             click.echo(f"Setting brightness to {level}...", err=True)
-            pb.setBrightnessSlider(level, saveToFlash=save)
+            pb.setBrightnessSlider(level, saveToFlash=not no_save)
 
             # Give the device time to process (small, smart delay)
             safe_wait(ctx, delay_ms=150)
 
-            action = "saved" if save else "set"
+            action = "set" if no_save else "saved"
             click.echo(f"Brightness {action} to {level}", err=True)
 
     except Exception as e:
@@ -296,12 +296,12 @@ def pixels(ctx, count, no_save):
     help='Output raw JSON instead of pretty-printed'
 )
 @click.option(
-    '--save',
+    '--no-save',
     is_flag=True,
-    help='Save the map to flash memory (persistent across reboots)'
+    help='Do not save the map to flash (temporary change only)'
 )
 @click.pass_context
-def map(ctx, mapfile, coords, raw, save):
+def map(ctx, mapfile, coords, raw, no_save):
     """
     Get or set the pixel map function.
 
@@ -311,9 +311,9 @@ def map(ctx, mapfile, coords, raw, save):
     \b
     Examples:
         pb map                       # Get current map function
-        pb map map.js                # Set map from file
+        pb map map.js                # Set map from file (saved to flash)
         pb map --coords              # Show pixel coordinates (normalized 0-1)
-        pb map map.js --save         # Set map from file and save to flash
+        pb map map.js --no-save      # Set map from file (temporary only)
         pb map --coords --raw        # Show coordinates as raw JSON
     """
     pb = get_pixelblaze(ctx)
@@ -326,10 +326,10 @@ def map(ctx, mapfile, coords, raw, save):
             pb.setMapFunction(mapFunction)
             safe_wait(ctx, delay_ms=200)
 
-            if save:
+            if not no_save:
                 click.echo("Saving map to flash...", err=True)
 
-            action = "saved" if save else "set"
+            action = "set" if no_save else "saved"
             click.echo(f"Map function {action}", err=True)
         else:
             # Get current map
@@ -360,12 +360,12 @@ def map(ctx, mapfile, coords, raw, save):
     help='Also start/resume the pattern sequencer'
 )
 @click.option(
-    '--save',
+    '--no-save',
     is_flag=True,
-    help='Save the on state to flash memory (persistent across reboots)'
+    help='Do not save the on state to flash (temporary change only)'
 )
 @click.pass_context
-def on(ctx, brightness, play_sequencer, save):
+def on(ctx, brightness, play_sequencer, no_save):
     """
     Turn on the Pixelblaze by setting brightness.
 
@@ -374,10 +374,10 @@ def on(ctx, brightness, play_sequencer, save):
 
     \b
     Examples:
-        pb on                       # Set brightness to 1.0 (full)
-        pb on 0.5                   # Set brightness to 50%
-        pb on --play-sequencer      # Set brightness to 1.0 and start sequencer
-        pb on 0.8 --save            # Set brightness to 80% and save to flash
+        pb on                       # Set brightness to 1.0 (full, saved to flash)
+        pb on 0.5                   # Set brightness to 50% (saved to flash)
+        pb on --play-sequencer      # Set brightness to 1.0 and start sequencer (saved)
+        pb on 0.8 --no-save         # Set brightness to 80% (temporary only)
     """
     pb = get_pixelblaze(ctx)
 
@@ -388,7 +388,7 @@ def on(ctx, brightness, play_sequencer, save):
     try:
         # Set brightness (fire-and-forget)
         click.echo(f"Setting brightness to {brightness}...", err=True)
-        pb.setBrightnessSlider(brightness, saveToFlash=save)
+        pb.setBrightnessSlider(brightness, saveToFlash=not no_save)
 
         # Small delay for processing
         safe_wait(ctx, delay_ms=150)
@@ -396,10 +396,10 @@ def on(ctx, brightness, play_sequencer, save):
         # Optionally start the sequencer
         if play_sequencer:
             click.echo("Starting sequencer...", err=True)
-            pb.playSequencer(saveToFlash=save)
+            pb.playSequencer(saveToFlash=not no_save)
             safe_wait(ctx, delay_ms=100)
 
-        action = "saved and turned on" if save else "turned on"
+        action = "turned on" if no_save else "saved and turned on"
         click.echo(f"Pixelblaze {action} (brightness: {brightness})", err=True)
 
     except Exception as e:
@@ -413,12 +413,12 @@ def on(ctx, brightness, play_sequencer, save):
     help='Also pause the pattern sequencer'
 )
 @click.option(
-    '--save',
+    '--no-save',
     is_flag=True,
-    help='Save the off state to flash memory (persistent across reboots)'
+    help='Do not save the off state to flash (temporary change only)'
 )
 @click.pass_context
-def off(ctx, pause_sequencer, save):
+def off(ctx, pause_sequencer, no_save):
     """
     Turn off the Pixelblaze by setting brightness to zero.
 
@@ -427,16 +427,16 @@ def off(ctx, pause_sequencer, save):
 
     \b
     Examples:
-        pb off                      # Set brightness to 0
-        pb off --pause-sequencer    # Set brightness to 0 and pause sequencer
-        pb off --save               # Set brightness to 0 and save to flash
+        pb off                      # Set brightness to 0 (saved to flash)
+        pb off --pause-sequencer    # Set brightness to 0 and pause sequencer (saved)
+        pb off --no-save            # Set brightness to 0 (temporary only)
     """
     pb = get_pixelblaze(ctx)
 
     try:
         # Set brightness to 0 (fire-and-forget)
         click.echo("Setting brightness to 0...", err=True)
-        pb.setBrightnessSlider(0.0, saveToFlash=save)
+        pb.setBrightnessSlider(0.0, saveToFlash=not no_save)
 
         # Small delay for processing
         safe_wait(ctx, delay_ms=150)
@@ -444,10 +444,10 @@ def off(ctx, pause_sequencer, save):
         # Optionally pause the sequencer
         if pause_sequencer:
             click.echo("Pausing sequencer...", err=True)
-            pb.pauseSequencer(saveToFlash=save)
+            pb.pauseSequencer(saveToFlash=not no_save)
             safe_wait(ctx, delay_ms=100)
 
-        action = "saved and turned off" if save else "turned off"
+        action = "turned off" if no_save else "saved and turned off"
         click.echo(f"Pixelblaze {action}", err=True)
 
     except Exception as e:
@@ -468,26 +468,26 @@ def seq(ctx):
 
 @seq.command()
 @click.option(
-    '--save',
+    '--no-save',
     is_flag=True,
-    help='Save the paused state to flash memory'
+    help='Do not save paused state to flash (temporary change only)'
 )
 @click.pass_context
-def pause(ctx, save):
+def pause(ctx, no_save):
     """
     Pause the pattern sequencer.
 
     \b
     Examples:
-        pb seq pause           # Pause sequencer
-        pb seq pause --save    # Pause and save to flash
+        pb seq pause           # Pause sequencer (saved to flash)
+        pb seq pause --no-save    # Pause (temporary only)
     """
     pb = get_pixelblaze(ctx)
 
     try:
         click.echo("Pausing sequencer...", err=True)
-        pb.pauseSequencer(saveToFlash=save)
-        action = "paused and saved" if save else "paused"
+        pb.pauseSequencer(saveToFlash=not no_save)
+        action = "paused" if no_save else "paused and saved"
         click.echo(f"Sequencer {action}", err=True)
     except Exception as e:
         raise click.ClickException(f"Failed to pause sequencer: {e}")
@@ -495,26 +495,26 @@ def pause(ctx, save):
 
 @seq.command()
 @click.option(
-    '--save',
+    '--no-save',
     is_flag=True,
-    help='Save the playing state to flash memory'
+    help='Do not save playing state to flash (temporary change only)'
 )
 @click.pass_context
-def play(ctx, save):
+def play(ctx, no_save):
     """
     Start/resume the pattern sequencer.
 
     \b
     Examples:
-        pb seq play           # Start/resume sequencer
-        pb seq play --save    # Start and save to flash
+        pb seq play           # Start/resume sequencer (saved to flash)
+        pb seq play --no-save    # Start (temporary only)
     """
     pb = get_pixelblaze(ctx)
 
     try:
         click.echo("Starting sequencer...", err=True)
-        pb.playSequencer(saveToFlash=save)
-        action = "started and saved" if save else "started"
+        pb.playSequencer(saveToFlash=not no_save)
+        action = "started" if no_save else "started and saved"
         click.echo(f"Sequencer {action}", err=True)
     except Exception as e:
         raise click.ClickException(f"Failed to start sequencer: {e}")
@@ -522,12 +522,12 @@ def play(ctx, save):
 
 @seq.command()
 @click.option(
-    '--save',
+    '--no-save',
     is_flag=True,
-    help='Save the state to flash memory'
+    help='Do not save state to flash (temporary change only)'
 )
 @click.pass_context
-def next(ctx, save):
+def next(ctx, no_save):
     """
     Advance to the next pattern in the sequence.
 
@@ -535,15 +535,16 @@ def next(ctx, save):
 
     \b
     Examples:
-        pb seq next           # Next pattern
-        pb seq next --save    # Next pattern and save
+        pb seq next           # Next pattern (saved to flash)
+        pb seq next --no-save    # Next pattern (temporary only)
     """
     pb = get_pixelblaze(ctx)
 
     try:
         click.echo("Advancing to next pattern...", err=True)
-        pb.nextSequencer(saveToFlash=save)
-        click.echo("Advanced to next pattern", err=True)
+        pb.nextSequencer(saveToFlash=not no_save)
+        action = "Advanced to next pattern" if no_save else "Advanced to next pattern and saved"
+        click.echo(action, err=True)
     except Exception as e:
         raise click.ClickException(f"Failed to advance to next pattern: {e}")
 
@@ -586,12 +587,12 @@ def random(ctx):
 @seq.command()
 @click.argument('seconds', type=float)
 @click.option(
-    '--save',
+    '--no-save',
     is_flag=True,
-    help='Save the updated playlist to flash memory'
+    help='Do not save updated playlist to flash (temporary change only)'
 )
 @click.pass_context
-def len(ctx, seconds, save):
+def len(ctx, seconds, no_save):
     """
     Set the duration for all patterns in the playlist.
 
@@ -602,8 +603,8 @@ def len(ctx, seconds, save):
 
     \b
     Examples:
-        pb seq len 10          # Set all durations to 10 seconds
-        pb seq len 30 --save   # Set to 30 seconds and save
+        pb seq len 10          # Set all durations to 10 seconds (saved)
+        pb seq len 30 --no-save   # Set to 30 seconds (temporary only)
     """
     pb = get_pixelblaze(ctx)
 
@@ -631,10 +632,11 @@ def len(ctx, seconds, save):
         click.echo(f"Setting {original_count} pattern(s) to {seconds} seconds each...", err=True)
         pb.setSequencerPlaylist(playlist)
 
-        if save:
+        if not no_save:
             click.echo("Saving playlist to flash...", err=True)
 
-        click.echo(f"Playlist updated: all patterns set to {seconds}s", err=True)
+        action = "set" if no_save else "saved"
+        click.echo(f"Playlist updated and {action}: all patterns set to {seconds}s", err=True)
 
     except Exception as e:
         raise click.ClickException(f"Failed to update playlist durations: {e}")
@@ -643,9 +645,9 @@ def len(ctx, seconds, save):
 @cli.command()
 @click.argument('search', type=str)
 @click.option(
-    '--save',
+    '--no-save',
     is_flag=True,
-    help='Save the pattern selection to flash memory'
+    help='Do not save pattern selection to flash (temporary change only)'
 )
 @click.option(
     '--exact',
@@ -653,7 +655,7 @@ def len(ctx, seconds, save):
     help='Require exact match instead of partial regex match'
 )
 @click.pass_context
-def pattern(ctx, search, save, exact):
+def pattern(ctx, search, no_save, exact):
     """
     Switch to a pattern by name (case-insensitive partial match).
 
@@ -662,11 +664,11 @@ def pattern(ctx, search, save, exact):
 
     \b
     Examples:
-        pb pattern rainbow              # Match "Rainbow" or "rainbow wave"
-        pb pattern "^glit"              # Match patterns starting with "glit"
-        pb pattern fire --save          # Match "fire" and save selection
-        pb pattern "sound.*react"       # Regex: "sound" followed by "react"
-        pb pattern exact --exact        # Exact match only (case-insensitive)
+        pb pattern rainbow              # Match "Rainbow" or "rainbow wave" (saved)
+        pb pattern "^glit"              # Match patterns starting with "glit" (saved)
+        pb pattern fire --no-save       # Match "fire" (temporary only)
+        pb pattern "sound.*react"       # Regex: "sound" followed by "react" (saved)
+        pb pattern exact --exact        # Exact match only (case-insensitive, saved)
     """
     pb = get_pixelblaze(ctx)
 
@@ -707,12 +709,12 @@ def pattern(ctx, search, save, exact):
 
         # Switch to the pattern
         click.echo(f"Switching to pattern: {matched_name}", err=True)
-        pb.setActivePattern(matched_id, saveToFlash=save)
+        pb.setActivePattern(matched_id, saveToFlash=not no_save)
 
         # Small delay for processing
         safe_wait(ctx, delay_ms=100)
 
-        action = "saved and activated" if save else "activated"
+        action = "activated" if no_save else "saved and activated"
         click.echo(f"Pattern '{matched_name}' {action}", err=True)
 
     except Exception as e:
