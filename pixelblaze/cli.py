@@ -13,7 +13,7 @@ import json
 import time
 import re
 import click
-from typing import Optional, Dict
+from typing import Dict
 from pixelblaze.pixelblaze import Pixelblaze
 
 
@@ -62,20 +62,6 @@ def discover_pixelblaze(ip_address: str) -> str:
     raise click.ClickException(
         "No Pixelblaze found. Specify an IP address with --ip or ensure a Pixelblaze is on the network."
     )
-
-
-def safe_wait(ctx: click.Context, delay_ms: int = 150):
-    """
-    Wait a short time for the device to process, unless --no-verify is set.
-
-    Args:
-        ctx: Click context
-        delay_ms: Milliseconds to wait (default 150ms)
-    """
-    if ctx.obj.get('no_verify', False):
-        return  # Skip wait if --no-verify is set
-
-    time.sleep(delay_ms / 1000.0)
 
 
 def get_pixelblaze(ctx: click.Context) -> Pixelblaze:
@@ -206,11 +192,7 @@ def ping(ctx, count):
 
 @cli.command()
 @click.argument('level', type=float, required=False)
-@click.option(
-    '--no-save',
-    is_flag=True,
-    help='Do not save brightness to flash (temporary change only)'
-)
+@click.option('--no-save', is_flag=True, help='Do not save brightness to flash (temporary change only)')
 @click.pass_context
 def brightness(ctx, level, no_save):
     """
@@ -225,15 +207,11 @@ def brightness(ctx, level, no_save):
         pb brightness 0 --no-save  # Set to 0 (temporary only)
         pb brightness 1         # Set to full brightness (saved to flash)
     """
-    pb = get_pixelblaze(ctx)
-
-    try:
+    with get_pixelblaze(ctx) as pb:
         if level is None:
-            # Get current brightness
             current = pb.getBrightnessSlider()
             click.echo(f"{current:.2f}")
         else:
-            # Validate range
             if not 0.0 <= level <= 1.0:
                 raise click.ClickException("Brightness must be between 0.0 and 1.0")
 
@@ -241,14 +219,8 @@ def brightness(ctx, level, no_save):
             click.echo(f"Setting brightness to {level}...", err=True)
             pb.setBrightnessSlider(level, saveToFlash=not no_save)
 
-            # Give the device time to process (small, smart delay)
-            safe_wait(ctx, delay_ms=150)
-
             action = "set" if no_save else "saved"
             click.echo(f"Brightness {action} to {level}", err=True)
-
-    except Exception as e:
-        raise click.ClickException(f"Failed to manage brightness: {e}")
 
 
 @cli.command()
@@ -324,7 +296,6 @@ def map(ctx, mapfile, coords, raw, no_save):
             mapFunction = mapfile.read()
             click.echo(f"Setting map function from {mapfile.name}...", err=True)
             pb.setMapFunction(mapFunction)
-            safe_wait(ctx, delay_ms=200)
 
             if not no_save:
                 click.echo("Saving map to flash...", err=True)
@@ -390,14 +361,10 @@ def on(ctx, brightness, play_sequencer, no_save):
         click.echo(f"Setting brightness to {brightness}...", err=True)
         pb.setBrightnessSlider(brightness, saveToFlash=not no_save)
 
-        # Small delay for processing
-        safe_wait(ctx, delay_ms=150)
-
         # Optionally start the sequencer
         if play_sequencer:
             click.echo("Starting sequencer...", err=True)
             pb.playSequencer(saveToFlash=not no_save)
-            safe_wait(ctx, delay_ms=100)
 
         action = "turned on" if no_save else "saved and turned on"
         click.echo(f"Pixelblaze {action} (brightness: {brightness})", err=True)
@@ -438,14 +405,10 @@ def off(ctx, pause_sequencer, no_save):
         click.echo("Setting brightness to 0...", err=True)
         pb.setBrightnessSlider(0.0, saveToFlash=not no_save)
 
-        # Small delay for processing
-        safe_wait(ctx, delay_ms=150)
-
         # Optionally pause the sequencer
         if pause_sequencer:
             click.echo("Pausing sequencer...", err=True)
             pb.pauseSequencer(saveToFlash=not no_save)
-            safe_wait(ctx, delay_ms=100)
 
         action = "turned off" if no_save else "saved and turned off"
         click.echo(f"Pixelblaze {action}", err=True)
@@ -711,9 +674,6 @@ def pattern(ctx, search, no_save, exact):
         click.echo(f"Switching to pattern: {matched_name}", err=True)
         pb.setActivePattern(matched_id, saveToFlash=not no_save)
 
-        # Small delay for processing
-        safe_wait(ctx, delay_ms=100)
-
         action = "activated" if no_save else "saved and activated"
         click.echo(f"Pattern '{matched_name}' {action}", err=True)
 
@@ -835,6 +795,8 @@ def ws(ctx, json_data, expect, timeout):
 
         # Send the websocket message
         # If no --expect is provided, wait for any non-chatty text response
+        if expect == "stats":
+            expect = pb.messageTypes.specialStats
         response = pb.wsSendJson(json_obj, expectedResponse=expect, waitForAnyResponse=(expect is None))
 
         # Display response
