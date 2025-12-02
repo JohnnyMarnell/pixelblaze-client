@@ -75,6 +75,17 @@ If you need or want to use a proxy server (for debugging it can be very useful t
     pb = Pixelblaze("192.168.4.1", proxyUrl="http://192.168.8.8:8888")
 ```
 
+The great [tshark](https://tshark.dev/) (comes with [Wireshark](https://www.wireshark.org/), both available with brew install)
+can be used to see Pixelblaze requests and responses as seen in this example Terminal command
+(with [jq](https://jqlang.org/) highlighting) here (`en0` is often your computer's WiFi interface):
+
+```sh
+sudo tshark -i en0 -ql -d tcp.port==81,http \
+    -T fields -e websocket.payload.text \
+    -Y "(ip.dst == 192.168.4.1 or ip.src == 192.168.4.1) and websocket" \
+    | jq --unbuffered -c .
+```
+
 ### Advanced topic: lifecycle management
 
 The `Pixelblaze` class can be used in a `with` statement, which will automatically close the connection and dispose of the object when the `with` statement completes:
