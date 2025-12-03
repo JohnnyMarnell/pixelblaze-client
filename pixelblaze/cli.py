@@ -12,7 +12,7 @@ import time
 import re
 import click
 from typing import Dict
-from pixelblaze.pixelblaze import Pixelblaze
+from pixelblaze.pixelblaze import Pixelblaze, PBB
 from pixelblaze.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json, jsons
 
 @click.group()
@@ -556,6 +556,158 @@ def ping(pb: Pixelblaze, count):
     else:
         log(f"\nAll pings failed")
         raise click.ClickException("Failed to ping Pixelblaze")
+
+
+@click.command()
+@click.argument('output_file', required=False)
+@click.option('--ip', default='auto', help='IP address of Pixelblaze')
+@click.option('--quiet', '-q', is_flag=True, help='Suppress verbose progress output')
+@click.option('--decode', '-d', is_flag=True, help='Decode base64 file contents in output')
+@click.option('--binary', is_flag=True, help='Include binary content as base64 (with --decode)')
+@click.pass_context
+def pbb(ctx, output_file, ip, quiet, decode, binary):
+    """
+    Export a Pixelblaze Binary Backup (.pbb file).
+
+    Backs up the entire Pixelblaze configuration including patterns, settings,
+    map data, and all configuration files.
+
+    If no output file is specified, outputs to stdout as JSON.
+    If a filename is provided, saves as a .pbb file (auto-appends .pbb extension if missing).
+    If the file already exists, uses that file instead of connecting to Pixelblaze.
+
+    \b
+    Examples:
+        pb --ip 192.168.1.24 pbb                    # Output to stdout
+        pb --ip 192.168.1.24 pbb backup             # Save to backup.pbb
+        pb --ip 192.168.1.24 pbb my_config.pbb      # Save to my_config.pbb
+        pb --ip 192.168.1.24 pbb -q backup          # Quiet mode
+        pb pbb -d backup.pbb                        # Decode existing file
+        pb pbb -d --binary backup.pbb               # Include binary as base64
+    """
+    import pathlib
+    import base64
+
+    # Determine the actual file path
+    if output_file:
+        if not output_file.endswith('.pbb'):
+            output_file += '.pbb'
+
+    # Check if file exists and should be used
+    if output_file and pathlib.Path(output_file).exists():
+        log(f"Using existing file: {output_file}")
+        temp_file = output_file
+        should_cleanup = False
+    else:
+        # Need to fetch from Pixelblaze
+        from pixelblaze.cli_utils import get_pixelblaze
+        ctx.obj = ctx.obj or {}
+        ctx.obj['ip'] = ip
+
+        log("Creating backup from Pixelblaze...")
+        with get_pixelblaze(ctx) as pb:
+            backup = PBB.fromPixelblaze(pb, verbose=not quiet)
+
+            if output_file:
+                backup.toFile(output_file)
+                log(f"Backup saved to {output_file}")
+                return
+            else:
+                temp_file = '/tmp/pixelblaze_backup_temp.pbb'
+                backup.toFile(temp_file)
+                should_cleanup = True
+
+    # Read and potentially decode the file
+    content = pathlib.Path(temp_file).read_text()
+
+    if decode:
+        # Decode base64 entries
+        import struct
+        from pixelblaze.pixelblaze import PBP
+
+        data = jsonlib.loads(content)
+        if 'files' in data:
+            decoded_files = {}
+            for filename, b64_content in data['files'].items():
+                try:
+                    # Decode base64
+                    decoded = base64.b64decode(b64_content)
+
+                    # Check if it's a PBP (Pixelblaze Binary Pattern) file
+                    if filename.startswith('/p/') and len(decoded) > 36:
+                        try:
+                            # Parse PBP format
+                            pbp = PBP.fromBytes(filename.split('/')[-1], decoded)
+                            decoded_files[filename] = {
+                                'name': pbp.name,
+                                'sourceCode': jsonlib.loads(pbp.sourceCode),
+                                'preview': '<jpeg>' if not binary else base64.b64encode(pbp.jpeg).decode('utf-8'),
+                                'byteCode': '<bytecode>' if not binary else base64.b64encode(pbp.byteCode).decode('utf-8')
+                            }
+                            continue
+                        except Exception:
+                            # Not a valid PBP, try other formats
+                            pass
+
+                    # Try to parse as UTF-8 text
+                    try:
+                        text = decoded.decode('utf-8')
+                        # Try to parse as JSON
+                        try:
+                            decoded_files[filename] = jsonlib.loads(text)
+                        except jsonlib.JSONDecodeError:
+                            # Not JSON, just text
+                            decoded_files[filename] = text
+                    except UnicodeDecodeError:
+                        # Binary content (images, etc.)
+                        if binary:
+                            decoded_files[filename] = b64_content
+                        else:
+                            # Detect image format
+                            if decoded.startswith(b'\xff\xd8\xff'):
+                                decoded_files[filename] = '<jpeg>'
+                            elif decoded.startswith(b'\x89PNG'):
+                                decoded_files[filename] = '<png>'
+                            else:
+                                decoded_files[filename] = '<binary>'
+                except Exception:
+                    # If decode fails, keep original
+                    decoded_files[filename] = b64_content
+
+            data['files'] = decoded_files
+            content = jsonlib.dumps(data, indent=2)
+
+    click.echo(content)
+    if should_cleanup:
+        pathlib.Path(temp_file).unlink()
+
+
+@cli(pixelblaze)
+@click.argument('input_file')
+def restore(pb: Pixelblaze, input_file):
+    """
+    Restore a Pixelblaze from a Binary Backup (.pbb file).
+
+    Restores the entire Pixelblaze configuration from a .pbb backup file,
+    including patterns, settings, map data, and all configuration files.
+
+    WARNING: This will overwrite all current patterns and settings!
+
+    \b
+    Examples:
+        pb --ip 192.168.1.24 restore backup.pbb
+        pb --ip 192.168.1.24 restore my_config.pbb
+    """
+    if not input_file.endswith('.pbb'):
+        input_file += '.pbb'
+
+    log(f"Restoring from {input_file}...")
+    backup = PBB.fromFile(input_file)
+    backup.toPixelblaze(pb)
+    log("Restore complete!")
+
+
+pixelblaze.add_command(pbb)
 
 
 def main():
