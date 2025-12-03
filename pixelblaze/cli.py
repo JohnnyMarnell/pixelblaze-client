@@ -14,14 +14,14 @@ import re
 import click
 from typing import Dict
 from pixelblaze.pixelblaze import Pixelblaze
-from pixelblaze.cli_utils import cli, log
+from pixelblaze.cli_utils import cli, log, no_save_option
 
 
 @click.group()
 @click.option(
     '--ip',
     default='auto',
-    help='IP address of Pixelblaze (default: auto-discover, checks 192.168.4.1 first, then network scan)',
+    help='IP address of Pixelblaze (default: auto discover mode, checks 192.168.4.1 first for Ad Hoc, then network scan)',
     show_default=True
 )
 @click.option(
@@ -31,13 +31,8 @@ from pixelblaze.cli_utils import cli, log
     help='Command timeout in seconds (default: 5.0)',
     show_default=True
 )
-@click.option(
-    '--no-verify',
-    is_flag=True,
-    help='Skip ping/ack verification (faster but less reliable)'
-)
 @click.pass_context
-def pixelblaze(ctx, ip, timeout, no_verify):
+def pixelblaze(ctx, ip, timeout):
     """
     Pixelblaze LED Controller CLI
 
@@ -46,16 +41,11 @@ def pixelblaze(ctx, ip, timeout, no_verify):
     ctx.ensure_object(dict)
     ctx.obj['ip'] = ip
     ctx.obj['timeout'] = timeout
-    ctx.obj['no_verify'] = no_verify
 
 
 @cli(pixelblaze)
 @click.argument('count', type=int, required=False)
-@click.option(
-    '--no-save',
-    is_flag=True,
-    help='Do not save pixel count to flash (temporary change only)'
-)
+@no_save_option
 def pixels(pb: Pixelblaze, count, no_save):
     """
     Get or set the number of pixels configured on the Pixelblaze.
@@ -76,34 +66,70 @@ def pixels(pb: Pixelblaze, count, no_save):
 
 
 @cli(pixelblaze)
-@click.argument('level', type=float, required=False)
-@click.option('--no-save', is_flag=True, help='Do not save brightness to flash (temporary change only)')
-def brightness(pb: Pixelblaze, level, no_save):
+@click.argument('brightness', type=float, default=1.0, required=False)
+@click.option(
+    '--play-sequencer',
+    is_flag=True,
+    help='Also start/resume the pattern sequencer'
+)
+@no_save_option
+def on(pb: Pixelblaze, brightness, play_sequencer, no_save):
     """
-    Get or set the brightness level.
+    Turn on the Pixelblaze by setting brightness.
 
-    LEVEL is a float between 0.0 and 1.0 (optional).
+    This command sets the brightness to the specified level (default: 1.0).
+    Optionally, you can also start/resume the sequencer.
 
     \b
     Examples:
-        pb brightness           # Get current brightness
-        pb brightness 0.5       # Set brightness to 50% (saved to flash)
-        pb brightness 0 --no-save  # Set to 0 (temporary only)
-        pb brightness 1         # Set to full brightness (saved to flash)
+        pb on                       # Set brightness to 1.0 (full, saved to flash)
+        pb on 0.5                   # Set brightness to 50% (saved to flash)
+        pb on --play-sequencer      # Set brightness to 1.0 and start sequencer (saved)
+        pb on 0.8 --no-save         # Set brightness to 80% (temporary only)
     """
-    if level is None:
-        current = pb.getBrightnessSlider()
-        click.echo(f"{current:.2f}")
-    else:
-        if not 0.0 <= level <= 1.0:
-            raise click.ClickException("Brightness must be between 0.0 and 1.0")
+    if not 0.0 <= brightness <= 1.0:
+        raise click.ClickException("Brightness must be between 0.0 and 1.0")
 
-        # Set brightness (fire-and-forget command)
-        log(f"Setting brightness to {level}...")
-        pb.setBrightnessSlider(level, saveToFlash=not no_save)
+    log(f"Setting brightness to {brightness}...")
+    pb.setBrightnessSlider(brightness, saveToFlash=not no_save)
 
-        action = "set" if no_save else "saved"
-        log(f"Brightness {action} to {level}")
+    if play_sequencer:
+        log("Starting sequencer...")
+        pb.playSequencer(saveToFlash=not no_save)
+
+    action = "turned on" if no_save else "saved and turned on"
+    log(f"Pixelblaze {action} (brightness: {brightness})")
+
+
+@cli(pixelblaze)
+@click.option(
+    '--pause-sequencer',
+    is_flag=True,
+    help='Also pause the pattern sequencer'
+)
+@no_save_option
+def off(pb: Pixelblaze, pause_sequencer, no_save):
+    """
+    Turn off the Pixelblaze by setting brightness to zero.
+
+    This command sets the brightness to 0, effectively turning off all LEDs.
+    Optionally, you can also pause the sequencer to stop pattern changes.
+
+    \b
+    Examples:
+        pb off                      # Set brightness to 0 (saved to flash)
+        pb off --pause-sequencer    # Set brightness to 0 and pause sequencer (saved)
+        pb off --no-save            # Set brightness to 0 (temporary only)
+    """
+    log("Setting brightness to 0...")
+    pb.setBrightnessSlider(0.0, saveToFlash=not no_save)
+
+    if pause_sequencer:
+        log("Pausing sequencer...")
+        pb.pauseSequencer(saveToFlash=not no_save)
+
+    action = "turned off" if no_save else "saved and turned off"
+    log(f"Pixelblaze {action}")
 
 
 @cli(pixelblaze)
@@ -118,11 +144,7 @@ def brightness(pb: Pixelblaze, level, no_save):
     is_flag=True,
     help='Output raw JSON instead of pretty-printed'
 )
-@click.option(
-    '--no-save',
-    is_flag=True,
-    help='Do not save the map to flash (temporary change only)'
-)
+@no_save_option
 def map(pb: Pixelblaze, mapfile, coords, raw, no_save):
     """
     Get or set the pixel map function.
@@ -163,81 +185,6 @@ def map(pb: Pixelblaze, mapfile, coords, raw, no_save):
             click.echo(mapFunction)
 
 
-@cli(pixelblaze)
-@click.argument('brightness', type=float, default=1.0, required=False)
-@click.option(
-    '--play-sequencer',
-    is_flag=True,
-    help='Also start/resume the pattern sequencer'
-)
-@click.option(
-    '--no-save',
-    is_flag=True,
-    help='Do not save the on state to flash (temporary change only)'
-)
-def on(pb: Pixelblaze, brightness, play_sequencer, no_save):
-    """
-    Turn on the Pixelblaze by setting brightness.
-
-    This command sets the brightness to the specified level (default: 1.0).
-    Optionally, you can also start/resume the sequencer.
-
-    \b
-    Examples:
-        pb on                       # Set brightness to 1.0 (full, saved to flash)
-        pb on 0.5                   # Set brightness to 50% (saved to flash)
-        pb on --play-sequencer      # Set brightness to 1.0 and start sequencer (saved)
-        pb on 0.8 --no-save         # Set brightness to 80% (temporary only)
-    """
-    if not 0.0 <= brightness <= 1.0:
-        raise click.ClickException("Brightness must be between 0.0 and 1.0")
-
-    log(f"Setting brightness to {brightness}...")
-    pb.setBrightnessSlider(brightness, saveToFlash=not no_save)
-
-    if play_sequencer:
-        log("Starting sequencer...")
-        pb.playSequencer(saveToFlash=not no_save)
-
-    action = "turned on" if no_save else "saved and turned on"
-    log(f"Pixelblaze {action} (brightness: {brightness})")
-
-
-@cli(pixelblaze)
-@click.option(
-    '--pause-sequencer',
-    is_flag=True,
-    help='Also pause the pattern sequencer'
-)
-@click.option(
-    '--no-save',
-    is_flag=True,
-    help='Do not save the off state to flash (temporary change only)'
-)
-def off(pb: Pixelblaze, pause_sequencer, no_save):
-    """
-    Turn off the Pixelblaze by setting brightness to zero.
-
-    This command sets the brightness to 0, effectively turning off all LEDs.
-    Optionally, you can also pause the sequencer to stop pattern changes.
-
-    \b
-    Examples:
-        pb off                      # Set brightness to 0 (saved to flash)
-        pb off --pause-sequencer    # Set brightness to 0 and pause sequencer (saved)
-        pb off --no-save            # Set brightness to 0 (temporary only)
-    """
-    log("Setting brightness to 0...")
-    pb.setBrightnessSlider(0.0, saveToFlash=not no_save)
-
-    if pause_sequencer:
-        log("Pausing sequencer...")
-        pb.pauseSequencer(saveToFlash=not no_save)
-
-    action = "turned off" if no_save else "saved and turned off"
-    log(f"Pixelblaze {action}")
-
-
 @pixelblaze.group()
 @click.pass_context
 def seq(ctx):
@@ -251,11 +198,7 @@ def seq(ctx):
 
 
 @cli(seq)
-@click.option(
-    '--no-save',
-    is_flag=True,
-    help='Do not save paused state to flash (temporary change only)'
-)
+@no_save_option
 def pause(pb: Pixelblaze, no_save):
     """
     Pause the pattern sequencer.
@@ -272,11 +215,7 @@ def pause(pb: Pixelblaze, no_save):
 
 
 @cli(seq)
-@click.option(
-    '--no-save',
-    is_flag=True,
-    help='Do not save playing state to flash (temporary change only)'
-)
+@no_save_option
 def play(pb: Pixelblaze, no_save):
     """
     Start/resume the pattern sequencer.
@@ -293,11 +232,7 @@ def play(pb: Pixelblaze, no_save):
 
 
 @cli(seq)
-@click.option(
-    '--no-save',
-    is_flag=True,
-    help='Do not save state to flash (temporary change only)'
-)
+@no_save_option
 def next(pb: Pixelblaze, no_save):
     """
     Advance to the next pattern in the sequence.
@@ -342,21 +277,16 @@ def random(pb: Pixelblaze):
     log(f"Now playing: {pattern_name}")
 
 
-@cli(seq)
+@cli(seq, name='len')
 @click.argument('seconds', type=float)
-@click.option(
-    '--no-save',
-    is_flag=True,
-    help='Do not save updated playlist to flash (temporary change only)'
-)
-def len(pb: Pixelblaze, seconds, no_save):
+@no_save_option
+def set_duration(pb: Pixelblaze, seconds, no_save):
     """
-    Set the duration for all patterns in the playlist.
+    Set the duration for all patterns in the sequencer playlist.
 
     SECONDS is the duration in seconds for each pattern.
 
-    This modifies the default playlist by setting all pattern durations
-    to the specified value.
+    Updates the sequencer playlist to change pattern durations.
 
     \b
     Examples:
@@ -394,11 +324,7 @@ def len(pb: Pixelblaze, seconds, no_save):
 
 @cli(pixelblaze)
 @click.argument('search', type=str)
-@click.option(
-    '--no-save',
-    is_flag=True,
-    help='Do not save pattern selection to flash (temporary change only)'
-)
+@no_save_option
 @click.option(
     '--exact',
     is_flag=True,
@@ -559,13 +485,13 @@ def ws(pb: Pixelblaze, json_data, expect):
 @click.option(
     '--vars',
     type=str,
-    help='JSON dictionary of variables to set (e.g., \'{"speed": 0.5, "brightness": 1.0}\')'
+    help='JSON dictionary of variables to set (e.g., \'{"speed": 0.5, "patternColor": 1.0}\')'
 )
 @click.option(
     '--var',
     'var_pairs',
     multiple=True,
-    help='Individual variable as key:value pair (can be used multiple times, e.g., --var speed:0.5 --var brightness:1.0)'
+    help='Individual variable as key:value pair (can be used multiple times, e.g., --var speed:0.5 --var patternColor:1.0)'
 )
 def render(pb: Pixelblaze, code, vars, var_pairs):
     """
@@ -578,8 +504,8 @@ def render(pb: Pixelblaze, code, vars, var_pairs):
     Examples:
         pb render "export function render(index) { hsv(0.5, 1, 1) }"
         echo "export function render(index) { hsv(0.5, 1, 1) }" | pb render
-        pb render code.js --var speed:0.5 --var brightness:1.0
-        pb render code.js --vars '{"speed": 0.5, "brightness": 1.0}'
+        pb render code.js --var speed:0.5 --var patternColor:1.0
+        pb render code.js --vars '{"speed": 0.5, "patternColor": 1.0}'
     """
     if code is None:
         if not sys.stdin.isatty():

@@ -8,6 +8,13 @@ from pixelblaze.pixelblaze import Pixelblaze
 
 log = lambda *args, **kwargs: click.echo(*args, err=True, *kwargs)
 
+# Reusable Click options
+no_save_option = click.option(
+    '--no-save',
+    is_flag=True,
+    help='Do not save changes to flash (temporary only)'
+)
+
 def discover_pixelblaze(ip_address: str) -> str:
     """
     Discovers a Pixelblaze IP address using the specified strategy.
