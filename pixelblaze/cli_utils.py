@@ -4,11 +4,13 @@ import sys
 import socket
 import click
 import json5
+import json
 from functools import wraps
 from typing import Callable, Optional
 from pixelblaze.pixelblaze import Pixelblaze
 
 log = lambda *args, **kwargs: click.echo(*args, err=True, *kwargs)
+jsons = lambda x: click.echo(json.dumps(x, separators=(',', ':')))
 
 # Reusable Click options
 no_save_option = click.option(

@@ -7,14 +7,12 @@ This module provides a modern CLI tool for controlling Pixelblazes with
 flexible discovery, pattern rendering, and configuration management.
 """
 
-import json
 import time
 import re
 import click
 from typing import Dict
 from pixelblaze.pixelblaze import Pixelblaze
-from pixelblaze.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json
-
+from pixelblaze.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json, jsons
 
 @click.group()
 @click.option(
@@ -133,12 +131,9 @@ def off(pb: Pixelblaze, pause_sequencer, no_save):
 
 @cli(pixelblaze)
 @input_arg
-@click.option(
-    '--fn',
-    is_flag=True,
-    help='Show map function code instead of pixel coordinates'
-)
-def map(pb: Pixelblaze, input, fn):
+@click.option('--fn', is_flag=True, help='Whether using map function code instead of pixel coordinates')
+@click.option('--csv', is_flag=True, help='Output as csv instead of Pixelblaze 3-arrays')
+def map(pb: Pixelblaze, input, fn, csv):
     """
     Get or set the pixel map function.
 
@@ -157,14 +152,20 @@ def map(pb: Pixelblaze, input, fn):
     content = read_input(input, "map", required=False)
     setting = content is not None
     log(f"{setting and "Setting" or "Fetching"} map {map_type}...")
+
     if setting and fn:
         pb.setMapFunction(content)
     elif setting and not fn:
         pb.setMapCoordinates(parse_json(content))
     elif fn:
         click.echo(pb.getMapFunction())
+    elif csv:
+        coords = pb.getMapCoordinates()
+        click.echo("index,x,y,z")
+        for i in range(0, len(coords[0])):
+            click.echo(f"{i},{coords[0][i]},{coords[1][i]},{coords[2][i]}")
     else:
-        click.echo(json.dumps(pb.getMapCoordinates(), separators=(',', ':')))
+        jsons(pb.getMapCoordinates())
 
 
 @pixelblaze.group()
@@ -380,13 +381,13 @@ def cfg(pb: Pixelblaze):
         pb cfg
         pb cfg | yq -P          # Pretty-printed YAML
     """
-    log("Fetching configuration...")
-    click.echo(json.dumps({
+    log("Fetching configurations...")
+    jsons({
         'config': pb.getConfigSettings(),
         'patterns': pb.getPatternList(),
         'playlist': pb.getSequencerPlaylist(),
         'sequencer': pb.getConfigSequencer()
-    }, separators=(',', ':')))
+    })
 
 
 @cli(pixelblaze)
@@ -396,7 +397,7 @@ def cfg(pb: Pixelblaze):
     type=str,
     help='Expected response key (e.g., "ack", "playlist")'
 )
-def ws(pb: Pixelblaze, json_data, expect):
+def ws(pb: Pixelblaze, json, expect):
     """
     Send arbitrary JSON to the Pixelblaze websocket.
 
@@ -404,33 +405,28 @@ def ws(pb: Pixelblaze, json_data, expect):
 
     \b
     Examples:
-        pb ws '{"ping":true}'
+        pb ws '{ping:true}'
         pb ws '{"getConfig":true}' --expect config
-        pb ws '{"brightness":0.5,"save":false}'
-        pb ws '{"activeProgramId":"abc123","save":true}'
-        pb ws '{"getPlaylist":"_defaultplaylist_"}' --expect playlist
+        pb ws '{brightness:0.5, save:false}'
+        pb ws '{activeProgramId:"abc123", save:true}'
+        pb ws '{'getPlaylist':"_defaultplaylist_"}' --expect playlist
     """
-    json_obj = json.loads(json_data)
+    json_obj = parse_json(json)
 
-    log(f"Sending: {json.dumps(json_obj, separators=(',', ':'))}")
-
-    # Send the websocket message
-    # If no --expect is provided, wait for any non-chatty text response
+    # Send the websocket message, if no --expect is provided, wait for any non-chatty text response
     if expect == "stats":
         expect = pb.messageTypes.specialStats
     response = pb.wsSendJson(json_obj, expectedResponse=expect, waitForAnyResponse=(expect is None))
 
     if response is None:
-        log("No response (fire-and-forget command)")
+        log("No response (fire-and-forget command?)")
     elif isinstance(response, bytes):
         log("Binary response:")
         click.echo(response.hex())
     else:
         log("Response:")
         try:
-            # Try to pretty-print JSON response
-            response_json = json.loads(response)
-            click.echo(json.dumps(response_json, indent=2))
+            jsons(response)
         except:
             # Not JSON, just print it
             click.echo(response)
@@ -465,6 +461,8 @@ def render(pb: Pixelblaze, input, vars, var_pairs):
         pb render code.js --vars '{speed: 0.5, patternColor: 1.0}'   # JSON5: unquoted keys
     """
     code = read_input(input, "code")
+    if ("export" not in code):
+        code = 'export function render(index) { ' + code + ' ; }'
 
     variables: Dict[str, float] = {}
 
