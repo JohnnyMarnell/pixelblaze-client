@@ -1,9 +1,11 @@
 """CLI utilities for Pixelblaze controller."""
 
+import sys
 import socket
 import click
+import json5
 from functools import wraps
-from typing import Callable
+from typing import Callable, Optional
 from pixelblaze.pixelblaze import Pixelblaze
 
 log = lambda *args, **kwargs: click.echo(*args, err=True, *kwargs)
@@ -14,6 +16,9 @@ no_save_option = click.option(
     is_flag=True,
     help='Do not save changes to flash (temporary only)'
 )
+
+# Reusable Click arguments
+input_arg = click.argument('input', required=False)
 
 def discover_pixelblaze(ip_address: str) -> str:
     """
@@ -60,6 +65,68 @@ def discover_pixelblaze(ip_address: str) -> str:
     raise click.ClickException(
         "No Pixelblaze found. Specify an IP address with --ip or ensure a Pixelblaze is on the network."
     )
+
+
+def read_input(value: Optional[str], name: str = "input", required: bool = True) -> str:
+    """
+    Read input from value, file path, or stdin.
+
+    If value is provided:
+      - If it's an existing file path, read the file
+      - Otherwise, treat it as the content itself
+    If value is None:
+      - If stdin is available (not a TTY), read from stdin
+      - Otherwise, raise an error
+
+    Args:
+        value: The input value (can be None, a file path, or content string)
+        name: Name for error messages (e.g., "code", "map")
+
+    Returns:
+        str: The input content
+
+    Raises:
+        click.ClickException: If no input provided
+    """
+    import os
+
+    if value is not None:
+        # Check if it's an existing file path
+        if os.path.isfile(value):
+            with open(value, 'r') as f:
+                return f.read().strip()
+        # Otherwise treat it as the content itself
+        return value
+
+    # No value provided, try stdin
+    if not sys.stdin.isatty():
+        return sys.stdin.read().strip()
+
+    if required:
+        raise click.ClickException(
+            f"No {name} provided. Supply {name} as text, a file path, or pipe via stdin."
+        )
+    else:
+        return None
+
+
+def parse_json(text: str):
+    """
+    Parse JSON-like text using json5 (supports single quotes, unquoted keys, etc).
+
+    Args:
+        text: JSON5 string to parse
+
+    Returns:
+        Parsed object/array
+
+    Raises:
+        click.ClickException: If parsing fails
+    """
+    try:
+        return json5.loads(text)
+    except Exception as e:
+        raise click.ClickException(f"Invalid JSON: {e}")
 
 
 def get_pixelblaze(ctx: click.Context) -> Pixelblaze:

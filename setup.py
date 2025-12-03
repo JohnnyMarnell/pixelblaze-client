@@ -30,7 +30,9 @@ setuptools.setup(
       "requests",
       "pytz",
       "mini-racer",
-      "click>=8.0"
+      "click>=8.0",
+      "json5",
+      "pyyaml"
     ],
     packages=["pixelblaze"],
     python_requires='>=3.9',

@@ -7,14 +7,13 @@ This module provides a modern CLI tool for controlling Pixelblazes with
 flexible discovery, pattern rendering, and configuration management.
 """
 
-import sys
 import json
 import time
 import re
 import click
 from typing import Dict
 from pixelblaze.pixelblaze import Pixelblaze
-from pixelblaze.cli_utils import cli, log, no_save_option
+from pixelblaze.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json
 
 
 @click.group()
@@ -133,56 +132,39 @@ def off(pb: Pixelblaze, pause_sequencer, no_save):
 
 
 @cli(pixelblaze)
-@click.argument('mapfile', type=click.File('r'), required=False)
+@input_arg
 @click.option(
-    '--coords',
+    '--fn',
     is_flag=True,
-    help='Show pixel coordinates instead of map function code'
+    help='Show map function code instead of pixel coordinates'
 )
-@click.option(
-    '--raw',
-    is_flag=True,
-    help='Output raw JSON instead of pretty-printed'
-)
-@no_save_option
-def map(pb: Pixelblaze, mapfile, coords, raw, no_save):
+def map(pb: Pixelblaze, input, fn):
     """
     Get or set the pixel map function.
 
-    MAPFILE is an optional JavaScript file to load as the map function.
-    If no file is provided, the current map function is displayed.
+    INPUT is an optional JavaScript file path or inline code. Can also be
+    piped via stdin. If no input is provided, the current map function
+    is displayed.
 
     \b
     Examples:
-        pb map                       # Get current map function
-        pb map map.js                # Set map from file (saved to flash)
-        pb map --coords              # Show pixel coordinates (normalized 0-1)
-        pb map map.js --no-save      # Set map from file (temporary only)
-        pb map --coords --raw        # Show coordinates as raw JSON
+        pb map                       # Get current map coordinates (normalized 0-1)
+        pb map map.js                # Set map from file
+        pb map < map.js              # Set map from stdin
+        pb map --fn                  # Show map function
     """
-    if mapfile is not None:
-        mapFunction = mapfile.read()
-        log(f"Setting map function from {mapfile.name}...")
-        pb.setMapFunction(mapFunction)
-
-        if not no_save:
-            log("Saving map to flash...")
-
-        action = "set" if no_save else "saved"
-        log(f"Map function {action}")
+    map_type = fn and "function" or "coordinates"
+    content = read_input(input, "map", required=False)
+    setting = content is not None
+    log(f"{setting and "Setting" or "Fetching"} map {map_type}...")
+    if setting and fn:
+        pb.setMapFunction(content)
+    elif setting and not fn:
+        pb.setMapCoordinates(parse_json(content))
+    elif fn:
+        click.echo(pb.getMapFunction())
     else:
-        if coords:
-            log("Fetching pixel coordinates...")
-            coordinates = pb.getMapCoordinates()
-
-            if raw:
-                click.echo(json.dumps(coordinates, separators=(',', ':')))
-            else:
-                click.echo(json.dumps(coordinates, indent=2))
-        else:
-            log("Fetching map function...")
-            mapFunction = pb.getMapFunction()
-            click.echo(mapFunction)
+        click.echo(json.dumps(pb.getMapCoordinates(), separators=(',', ':')))
 
 
 @pixelblaze.group()
@@ -381,15 +363,10 @@ def pattern(pb: Pixelblaze, search, no_save, exact):
     log(f"Pattern '{matched_name}' {action}")
 
 
-@cli(pixelblaze, name='config')
-@click.option(
-    '--raw',
-    is_flag=True,
-    help='Output raw JSON instead of pretty-printed'
-)
-def config_cmd(pb: Pixelblaze, raw):
+@cli(pixelblaze)
+def cfg(pb: Pixelblaze):
     """
-    Fetch and display all configuration from the Pixelblaze.
+    Fetch and display most of the configuration from the Pixelblaze.
 
     This mimics the web UI's initial configuration fetch, retrieving:
     - Device config
@@ -400,37 +377,16 @@ def config_cmd(pb: Pixelblaze, raw):
 
     \b
     Examples:
-        pb config              # Pretty-printed JSON
-        pb config --raw        # Raw JSON for scripting
+        pb cfg
+        pb cfg | yq -P          # Pretty-printed YAML
     """
     log("Fetching configuration...")
-
-    config_data = {}
-
-    try:
-        config_data['config'] = pb.getConfigSettings()
-    except Exception as e:
-        log(f"Warning: Could not fetch config: {e}")
-
-    try:
-        config_data['patterns'] = pb.getPatternList()
-    except Exception as e:
-        log(f"Warning: Could not fetch patterns: {e}")
-
-    try:
-        config_data['playlist'] = pb.getSequencerPlaylist()
-    except Exception as e:
-        log(f"Warning: Could not fetch playlist: {e}")
-
-    try:
-        config_data['sequencer'] = pb.getConfigSequencer()
-    except Exception as e:
-        log(f"Warning: Could not fetch sequencer: {e}")
-
-    if raw:
-        click.echo(json.dumps(config_data, separators=(',', ':')))
-    else:
-        click.echo(json.dumps(config_data, indent=2))
+    click.echo(json.dumps({
+        'config': pb.getConfigSettings(),
+        'patterns': pb.getPatternList(),
+        'playlist': pb.getSequencerPlaylist(),
+        'sequencer': pb.getConfigSequencer()
+    }, separators=(',', ':')))
 
 
 @cli(pixelblaze)
@@ -481,7 +437,7 @@ def ws(pb: Pixelblaze, json_data, expect):
 
 
 @cli(pixelblaze)
-@click.argument('code', required=False)
+@input_arg
 @click.option(
     '--vars',
     type=str,
@@ -493,35 +449,27 @@ def ws(pb: Pixelblaze, json_data, expect):
     multiple=True,
     help='Individual variable as key:value pair (can be used multiple times, e.g., --var speed:0.5 --var patternColor:1.0)'
 )
-def render(pb: Pixelblaze, code, vars, var_pairs):
+def render(pb: Pixelblaze, input, vars, var_pairs):
     """
     Send JavaScript code to the Pixelblaze renderer.
 
-    Code can be provided as an argument or piped via stdin.
-    Variables can be set using --vars (JSON) or --var (key:value pairs).
+    Code can be provided inline, from a file, or piped via stdin.
+    Variables can be set using --vars (JSON5) or --var (key:value pairs).
 
     \b
     Examples:
         pb render "export function render(index) { hsv(0.5, 1, 1) }"
-        echo "export function render(index) { hsv(0.5, 1, 1) }" | pb render
+        pb render code.js                                            # Read from file
+        echo "..." | pb render                                       # Pipe from stdin
         pb render code.js --var speed:0.5 --var patternColor:1.0
-        pb render code.js --vars '{"speed": 0.5, "patternColor": 1.0}'
+        pb render code.js --vars '{speed: 0.5, patternColor: 1.0}'   # JSON5: unquoted keys
     """
-    if code is None:
-        if not sys.stdin.isatty():
-            code = sys.stdin.read().strip()
-        else:
-            raise click.ClickException(
-                "No code provided. Supply code as an argument or pipe it via stdin."
-            )
+    code = read_input(input, "code")
 
     variables: Dict[str, float] = {}
 
     if vars:
-        try:
-            variables = json.loads(vars)
-        except json.JSONDecodeError as e:
-            raise click.ClickException(f"Invalid JSON in --vars: {e}")
+        variables = parse_json(vars)
 
     if var_pairs:
         for pair in var_pairs:
