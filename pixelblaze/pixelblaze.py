@@ -1309,15 +1309,44 @@ class Pixelblaze:
         if sources is not None: return _LZstring.decompress(sources)
         return None
 
-    def compilePattern(self, patternCode: str) -> bytes:
+    def compilePattern(self, patternCode: str, allow_cache: bool = False) -> bytes:
         """Compiles pattern sourcecode into a bytecode blob.
 
         Args:
             patternCode (str): The PBscript sourcecode of the pattern.
+            allow_cache (bool): If True, use cached compiler if available. Defaults to False for backwards compatibility.
 
         Returns:
             bytes: a compiled blob of bytecode, ready to send to the Pixelblaze using `sendPatternToRenderer()`.
         """
+
+        def _get_compiler_cache_dir():
+            """Get the compiler cache directory."""
+            import sys
+            if sys.platform == 'win32':
+                cache_dir = pathlib.Path.home() / 'AppData' / 'Local' / 'pixelblaze' / 'compiler_cache'
+            else:
+                cache_dir = pathlib.Path.home() / '.config' / 'pixelblaze' / 'compiler_cache'
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            return cache_dir
+
+        def _get_cached_compiler(version: str):
+            """Get cached compiler code for a specific version."""
+            try:
+                cache_file = _get_compiler_cache_dir() / f"{version}.js"
+                if cache_file.exists():
+                    return cache_file.read_text()
+            except Exception:
+                pass
+            return None
+
+        def _cache_compiler(version: str, compiler_code: str):
+            """Cache compiler code for future use."""
+            try:
+                cache_file = _get_compiler_cache_dir() / f"{version}.js"
+                cache_file.write_text(compiler_code)
+            except Exception:
+                pass
 
         # Firmware-dependent adapters.
         def getSubstring(text: str, startValue: str, endValue: str):
@@ -1389,23 +1418,29 @@ class Pixelblaze:
                 # print("Using v3AdapterV3")
                 return v3AdapterV3
 
-        # Download the webUI from the Pixelblaze and extract the pieces we need for compilation.
-        webUI = gzip.decompress(self.getFile("/index.html.gz")).decode('utf-8-sig')
+        # Try to get compiler from cache first if allowed
         version = self.getVersion()
-        # DEBUG BLOCK -- REMOVE BEFORE COMMITTING
-        # print(webUI.encode('utf-8-sig'))
-        # quit(0)
-        # DEBUG BLOCK -- REMOVE BEFORE COMMITTING
-        components = getAdapter(float(version))(webUI)
-        # print("Hardware Variant: ", components["hardwareVariant"].encode('utf-8-sig'))
-        # print("Constants: ", components["constants"].encode('utf-8'))
-        # print("Extended Operators: ", components["extendedOperators"].encode('utf-8'))
-        # print("Compiler: ", components["compiler"].encode('utf-8-sig'))
+        compiler = None
+        if allow_cache:
+            compiler = _get_cached_compiler(version)
 
-        # Build up the compilation environment from bits and pieces.
-        compiler = 'window = {};\nvar predefinedGlobals = ["pixelCount"];\n' + components["hardwareVariant"] + '\n' + \
-                   components["constants"] + '\n' + components["extendedOperators"] + '\n' + components[
-                       "compiler"] + '\n' + """
+        if compiler is None:
+            # Download the webUI from the Pixelblaze and extract the pieces we need for compilation.
+            webUI = gzip.decompress(self.getFile("/index.html.gz")).decode('utf-8-sig')
+            # DEBUG BLOCK -- REMOVE BEFORE COMMITTING
+            # print(webUI.encode('utf-8-sig'))
+            # quit(0)
+            # DEBUG BLOCK -- REMOVE BEFORE COMMITTING
+            components = getAdapter(float(version))(webUI)
+            # print("Hardware Variant: ", components["hardwareVariant"].encode('utf-8-sig'))
+            # print("Constants: ", components["constants"].encode('utf-8'))
+            # print("Extended Operators: ", components["extendedOperators"].encode('utf-8'))
+            # print("Compiler: ", components["compiler"].encode('utf-8-sig'))
+
+            # Build up the compilation environment from bits and pieces.
+            compiler = 'window = {};\nvar predefinedGlobals = ["pixelCount"];\n' + components["hardwareVariant"] + '\n' + \
+                       components["constants"] + '\n' + components["extendedOperators"] + '\n' + components[
+                           "compiler"] + '\n' + """
             const compilePattern = (src) => {
                 try {
                     compilerOptions = { predefinedGlobals: predefinedGlobals, extendedOperators: extendedOperators, constants: constants }
@@ -1432,6 +1467,10 @@ class Pixelblaze:
                 }
             }
             """
+
+            # Cache the compiler for future use if caching is enabled
+            if allow_cache:
+                _cache_compiler(version, compiler)
 
         # Load the compiler into the interpreter.
         ctx = MiniRacer()

@@ -5,12 +5,46 @@ import socket
 import click
 import json5
 import json
+import pathlib
 from functools import wraps
 from typing import Callable, Optional
 from pixelblaze.pixelblaze import Pixelblaze
 
 log = lambda *args, **kwargs: click.echo(*args, err=True, *kwargs)
 jsons = lambda x: click.echo(json.dumps(x, separators=(',', ':')))
+
+
+def get_cache_dir():
+    """Get the cache directory for Pixelblaze CLI, creating it if needed."""
+    # Use ~/.config/pixelblaze on Unix-like systems, ~/AppData/Local/pixelblaze on Windows
+    if sys.platform == 'win32':
+        cache_dir = pathlib.Path.home() / 'AppData' / 'Local' / 'pixelblaze'
+    else:
+        config_home = pathlib.Path.home() / '.config'
+        cache_dir = config_home / 'pixelblaze'
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def get_cached_ip():
+    """Get the last used IP from cache."""
+    try:
+        cache_file = get_cache_dir() / 'last_ip.txt'
+        if cache_file.exists():
+            return cache_file.read_text().strip()
+    except Exception:
+        pass
+    return None
+
+
+def cache_ip(ip_address):
+    """Cache the IP address for future use."""
+    try:
+        cache_file = get_cache_dir() / 'last_ip.txt'
+        cache_file.write_text(ip_address)
+    except Exception:
+        pass
 
 # Reusable Click options
 no_save_option = click.option(
@@ -36,7 +70,25 @@ def discover_pixelblaze(ip_address: str) -> str:
         click.ClickException: If no Pixelblaze can be found
     """
     if ip_address and ip_address != "auto":
+        cache_ip(ip_address)  # Cache explicitly provided IP
         return ip_address
+
+    # Try cached IP first
+    cached_ip = get_cached_ip()
+    if cached_ip:
+        click.echo(f"Trying cached IP {cached_ip}...", err=True)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            result = sock.connect_ex((cached_ip, 80))
+            sock.close()
+
+            if result == 0:
+                click.echo(f"Found Pixelblaze at {cached_ip} (cached)", err=True)
+                return cached_ip
+        except Exception:
+            pass
+        click.echo(f"Cached IP {cached_ip} not responding, searching...", err=True)
 
     # Try ad-hoc mode first (192.168.4.1)
     adhoc_ip = "192.168.4.1"
@@ -50,6 +102,7 @@ def discover_pixelblaze(ip_address: str) -> str:
 
         if result == 0:
             click.echo(f"Found Pixelblaze at {adhoc_ip}", err=True)
+            cache_ip(adhoc_ip)
             return adhoc_ip
     except Exception as e:
         click.echo(f"Ad-hoc check failed: {e}", err=True)
@@ -60,6 +113,7 @@ def discover_pixelblaze(ip_address: str) -> str:
     try:
         for found_ip in Pixelblaze.EnumerateAddresses(timeout=2000):
             click.echo(f"Found Pixelblaze at {found_ip}", err=True)
+            cache_ip(found_ip)
             return found_ip
     except Exception as e:
         click.echo(f"Enumeration failed: {e}", err=True)

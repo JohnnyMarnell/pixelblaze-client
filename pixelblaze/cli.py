@@ -13,7 +13,7 @@ import re
 import click
 from typing import Dict
 from pixelblaze.pixelblaze import Pixelblaze, PBB
-from pixelblaze.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json, jsons
+from pixelblaze.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json, jsons, get_cache_dir
 
 @click.group()
 @click.option(
@@ -170,8 +170,7 @@ def map(pb: Pixelblaze, input, csv):
 
 
 @pixelblaze.group()
-@click.pass_context
-def seq(ctx):
+def seq():
     """
     Sequencer and playlist control commands.
 
@@ -483,7 +482,7 @@ def render(pb: Pixelblaze, input, vars, var_pairs):
                 variables[key.strip()] = value.strip()
 
     log("Compiling pattern...")
-    bytecode = pb.compilePattern(code)
+    bytecode = pb.compilePattern(code, allow_cache=True)
 
     log("Sending to renderer...")
     pb.sendPatternToRenderer(bytecode)
@@ -622,7 +621,6 @@ def pbb(ctx, output_file, ip, quiet, decode, binary):
 
     if decode:
         # Decode base64 entries
-        import struct
         from pixelblaze.pixelblaze import PBP
 
         data = jsonlib.loads(content)
@@ -708,6 +706,81 @@ def restore(pb: Pixelblaze, input_file):
 
 
 pixelblaze.add_command(pbb)
+
+
+@pixelblaze.group()
+def cache():
+    """
+    Manage Pixelblaze CLI cache.
+
+    The cache stores the last used IP address and compiled pattern compilers
+    to speed up CLI operations.
+    """
+    pass
+
+
+@cache.command()
+def show():
+    """Show cache location and contents."""
+    cache_dir = get_cache_dir()
+
+    log(f"Cache directory: {cache_dir}")
+    log("")
+
+    # Show IP cache
+    ip_file = cache_dir / 'last_ip.txt'
+    if ip_file.exists():
+        log(f"Cached IP: {ip_file.read_text().strip()}")
+    else:
+        log("Cached IP: (none)")
+
+    # Show compiler cache
+    compiler_cache = cache_dir / 'compiler_cache'
+    if compiler_cache.exists():
+        cached_compilers = list(compiler_cache.glob('*.js'))
+        if cached_compilers:
+            log(f"\nCached compilers ({len(cached_compilers)}):")
+            for compiler_file in sorted(cached_compilers):
+                version = compiler_file.stem
+                size_kb = compiler_file.stat().st_size / 1024
+                log(f"  - Version {version} ({size_kb:.1f} KB)")
+        else:
+            log("\nCached compilers: (none)")
+    else:
+        log("\nCached compilers: (none)")
+
+
+@cache.command()
+@click.option('--compiler', is_flag=True, help='Only clear compiler cache')
+@click.option('--ip', is_flag=True, help='Only clear IP cache')
+def clear(compiler, ip):
+    """Clear the cache."""
+    import shutil
+
+    cache_dir = get_cache_dir()
+
+    if not compiler and not ip:
+        # Clear everything
+        if click.confirm(f"Clear all cache in {cache_dir}?", err=True):
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            log("Cache cleared")
+        return
+
+    if ip:
+        ip_file = cache_dir / 'last_ip.txt'
+        if ip_file.exists():
+            ip_file.unlink()
+            log("IP cache cleared")
+        else:
+            log("No IP cache to clear")
+
+    if compiler:
+        compiler_cache = cache_dir / 'compiler_cache'
+        if compiler_cache.exists():
+            shutil.rmtree(compiler_cache, ignore_errors=True)
+            log("Compiler cache cleared")
+        else:
+            log("No compiler cache to clear")
 
 
 def main():
