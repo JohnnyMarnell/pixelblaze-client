@@ -185,6 +185,91 @@ def parse_json(text: str):
         raise click.ClickException(f"Invalid JSON: {e}")
 
 
+def check(condition, error_message: str):
+    """
+    Ensure a condition is true, otherwise raise a ClickException.
+
+    Args:
+        condition: The condition to check
+        error_message: Error message to display if condition is false
+
+    Raises:
+        click.ClickException: If condition is false
+
+    Example:
+        ensure(len(items) > 0, "No items found")
+        ensure(value >= 0 and value <= 1, "Value must be between 0 and 1")
+    """
+    if not condition:
+        raise click.ClickException(error_message)
+
+
+def parse_vars(args):
+    """
+    Parse variable arguments in flexible formats.
+
+    Supports:
+    - key value pairs: ('foo', 'bar') → {foo: "bar"}
+    - colon-separated: ('foo:bar baz',) → {foo: "bar baz"}
+    - JSON5 objects: ('{a:1, b:2}',) → {a: 1, b: 2}
+    - mixed: ('foo', '2', 'bar:3', '{baz:true}') → {foo: 2, bar: 3, baz: true}
+
+    Args:
+        args: Tuple or list of argument strings
+
+    Returns:
+        dict: Parsed variables
+
+    Raises:
+        click.ClickException: If parsing fails or args are malformed
+
+    Examples:
+        parse_vars(['foo', 'bar']) → {'foo': 'bar'}
+        parse_vars(['foo', '1']) → {'foo': 1}
+        parse_vars(['foo:bar']) → {'foo': 'bar'}
+        parse_vars(['{a:1}']) → {'a': 1}
+        parse_vars(['foo', '2', 'bar:3']) → {'foo': 2, 'bar': 3}
+    """
+    variables = {}
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+
+        # Try to parse as JSON5 object/array
+        if arg.startswith('{') or arg.startswith('['):
+            try:
+                parsed = parse_json(arg)
+                if isinstance(parsed, dict):
+                    variables.update(parsed)
+                    i += 1
+                    continue
+            except:
+                pass
+
+        # Check for colon-separated key:value
+        if ':' in arg:
+            key, value = arg.split(':', 1)
+            try:
+                variables[key] = float(value)
+            except ValueError:
+                variables[key] = value
+            i += 1
+            continue
+
+        # Otherwise, treat as key with next arg as value
+        check(i + 1 < len(args), f"Missing value for key '{arg}'")
+        key = arg
+        value = args[i + 1]
+        try:
+            variables[key] = float(value)
+        except ValueError:
+            variables[key] = value
+        i += 2
+
+    return variables
+
+
 def get_pixelblaze(ctx: click.Context) -> Pixelblaze:
     """
     Gets a Pixelblaze instance from the context, handling discovery if needed.

@@ -13,7 +13,7 @@ import re
 import click
 from typing import Dict
 from pixelblaze.pixelblaze import Pixelblaze, PBB
-from pixelblaze.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json, jsons, get_cache_dir
+from pixelblaze.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json, jsons, get_cache_dir, check, parse_vars
 
 @click.group()
 @click.option(
@@ -85,8 +85,7 @@ def on(pb: Pixelblaze, brightness, play_sequencer, no_save):
         pb on --play-sequencer      # Set brightness to 1.0 and start sequencer (saved)
         pb on 0.8 --no-save         # Set brightness to 80% (temporary only)
     """
-    if not 0.0 <= brightness <= 1.0:
-        raise click.ClickException("Brightness must be between 0.0 and 1.0")
+    check(0.0 <= brightness <= 1.0, "Brightness must be between 0.0 and 1.0")
 
     log(f"Setting brightness to {brightness}...")
     pb.setBrightnessSlider(brightness, saveToFlash=not no_save)
@@ -249,8 +248,7 @@ def random(pb: Pixelblaze):
     log("Getting pattern list...")
     patterns = pb.getPatternList()
 
-    if not patterns:
-        raise click.ClickException("No patterns found on Pixelblaze")
+    check(patterns, "No patterns found on Pixelblaze")
 
     pattern_id = rand.choice(list(patterns.keys()))
     pattern_name = patterns[pattern_id]
@@ -276,20 +274,15 @@ def set_duration(pb: Pixelblaze, seconds, no_save):
         pb seq len 10          # Set all durations to 10 seconds (saved)
         pb seq len 30 --no-save   # Set to 30 seconds (temporary only)
     """
-    if seconds <= 0:
-        raise click.ClickException("Duration must be greater than 0")
+    check(seconds > 0, "Duration must be greater than 0")
 
     milliseconds = int(seconds * 1000)
 
     log("Getting current playlist...")
     playlist = pb.getSequencerPlaylist()
 
-    if 'playlist' not in playlist or 'items' not in playlist['playlist']:
-        raise click.ClickException("Invalid playlist structure")
-
-    items = playlist['playlist']['items']
-    if not items:
-        raise click.ClickException("Playlist is empty")
+    items = playlist.get['playlist']['items']
+    check(items, "Playlist is empty")
 
     original_count = len(items)
     for item in items:
@@ -331,8 +324,7 @@ def pattern(pb: Pixelblaze, search, no_save, exact):
     log("Fetching pattern list...")
     patterns = pb.getPatternList()
 
-    if not patterns:
-        raise click.ClickException("No patterns found on Pixelblaze")
+    check(patterns, "No patterns found on Pixelblaze")
 
     pattern_regex = re.compile(search, re.IGNORECASE)
     matched_id = None
@@ -355,7 +347,7 @@ def pattern(pb: Pixelblaze, search, no_save, exact):
         log("\nAvailable patterns:")
         for pattern_name in sorted(patterns.values()):
             log(f"  - {pattern_name}")
-        raise click.ClickException(f"Pattern '{search}' not found")
+    check(matched_id, f"Pattern '{search}' not found")
 
     log(f"Switching to pattern: {matched_name}")
     pb.setActivePattern(matched_id, saveToFlash=not no_save)
@@ -435,51 +427,33 @@ def ws(pb: Pixelblaze, json, expect):
 @cli(pixelblaze)
 @input_arg
 @click.option(
-    '--vars',
-    type=str,
-    help='JSON dictionary of variables to set (e.g., \'{"speed": 0.5, "patternColor": 1.0}\')'
-)
-@click.option(
     '--var',
-    'var_pairs',
+    'var_args',
     multiple=True,
-    help='Individual variable as key:value pair (can be used multiple times, e.g., --var speed:0.5 --var patternColor:1.0)'
+    help='Variables in flexible format: key value, key:value, or \'{json5}\' (can be used multiple times)'
 )
-def render(pb: Pixelblaze, input, vars, var_pairs):
+def render(pb: Pixelblaze, input, var_args):
     """
     Send JavaScript code to the Pixelblaze renderer.
 
     Code can be provided inline, from a file, or piped via stdin.
-    Variables can be set using --vars (JSON5) or --var (key:value pairs).
+    Variables can be set using flexible --var format.
 
     \b
     Examples:
-        pb render "export function render(index) { hsv(0.5, 1, 1) }"
-        pb render code.js                                            # Read from file
-        echo "..." | pb render                                       # Pipe from stdin
-        pb render code.js --var speed:0.5 --var patternColor:1.0
-        pb render code.js --vars '{speed: 0.5, patternColor: 1.0}'   # JSON5: unquoted keys
+        pb render 'export function render(index) { hsv(0.5, 1, 1) }'
+        pb render code.js                                   # Read from file
+        echo "/* code */" | pb render                       # Pipe from stdin
+        pb render code.js --var speed 0.5                   # key value format
+        pb render code.js --var speed:0.5                   # colon format
+        pb render code.js --var '{speed: 0.5, color: 1.0}'  # JSON5 object
+        pb render code.js --var speed 0.5 --var color:1.0   # Mix formats
     """
     code = read_input(input, "code")
     if ("export" not in code):
         code = 'export function render(index) { ' + code + ' ; }'
 
-    variables: Dict[str, float] = {}
-
-    if vars:
-        variables = parse_json(vars)
-
-    if var_pairs:
-        for pair in var_pairs:
-            if ':' not in pair:
-                raise click.ClickException(
-                    f"Invalid --var format '{pair}'. Expected 'key:value'"
-                )
-            key, value = pair.split(':', 1)
-            try:
-                variables[key.strip()] = float(value.strip())
-            except ValueError:
-                variables[key.strip()] = value.strip()
+    variables = parse_vars(var_args) if var_args else {}
 
     log("Compiling pattern...")
     bytecode = pb.compilePattern(code, allow_cache=True)
@@ -492,6 +466,51 @@ def render(pb: Pixelblaze, input, vars, var_pairs):
         pb.setActiveVariables(variables)
 
     log("Pattern rendered successfully")
+
+
+@click.argument('args', nargs=-1, required=True)
+@click.option(
+    '--control',
+    is_flag=True,
+    help='Set as UI controls (sliders) instead of variables'
+)
+@no_save_option
+@cli(pixelblaze)
+def var(pb: Pixelblaze, args, control, no_save):
+    """
+    Set variables or UI controls on the active pattern.
+
+    Variables are pattern exports (export var myVar), while controls are
+    UI sliders (export function sliderMyControl(v)).
+
+    Supports multiple input formats that can be mixed:
+    - key value pairs: pb var foo bar
+    - colon-separated: pb var foo:bar
+    - JSON5 objects: pb var '{a:1, b:2}'
+    - combined: pb var foo 2 bar:3 '{baz:true}'
+
+    \b
+    Examples:
+        pb var globalSpeed .3              # Set variable to number
+        pb var foo bar                     # Set variable to string
+        pb var foo 1                       # Set variable to number 1
+        pb var 'foo:bar baz'               # Set foo to "bar baz" (colon format)
+        pb var '{a:1, b:2}'                # Set multiple from JSON5 object
+        pb var foo 2 bar:3 '{baz:true}'    # Mix all formats
+        pb var --control hue 0.33          # Set UI control
+        pb var foo bar --no-save           # Don't save to flash
+    """
+    variables = parse_vars(args)
+    check(variables, "No variables specified")
+
+    if control:
+        log(f"Setting controls: {variables}")
+        pb.setActiveControls(variables, saveToFlash=not no_save)
+    else:
+        log(f"Setting variables: {variables}")
+        pb.setActiveVariables(variables)
+
+    log("Variables set successfully")
 
 
 @click.option(
@@ -554,7 +573,7 @@ def ping(pb: Pixelblaze, count):
         click.echo(f"{avg_time:.2f}")
     else:
         log(f"\nAll pings failed")
-        raise click.ClickException("Failed to ping Pixelblaze")
+    check(successful > 0, "Failed to ping Pixelblaze")
 
 
 @click.command()
