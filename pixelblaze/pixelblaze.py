@@ -430,11 +430,13 @@ class Pixelblaze:
                         self.ws = websocket.create_connection(uri, sockopt=(
                         (socket.SOL_SOCKET, socket.SO_REUSEADDR, 1), (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),))
                     break
-                except websocket._exceptions.WebSocketConnectionClosedException:
-                    # print("Open failed.  Retry # ",retryCount)
+                except (websocket._exceptions.WebSocketConnectionClosedException,
+                        websocket._exceptions.WebSocketBadStatusException):
+                    # Connection failed - retry after a short delay
                     retryCount += 1
                     if retryCount >= self.max_open_retries:
                         raise
+                    time.sleep(0.1 * retryCount)  # Slight backoffs, 100ms, 200ms, 300ms etc
 
             self.ws.settimeout(self.default_recv_timeout)
             self.connected = True
@@ -1518,7 +1520,8 @@ class Pixelblaze:
         Returns:
             str: The text of the mapFunction.
         """
-        return self.getFile("/pixelmap.txt")
+        result = self.getFile("/pixelmap.txt")
+        return result.decode('utf-8') if result else None
 
     def setMapCoordinates(self, mapCoordinates: list) -> bool:
         """Sets raw coordinates for the map
