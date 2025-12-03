@@ -7,6 +7,7 @@ This module provides a modern CLI tool for controlling Pixelblazes with
 flexible discovery, pattern rendering, and configuration management.
 """
 
+import json as jsonlib
 import time
 import re
 import click
@@ -131,9 +132,8 @@ def off(pb: Pixelblaze, pause_sequencer, no_save):
 
 @cli(pixelblaze)
 @input_arg
-@click.option('--fn', is_flag=True, help='Whether using map function code instead of pixel coordinates')
 @click.option('--csv', is_flag=True, help='Output as csv instead of Pixelblaze 3-arrays')
-def map(pb: Pixelblaze, input, fn, csv):
+def map(pb: Pixelblaze, input, csv):
     """
     Get or set the pixel map function.
 
@@ -146,26 +146,27 @@ def map(pb: Pixelblaze, input, fn, csv):
         pb map                       # Get current map coordinates (normalized 0-1)
         pb map map.js                # Set map from file
         pb map < map.js              # Set map from stdin
-        pb map --fn                  # Show map function
     """
-    map_type = fn and "function" or "coordinates"
     content = read_input(input, "map", required=False)
     setting = content is not None
-    log(f"{setting and "Setting" or "Fetching"} map {map_type}...")
 
-    if setting and fn:
-        pb.setMapFunction(content)
-    elif setting and not fn:
-        pb.setMapCoordinates(parse_json(content))
-    elif fn:
-        click.echo(pb.getMapFunction())
+    if setting:
+        if "function" in content:
+            log(f"Setting map function...")
+            pb.setMapFunction(content)
+        else:
+            # Also supporting numbers as strings
+            log(f"Setting map coordinates...")
+            pb.setMapCoordinates(parse_json(jsonlib.dumps(parse_json(content)).replace('"', "")))
     elif csv:
+        log(f"Fetching map coordinates as CSV...")
         coords = pb.getMapCoordinates()
         click.echo("index,x,y,z")
         for i in range(0, len(coords[0])):
             click.echo(f"{i},{coords[0][i]},{coords[1][i]},{coords[2][i]}")
     else:
-        jsons(pb.getMapCoordinates())
+        log(f"Fetching map config...")
+        jsons({'coordinates': pb.getMapCoordinates(), 'fn': pb.getMapFunction()})
 
 
 @pixelblaze.group()
