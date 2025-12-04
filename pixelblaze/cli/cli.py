@@ -13,7 +13,8 @@ import re
 import click
 import pathlib
 from pixelblaze.pixelblaze import Pixelblaze, PBB
-from pixelblaze.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json, jsons, get_cache_dir, check, parse_vars
+from pixelblaze.cli.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json, jsons, \
+                                     get_cache_dir, check, parse_vars
 
 @click.group()
 @click.option(
@@ -303,7 +304,6 @@ def set_duration(pb: Pixelblaze, seconds, no_save):
 @click.option(
     '--write',
     'write_target',
-    is_flag=False,
     flag_value='',
     default=None,
     help='Save pattern to Pixelblaze (optionally specify name or pattern ID to overwrite)'
@@ -465,7 +465,7 @@ def _handle_write_mode(pb: Pixelblaze, input, write_target, img, variables, no_s
     log("Compiling pattern...")
     bytecode = pb.compilePattern(code, allow_cache=True)
 
-    img = img or pathlib.Path(__file__).parent.parent / 'site/images/preview_placeholder.jpg'
+    img = img or pathlib.Path(__file__).parent / '../../site/images/preview_placeholder.jpg'
     log(f"Loading preview image from {img}...")
     with open(img, 'rb') as f:
         preview_image = f.read()
@@ -557,7 +557,7 @@ def cfg(pb: Pixelblaze):
 
 
 @cli(pixelblaze)
-@click.argument('json_data', type=str)
+@click.argument('json', type=str)
 @click.option(
     '--expect',
     type=str,
@@ -592,7 +592,7 @@ def ws(pb: Pixelblaze, json, expect):
     else:
         log("Response:")
         try:
-            jsons(response)
+            jsons(jsonlib.loads(response))
         except:
             # Not JSON, just print it
             click.echo(response)

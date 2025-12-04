@@ -37,7 +37,7 @@ setuptools.setup(
     python_requires='>=3.9',
     entry_points={
         'console_scripts': [
-            'pb=pixelblaze.cli:main',
+            'pb=pixelblaze.cli.cli:main',
         ],
     },
 )

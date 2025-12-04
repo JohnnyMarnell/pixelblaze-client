@@ -19,7 +19,7 @@ This module contains the following classes:
 
 - [`EPE`](#class-epe): an object for creating and manipulating Electromage Pattern Exports. 
 
-There is also a handy `pb` CLI installed, see `--help` strings, [test_cli.py](../pixelblaze/test_cli.py),
+There is also a handy `pb` CLI installed, see `--help` strings, [test_cli.py](../pixelblaze/cli/test_cli.py),
 and [cli_examples.sh](../examples/cli_examples.sh) for examples of how to use.
 
 

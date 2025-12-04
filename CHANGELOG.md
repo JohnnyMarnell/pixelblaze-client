@@ -30,6 +30,14 @@ Changes are categorized into the following types:
 * Cache mini-racer compile eval for speed
 * Add and use `PBP.fromComponents()`
 
+## [**v1.1.6**] - 2025-9-2
+
+#### Fixed
+
+* Remove unused re.T import that was causing problems with recent Python versions
+* Replaced deprecated py-mini-racer with mini-racer 
+* Fixed long-standing bug in output expander board configuration handling
+
 ## [**v1.1.5**] - 2025-2-23
 
 #### Fixed
