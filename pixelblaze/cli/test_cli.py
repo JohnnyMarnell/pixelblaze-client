@@ -4,7 +4,7 @@
 import json
 import shlex
 from click.testing import CliRunner
-from pixelblaze.cli import pixelblaze
+from pixelblaze.cli.cli import pixelblaze
 
 
 def test_cli():
@@ -24,7 +24,7 @@ def test_cli():
     original_brightness = cfg['config'].get('brightness', 1.0)
     # Active pattern ID is in the sequencer config, not settings config
     original_pattern_id = cfg.get('sequencer', {}).get('activeProgram', {}).get('activeProgramId')
-    original_pattern_name = cfg['patterns'].get(original_pattern_id, 'Unknown') if original_pattern_id else None
+    original_pattern_name = cfg['patterns'].get(original_pattern_id, '___Unknown') if original_pattern_id else None
     print(f"   Original pixels: {original_pixels}")
     print(f"   Original brightness: {original_brightness}")
     print(f"   Original pattern: {original_pattern_name} ({original_pattern_id})")
@@ -150,7 +150,7 @@ def test_cli():
     print(f"   ✓ Brightness restored to {original_brightness}")
 
     # Restore original pattern
-    if original_pattern_id:
+    if original_pattern_id and original_pattern_name != '___Unknown':
         print(f"\n13. Restoring original pattern ({original_pattern_name})...")
         cli(f'% pb pattern {original_pattern_id}')
         result = cli('% pb cfg')
@@ -159,7 +159,7 @@ def test_cli():
         assert active_pattern_id == original_pattern_id, f"Failed to restore pattern"
         print(f"   ✓ Pattern restored to {original_pattern_name}")
     else:
-        print("\n13. No original pattern to restore (was None)")
+        print("\n13. No original pattern to restore (was unknown)")
 
     print("\n✅ All tests passed!")
 

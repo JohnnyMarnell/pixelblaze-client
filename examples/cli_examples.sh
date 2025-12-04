@@ -73,7 +73,7 @@ pb seq pause
 pb seq next
 
 # Jump to random pattern
-pb seq rand  # [Corrected from 'random']
+pb seq rand
 
 # Set all patterns to 10 seconds
 pb seq len 10
@@ -98,7 +98,7 @@ pb pattern examples/test_pattern.js
 pb pattern examples/test_pattern.js --var speed 0.5
 
 # Render with JSON variables (supports JSON5/loose keys)
-pb pattern src.js --var '{speed: 0.5, brightness: 1.0}' # [Corrected flag from --vars]
+pb pattern src.js --var '{speed: 0.5, brightness: 1.0}'
 
 # Render from stdin
 echo "rgb(0, 0, 1)" | pb pattern

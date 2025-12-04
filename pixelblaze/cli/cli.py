@@ -301,12 +301,12 @@ def set_duration(pb: Pixelblaze, seconds, no_save):
 
 @cli(pixelblaze)
 @click.argument('input', type=str)
+@click.argument('name', type=str, required=False) # New optional second argument
 @click.option(
     '--write',
-    'write_target',
-    flag_value='',
-    default=None,
-    help='Save pattern to Pixelblaze (optionally specify name or pattern ID to overwrite)'
+    '-w',
+    is_flag=True,
+    help='Save pattern to Pixelblaze (uses NAME argument or filename stem)'
 )
 @click.option(
     '--rm',
@@ -330,11 +330,12 @@ def set_duration(pb: Pixelblaze, seconds, no_save):
     is_flag=True,
     help='Require exact match for pattern name lookup'
 )
-def pattern(pb: Pixelblaze, input, write_target, rm, img, var_args, no_save, exact):
+def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exact):
     """
     Unified pattern command: switch to, render, or save patterns.
 
     INPUT can be a pattern name, file path, or inline JavaScript code.
+    NAME (optional) is the target pattern name or ID for --write operations.
 
     \b
     **Without --write or --rm (render/switch mode):**
@@ -345,57 +346,52 @@ def pattern(pb: Pixelblaze, input, write_target, rm, img, var_args, no_save, exa
     \b
     **With --write (save mode):**
     - Saves the pattern to Pixelblaze filesystem
-    - Optionally specify pattern name or ID to overwrite
-
-    \b
-    **With --rm (remove mode):**
-    - Removes the pattern from Pixelblaze
-    - INPUT must be a pattern name or ID
+    - Uses NAME if provided, otherwise derives name from filename
+    - If NAME matches an existing ID, that pattern is overwritten
 
     \b
     Examples:
-        # Switch to existing pattern
+        # Switch/Render/Remove
         pb pattern rainbow
-        pb pattern "fire" --exact
-
-        # Render from file
         pb pattern code.js
-        pb pattern code.js --var speed 0.5
-
-        # Render inline code
-        pb pattern "hsv(time(0.1), 1, 1)"
-
-        # Save pattern from file
-        pb pattern code.js --write
-        pb pattern code.js --write "My Pattern"
-        pb pattern code.js --write --img preview.jpg
-
-        # Save inline code (requires name)
-        pb pattern "hsv(0.5,1,1)" --write "Solid Cyan"
-
-        # Overwrite existing pattern by ID
-        pb pattern code.js --write abcd1234567890123
-
-        # Remove pattern
-        pb pattern rainbow --rm
-        pb pattern abcd1234567890123 --rm
+        pb pattern abcd123456789012
+        pb pattern foo --rm
+  
+    \b
+        # Save (Write)
+        pb pattern code.js --write              # Save as "code"
+        pb pattern code.js --write "New Name"   # Save as "New Name"
+        pb pattern "hsv(0,1,1)" --write "Solid" # inline, requires name
+        pb pattern code.js --write abcd123456789012 # Overwrite existing
     """
     # Check for conflicting flags
-    check(not (write_target is not None and rm), "Cannot use --write and --rm together")
+    check(not (write and rm), "Cannot use --write and --rm together")
+    check(not (rm and name), "Cannot use extra argument with --rm")
 
     # Parse variables
     variables = parse_vars(var_args) if var_args else {}
 
     if rm:
-        # ===== REMOVE MODE: Delete pattern from Pixelblaze =====
+        # ===== REMOVE MODE =====
         check(not variables, "Cannot use --var with --rm")
         check(img is None, "Cannot use --img with --rm")
         _handle_remove_mode(pb, input, exact)
-    elif write_target is not None:
-        # ===== WRITE MODE: Save pattern to Pixelblaze =====
-        _handle_write_mode(pb, input, write_target, img, variables, no_save)
+
+    elif write:
+        # ===== WRITE MODE =====
+        # Map the new 'name' arg to the internal 'write_target' logic
+        # If name is None, pass '' so logic knows to use filename stem
+        target = name if name else ''
+        _handle_write_mode(pb, input, target, img, variables, no_save)
+
     else:
-        # ===== RENDER/SWITCH MODE: Render or switch to pattern =====
+        # ===== RENDER/SWITCH MODE =====
+        # If user provided a name but didn't say --write, we could warn, 
+        # but for now let's just ignore it or assume they meant to write?
+        # Ideally, we strictly check:
+        if name:
+             log(f"Warning: Name argument '{name}' ignored because --write was not specified.")
+        
         _handle_render_or_switch_mode(pb, input, variables, no_save, exact)
 
 
