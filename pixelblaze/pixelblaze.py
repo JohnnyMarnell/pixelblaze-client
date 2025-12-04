@@ -1515,6 +1515,10 @@ class Pixelblaze:
     def makeId(self):
         # build a 17-character ID consisting of characters from the list above
         return ''.join(random.choice(Pixelblaze._pattern_id_chars) for _ in range(17))
+    
+    @staticmethod
+    def isPatternId(id: str):
+        return len(id) == 17 and all(c in Pixelblaze._pattern_id_chars for c in id)
 
     def calculate_crc32(self, data):
         return binascii.crc32(data) & 0xffffffff
@@ -1551,7 +1555,7 @@ class Pixelblaze:
         """
         if id is None:
             id = self.makeId()
-        if len(id) != 17 or any(c not in Pixelblaze._pattern_id_chars for c in id):
+        if not Pixelblaze.isPatternId(id):
             raise ValueError("Invalid pattern ID: " + id)
 
         payload = {

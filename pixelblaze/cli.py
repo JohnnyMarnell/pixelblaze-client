@@ -8,13 +8,10 @@ flexible discovery, pattern rendering, and configuration management.
 """
 
 import json as jsonlib
-import string
-import random
 import time
 import re
 import click
 import pathlib
-from typing import Dict
 from pixelblaze.pixelblaze import Pixelblaze, PBB
 from pixelblaze.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json, jsons, get_cache_dir, check, parse_vars
 
@@ -302,61 +299,213 @@ def set_duration(pb: Pixelblaze, seconds, no_save):
 
 
 @cli(pixelblaze)
-@click.argument('search', type=str)
+@click.argument('input', type=str)
+@click.option(
+    '--write',
+    'write_target',
+    is_flag=False,
+    flag_value='',
+    default=None,
+    help='Save pattern to Pixelblaze (optionally specify name or pattern ID to overwrite)'
+)
+@click.option(
+    '--img',
+    type=click.Path(exists=True),
+    help='Path to preview image (100x150 JPEG) for --write. If omitted, generates SMPTE placeholder'
+)
+@click.option(
+    '--var',
+    'var_args',
+    multiple=True,
+    help='Variables/controls in flexible format: key value, key:value, or \'{json5}\''
+)
 @no_save_option
 @click.option(
     '--exact',
     is_flag=True,
-    help='Require exact match instead of partial regex match'
+    help='Require exact match for pattern name lookup'
 )
-def pattern(pb: Pixelblaze, search, no_save, exact):
+def pattern(pb: Pixelblaze, input, write_target, img, var_args, no_save, exact):
     """
-    Switch to a pattern by name (case-insensitive partial match).
+    Unified pattern command: switch to, render, or save patterns.
 
-    SEARCH is a string or regex pattern to match against pattern names.
-    The first matching pattern will be activated.
+    INPUT can be a pattern name, file path, or inline JavaScript code.
+
+    \b
+    **Without --write (render/switch mode):**
+    - If INPUT is a file path → render pattern from file
+    - Elif INPUT matches existing pattern → switch to that pattern
+    - Else → render INPUT as inline JavaScript code
+
+    \b
+    **With --write (save mode):**
+    - Saves the pattern to Pixelblaze filesystem
+    - Optionally specify pattern name or ID to overwrite
 
     \b
     Examples:
-        pb pattern rainbow              # Match "Rainbow" or "rainbow wave" (saved)
-        pb pattern "^glit"              # Match patterns starting with "glit" (saved)
-        pb pattern fire --no-save       # Match "fire" (temporary only)
-        pb pattern "sound.*react"       # Regex: "sound" followed by "react" (saved)
-        pb pattern exact --exact        # Exact match only (case-insensitive, saved)
+        # Switch to existing pattern
+        pb pattern rainbow
+        pb pattern "fire" --exact
+
+        # Render from file
+        pb pattern code.js
+        pb pattern code.js --var speed 0.5
+
+        # Render inline code
+        pb pattern "hsv(time(0.1), 1, 1)"
+
+        # Save pattern from file
+        pb pattern code.js --write
+        pb pattern code.js --write "My Pattern"
+        pb pattern code.js --write --img preview.jpg
+
+        # Save inline code (requires name)
+        pb pattern "hsv(0.5,1,1)" --write "Solid Cyan"
+
+        # Overwrite existing pattern by ID
+        pb pattern code.js --write abcd1234567890123
     """
-    log("Fetching pattern list...")
-    patterns = pb.getPatternList()
+    # Parse variables
+    variables = parse_vars(var_args) if var_args else {}
 
-    check(patterns, "No patterns found on Pixelblaze")
+    if write_target is not None:
+        # ===== WRITE MODE: Save pattern to Pixelblaze =====
+        _handle_write_mode(pb, input, write_target, img, variables)
+    else:
+        # ===== RENDER/SWITCH MODE: Render or switch to pattern =====
+        _handle_render_or_switch_mode(pb, input, variables, no_save, exact)
 
-    pattern_regex = re.compile(search, re.IGNORECASE)
-    matched_id = None
-    matched_name = None
 
-    for pattern_id, pattern_name in patterns.items():
-        if exact:
-            if pattern_name.lower() == search.lower():
-                matched_id = pattern_id
-                matched_name = pattern_name
-                break
+def _handle_write_mode(pb: Pixelblaze, input, write_target, img, variables):
+    """Handle --write mode: save pattern to Pixelblaze."""
+    is_file = pathlib.Path(input).is_file()
+
+    # Read code
+    if is_file:
+        code = read_input(input, "code")
+    else:
+        code = input
+
+    # Determine pattern name/ID
+    if write_target == '':
+        # Infer from filename
+        check(is_file, "Pattern name required when not reading from file. Use: --write NAME")
+        pattern_name = pathlib.Path(input).stem
+        pattern_id = None
+    elif Pixelblaze.isPatternId(write_target):
+        # It's a pattern ID to overwrite
+        pattern_id = write_target
+        # Get existing pattern name
+        patterns = pb.getPatternList()
+        pattern_name = patterns.get(pattern_id)
+        check(pattern_name, f"Pattern ID {write_target} not found")
+    else:
+        # It's a pattern name
+        pattern_name = write_target
+        pattern_id = None
+
+    # Add export wrapper if needed
+    if "export" not in code:
+        code = 'export function render(index) { ' + code + ' ; }'
+
+    # Compile
+    log("Compiling pattern...")
+    bytecode = pb.compilePattern(code, allow_cache=True)
+
+    # Use preview or placeholder
+    img = img or pathlib.Path(__file__).parent.parent / 'site/images/preview_placeholder.jpg'
+    log(f"Loading preview image from {img}...")
+    with open(img, 'rb') as f:
+        preview_image = f.read()
+
+    # Save
+    log(f"Saving pattern '{pattern_name}' (ID: {pattern_id})...")
+    pb.savePattern(
+        previewImage=preview_image,
+        sourceCode=code,
+        byteCode=bytecode,
+        name=pattern_name,
+        id=pattern_id
+    )
+
+    log(f"Pattern '{pattern_name}' saved successfully!")
+
+    # Set variables/controls if provided
+    if variables:
+        _set_vars_and_controls(pb, variables, True)
+
+
+def _handle_render_or_switch_mode(pb: Pixelblaze, input, variables, no_save, exact):
+    """Handle render or switch mode based on input type."""
+    is_file = pathlib.Path(input).is_file()
+
+    if is_file:
+        # Render from file
+        code = read_input(input, "code")
+        _render_pattern(pb, code, variables)
+    else:
+        # Try to find existing pattern by name
+        log("Fetching pattern list...")
+        patterns = pb.getPatternList()
+
+        matched_id = None
+        matched_name = None
+
+        if patterns:
+            pattern_regex = re.compile(input, re.IGNORECASE)
+
+            for pattern_id, pattern_name in patterns.items():
+                if exact:
+                    if pattern_name.lower() == input.lower():
+                        matched_id = pattern_id
+                        matched_name = pattern_name
+                        break
+                else:
+                    if pattern_regex.search(pattern_name):
+                        matched_id = pattern_id
+                        matched_name = pattern_name
+                        break
+
+        if matched_id:
+            # Switch to existing pattern
+            log(f"Switching to pattern: {matched_name}")
+            pb.setActivePattern(matched_id, saveToFlash=not no_save)
+
+            action = "activated" if no_save else "saved and activated"
+            log(f"Pattern '{matched_name}' {action}")
+
+            if variables:
+                _set_vars_and_controls(pb, variables, not no_save)
         else:
-            if pattern_regex.search(pattern_name):
-                matched_id = pattern_id
-                matched_name = pattern_name
-                break
+            # Treat as inline code
+            _render_pattern(pb, input, variables)
 
-    if not matched_id:
-        log(f"\nNo pattern matching '{search}' found.")
-        log("\nAvailable patterns:")
-        for pattern_name in sorted(patterns.values()):
-            log(f"  - {pattern_name}")
-    check(matched_id, f"Pattern '{search}' not found")
 
-    log(f"Switching to pattern: {matched_name}")
-    pb.setActivePattern(matched_id, saveToFlash=not no_save)
+def _render_pattern(pb: Pixelblaze, code, variables):
+    """Compile and render a pattern to the Pixelblaze."""
+    if "export" not in code:
+        code = 'export function render(index) { ' + code + ' ; }'
 
-    action = "activated" if no_save else "saved and activated"
-    log(f"Pattern '{matched_name}' {action}")
+    log("Compiling pattern...")
+    bytecode = pb.compilePattern(code, allow_cache=True)
+
+    log("Sending to renderer...")
+    pb.sendPatternToRenderer(bytecode)
+
+    if variables:
+        _set_vars_and_controls(pb, variables)
+
+    log("Pattern rendered successfully")
+
+
+def _set_vars_and_controls(pb: Pixelblaze, variables, save=False):
+    """Set variables and/or controls on the active pattern."""
+    log(f"Setting variables/controls: {variables}")
+    # Try to set as controls (UI sliders) - these get saved to flash
+    pb.setActiveControls(variables, saveToFlash=save)
+    # Also try to set as variables (exported vars) - these don't persist
+    pb.setActiveVariables(variables)
 
 
 @cli(pixelblaze)
@@ -425,135 +574,6 @@ def ws(pb: Pixelblaze, json, expect):
         except:
             # Not JSON, just print it
             click.echo(response)
-
-
-@cli(pixelblaze)
-@input_arg
-@click.option(
-    '--var',
-    'var_args',
-    multiple=True,
-    help='Variables in flexible format: key value, key:value, or \'{json5}\' (can be used multiple times)'
-)
-def render(pb: Pixelblaze, input, var_args):
-    """
-    Send JavaScript code to the Pixelblaze renderer.
-
-    Code can be provided inline, from a file, or piped via stdin.
-    Variables can be set using flexible --var format.
-
-    \b
-    Examples:
-        pb render 'export function render(index) { hsv(0.5, 1, 1) }'
-        pb render code.js                                   # Read from file
-        echo "/* code */" | pb render                       # Pipe from stdin
-        pb render code.js --var speed 0.5                   # key value format
-        pb render code.js --var speed:0.5                   # colon format
-        pb render code.js --var '{speed: 0.5, color: 1.0}'  # JSON5 object
-        pb render code.js --var speed 0.5 --var color:1.0   # Mix formats
-    """
-    code = read_input(input, "code")
-    if ("export" not in code):
-        code = 'export function render(index) { ' + code + ' ; }'
-
-    variables = parse_vars(var_args) if var_args else {}
-
-    log("Compiling pattern...")
-    bytecode = pb.compilePattern(code, allow_cache=True)
-
-    log("Sending to renderer...")
-    pb.sendPatternToRenderer(bytecode)
-
-    if variables:
-        log(f"Setting variables: {variables}")
-        pb.setActiveVariables(variables)
-
-    log("Pattern rendered successfully")
-
-
-@cli(pixelblaze)
-@input_arg
-@click.option(
-    '--name',
-    type=str,
-    help='Pattern name (required if not reading from file)'
-)
-@click.option(
-    '--img',
-    type=click.Path(exists=True),
-    help='Path to preview image (100x150 JPEG). If omitted, uses SMPTE color bar placeholder'
-)
-@click.option(
-    '--var',
-    'var_args',
-    multiple=True,
-    help='Variables in flexible format: key value, key:value, or \'{json5}\''
-)
-def write(pb: Pixelblaze, input, name, img, var_args):
-    """
-    Compile and save a pattern to the Pixelblaze.
-
-    Code can be provided inline, from a file, or piped via stdin.
-    If reading from a file, the pattern name defaults to the filename stem.
-    Otherwise, --name is required.
-
-    The preview image can be provided via --img (must be 100x150 JPEG).
-    If omitted, a SMPTE color bar placeholder is used.
-
-    \b
-    Examples:
-        pb write pattern.js                              # Save pattern, name from file
-        pb write pattern.js --img preview.jpg            # With custom preview
-        pb write --name "My Pattern" code.js             # Explicit name
-        pb write pattern.js --var speed 0.5              # With variables
-        echo "/* code */" | pb write --name "Inline"     # From stdin
-    """
-    # Determine pattern name
-    pattern_name = name
-    if not pattern_name:
-        # Try to get name from input if it's a file
-        if input and pathlib.Path(input).is_file():
-            pattern_name = pathlib.Path(input).stem
-        else:
-            check(False, "Pattern name is required when not reading from a file. Use --name option.")
-
-    # Read code
-    code = read_input(input, "code")
-
-    # Add export wrapper if needed
-    if "export" not in code:
-        code = 'export function render(index) { ' + code + ' ; }'
-
-    # Parse variables
-    variables = parse_vars(var_args) if var_args else {}
-
-    # Compile pattern
-    log("Compiling pattern...")
-    bytecode = pb.compilePattern(code, allow_cache=True)
-
-    # Get or generate preview image
-    img = img or pathlib.Path(__file__).parent.parent / 'site/images/preview_placeholder.jpg'
-    log(f"Loading preview image from {img}...")
-    with open(img, 'rb') as f:
-        preview_image = f.read()
-
-    # Save pattern
-    pattern_id = None
-    log(f"Saving pattern '{pattern_name}' (ID: {pattern_id})...")
-    pb.savePattern(
-        previewImage=preview_image,
-        sourceCode=code,
-        byteCode=bytecode,
-        name=pattern_name,
-        id=pattern_id
-    )
-
-    # Set variables if provided
-    if variables:
-        log(f"Setting variables: {variables}")
-        pb.setActiveVariables(variables)
-
-    log(f"Pattern '{pattern_name}' saved successfully!")
 
 
 @click.argument('args', nargs=-1, required=True)
