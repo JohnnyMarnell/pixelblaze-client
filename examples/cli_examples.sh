@@ -159,6 +159,9 @@ pb pbb
 pb pbb -d backup.pbb
 pb pbb -d --binary backup.pbb
 
+# Pretty print all pattern source code
+pb pbb -d backup.pbb | jq '.files[].sourceCode?.main' -crM | bat -l js
+
 # Restore from a backup file (WARNING: Overwrites device)
 pb restore backup.pbb
 
