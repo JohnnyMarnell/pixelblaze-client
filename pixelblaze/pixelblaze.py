@@ -80,7 +80,7 @@ import pathlib
 import pytz
 import traceback
 import gzip
-from typing import Union
+from typing import Union, Optional
 from enum import Enum, Flag, IntEnum, IntFlag
 from urllib.parse import urlparse, urljoin
 
@@ -1541,7 +1541,7 @@ class Pixelblaze:
         self.wsSendJson({"pause": False}, expectedResponse="ack")
         time.sleep(0.25)
 
-    def savePattern(self, *, previewImage: bytes, sourceCode: str, byteCode: bytes, name: str, id: str | None = None):
+    def savePattern(self, *, previewImage: bytes, sourceCode: str, byteCode: bytes, name: str, id: Optional[str] = None):
         """Saves a new pattern to the Pixelblaze filesystem.  Mimics the effects of the 'Save' button.
 
         If you don't know how to generate the previewImage and byteCode components, you don't want to do this.
@@ -1572,7 +1572,7 @@ class Pixelblaze:
             name=name,
             previewImage=previewImage,
             byteCode=byteCode,
-            sourceCode=json.dumps(payload)
+            sourceCode=json.dumps(payload, indent=None, separators=(',', ':'))
         )
         pbp.toPixelblaze(self)
 

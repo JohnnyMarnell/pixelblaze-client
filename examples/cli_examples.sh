@@ -2,6 +2,11 @@
 # Pixelblaze CLI Examples
 # Collection of common usage patterns for the pb command
 
+# >>>>>>>>>>>
+# >>>>>>>>>>> See Also:
+# >>>>>>>>>>> test_cli.py examples, and --help strings, and, of course, cli.py
+# >>>>>>>>>>>
+
 # Basic Discovery and Connection
 # ==============================
 
@@ -12,7 +17,7 @@ pb pixels
 pb --ip 192.168.1.100 pixels
 
 
-# Power Control
+# Basic Controls
 # =============
 
 # Turn off all LEDs
@@ -21,14 +26,18 @@ pb off
 # Turn on at full brightness
 pb on
 
-# Turn on at 50% brightness
-pb on 0.5
+# Turn on / set 50% brightness, do not save to flash
+pb on 0.5 --no-save
 
 # Turn off and save state to flash
-pb off --save
+pb off
 
 # Turn on with sequencer
 pb on --play-sequencer
+
+# Print most configs
+pb cfg
+pb cfg | yq -P
 
 
 # Pixel Configuration
@@ -42,6 +51,10 @@ pb pixels 300
 
 # Set pixel count and save to flash
 pb pixels 144 --save
+
+# Show current pixel mapper coordinates / function
+pb map
+pb map --csv
 
 
 # Sequencer Control
@@ -70,38 +83,20 @@ pb seq len 30 --save
 # =================
 
 # Simple solid color
-pb render "export function render(index) { hsv(0.5, 1, 1) }"
+pb pattern "hsv(0.5, 1, 1)"
 
 # Rainbow wave
-pb render "export function render(index) { hsv(index/pixelCount + time(0.1), 1, 1) }"
+pb pattern "hsv(index / pixelCount + time(0.1), 1, 1)"
 
 # Render from file
-pb render examples/test_pattern.js
+pb pattern examples/test_pattern.js
 
 # Render with variables
-pb render examples/test_pattern.js --var speed:0.5
+pb pattern examples/test_pattern.js --var speed:0.5
 
 # Render with JSON variables
-pb render pattern.js --vars '{"speed": 0.5, "brightness": 1.0}'
+pb pattern src.js --vars '{speed: 0.5, brightness: 1.0}'
 
 # Render from stdin
-echo "export function render(index) { hsv(0, 0, 1) }" | pb render
+echo "rgb(0, 0, 1)" | pb pattern
 
-
-# Combined Workflows
-# ==================
-
-# Setup for performance
-pb pixels 300 && pb on 0.8 && pb seq len 15 && pb seq play
-
-# Quick pattern test
-pb render test.js --var speed:0.3 && sleep 5 && pb seq random
-
-# Power cycle
-pb off && sleep 2 && pb on
-
-# Emergency stop
-pb off --pause-sequencer
-
-# Party mode
-pb on && pb seq random && pb seq play

@@ -13,15 +13,34 @@ Changes are categorized into the following types:
 - **Security** -- in case of vulnerabilities.
 
 ---
-## Current Version [**v1.1.5**] - 2025-2-23
+## Current Version [**v1.1.7**] - 2025-12-3
 
 #### Fixed
+
+* Added retry for `WebSocketBadStatusException`
+* Fix `savePattern()` functionality and API (add missing PBP feature)
+* Various utf-8 / encoding bugs
+* PBP putFile path
+* Add an integration-ish test!
+
+#### Added
+
+* Created handy `pb` cli
+* Implement `waitForAnyResponse` (non-chatty) for WS send
+* Cache mini-racer compile eval for speed
+* Add and use `PBP.fromComponents()`
+
+## [**v1.1.5**] - 2025-2-23
+
+#### Fixed
+
 * Added socket timeout to lightweight enumerator
 * Various small fixes, improvements and code cleanup
 
 ## [**v1.1.4**] - 2024-8-27
 
 #### Fixed
+
 * Update firmware version check for remote pattern compilation
 * Added ignoreOpenFailure to Pixelblaze() constructor to allow object creation without immediate connection to Pixelblaze.
 * Preview frame image no longer contains unwanted header data
