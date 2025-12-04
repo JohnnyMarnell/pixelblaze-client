@@ -8,9 +8,12 @@ flexible discovery, pattern rendering, and configuration management.
 """
 
 import json as jsonlib
+import string
+import random
 import time
 import re
 import click
+import pathlib
 from typing import Dict
 from pixelblaze.pixelblaze import Pixelblaze, PBB
 from pixelblaze.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json, jsons, get_cache_dir, check, parse_vars
@@ -233,7 +236,7 @@ def next(pb: Pixelblaze, no_save):
 
 
 @cli(seq)
-def random(pb: Pixelblaze):
+def rand(pb: Pixelblaze):
     """
     Jump to a random pattern.
 
@@ -241,7 +244,7 @@ def random(pb: Pixelblaze):
 
     \b
     Examples:
-        pb seq random    # Jump to random pattern
+        pb seq rand    # Jump to random pattern
     """
     import random as rand
 
@@ -466,6 +469,91 @@ def render(pb: Pixelblaze, input, var_args):
         pb.setActiveVariables(variables)
 
     log("Pattern rendered successfully")
+
+
+@cli(pixelblaze)
+@input_arg
+@click.option(
+    '--name',
+    type=str,
+    help='Pattern name (required if not reading from file)'
+)
+@click.option(
+    '--img',
+    type=click.Path(exists=True),
+    help='Path to preview image (100x150 JPEG). If omitted, uses SMPTE color bar placeholder'
+)
+@click.option(
+    '--var',
+    'var_args',
+    multiple=True,
+    help='Variables in flexible format: key value, key:value, or \'{json5}\''
+)
+def write(pb: Pixelblaze, input, name, img, var_args):
+    """
+    Compile and save a pattern to the Pixelblaze.
+
+    Code can be provided inline, from a file, or piped via stdin.
+    If reading from a file, the pattern name defaults to the filename stem.
+    Otherwise, --name is required.
+
+    The preview image can be provided via --img (must be 100x150 JPEG).
+    If omitted, a SMPTE color bar placeholder is used.
+
+    \b
+    Examples:
+        pb write pattern.js                              # Save pattern, name from file
+        pb write pattern.js --img preview.jpg            # With custom preview
+        pb write --name "My Pattern" code.js             # Explicit name
+        pb write pattern.js --var speed 0.5              # With variables
+        echo "/* code */" | pb write --name "Inline"     # From stdin
+    """
+    # Determine pattern name
+    pattern_name = name
+    if not pattern_name:
+        # Try to get name from input if it's a file
+        if input and pathlib.Path(input).is_file():
+            pattern_name = pathlib.Path(input).stem
+        else:
+            check(False, "Pattern name is required when not reading from a file. Use --name option.")
+
+    # Read code
+    code = read_input(input, "code")
+
+    # Add export wrapper if needed
+    if "export" not in code:
+        code = 'export function render(index) { ' + code + ' ; }'
+
+    # Parse variables
+    variables = parse_vars(var_args) if var_args else {}
+
+    # Compile pattern
+    log("Compiling pattern...")
+    bytecode = pb.compilePattern(code, allow_cache=True)
+
+    # Get or generate preview image
+    img = img or pathlib.Path(__file__).parent.parent / 'site/images/preview_placeholder.jpg'
+    log(f"Loading preview image from {img}...")
+    with open(img, 'rb') as f:
+        preview_image = f.read()
+
+    # Save pattern
+    pattern_id = None
+    log(f"Saving pattern '{pattern_name}' (ID: {pattern_id})...")
+    pb.savePattern(
+        previewImage=preview_image,
+        sourceCode=code,
+        byteCode=bytecode,
+        name=pattern_name,
+        id=pattern_id
+    )
+
+    # Set variables if provided
+    if variables:
+        log(f"Setting variables: {variables}")
+        pb.setActiveVariables(variables)
+
+    log(f"Pattern '{pattern_name}' saved successfully!")
 
 
 @click.argument('args', nargs=-1, required=True)
