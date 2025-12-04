@@ -399,96 +399,77 @@ def pattern(pb: Pixelblaze, input, write_target, rm, img, var_args, no_save, exa
         _handle_render_or_switch_mode(pb, input, variables, no_save, exact)
 
 
+def _find_pattern(pb: Pixelblaze, search: str, exact: bool = False):
+    """Find a pattern by name or ID.
+
+    Returns:
+        tuple: (pattern_id, pattern_name) or (None, None) if not found
+    """
+    log("Fetching pattern list...")
+    patterns = pb.getPatternList()
+
+    # Try by ID first
+    if Pixelblaze.isPatternId(search):
+        pattern_name = patterns.get(search)
+        return (search, pattern_name) if pattern_name else (None, None)
+
+    # Search by name
+    if not patterns:
+        return (None, None)
+
+    pattern_regex = re.compile(search, re.IGNORECASE)
+
+    for pattern_id, pattern_name in patterns.items():
+        if exact:
+            if pattern_name.lower() == search.lower():
+                return (pattern_id, pattern_name)
+        else:
+            if pattern_regex.search(pattern_name):
+                return (pattern_id, pattern_name)
+
+    return (None, None)
+
+
 def _handle_remove_mode(pb: Pixelblaze, input, exact):
     """Handle --rm mode: remove pattern from Pixelblaze."""
-    # Check if input is a file or looks like code
-    is_file = pathlib.Path(input).is_file()
-    check(not is_file, "Cannot use --rm with a file path. Specify pattern name or ID.")
+    check(not pathlib.Path(input).is_file(), "Cannot use --rm with a file path. Specify pattern name or ID.")
 
-    # Check if it's a pattern ID
-    if Pixelblaze.isPatternId(input):
-        # Delete by ID
-        log("Fetching pattern list...")
-        patterns = pb.getPatternList()
-        pattern_name = patterns.get(input)
-        check(pattern_name, f"Pattern ID '{input}' not found on Pixelblaze")
+    pattern_id, pattern_name = _find_pattern(pb, input, exact)
+    check(pattern_id, f"Pattern '{input}' not found on Pixelblaze")
 
-        log(f"Deleting pattern '{pattern_name}' (ID: {input})...")
-        pb.deletePattern(input)
-        log(f"Pattern '{pattern_name}' deleted successfully!")
-    else:
-        # Delete by name - need to find the ID first
-        log("Fetching pattern list...")
-        patterns = pb.getPatternList()
-
-        matched_id = None
-        matched_name = None
-
-        if patterns:
-            pattern_regex = re.compile(input, re.IGNORECASE)
-
-            for pattern_id, pattern_name in patterns.items():
-                if exact:
-                    if pattern_name.lower() == input.lower():
-                        matched_id = pattern_id
-                        matched_name = pattern_name
-                        break
-                else:
-                    if pattern_regex.search(pattern_name):
-                        matched_id = pattern_id
-                        matched_name = pattern_name
-                        break
-
-        check(matched_id, f"Pattern '{input}' not found on Pixelblaze")
-
-        log(f"Deleting pattern '{matched_name}' (ID: {matched_id})...")
-        pb.deletePattern(matched_id)
-        log(f"Pattern '{matched_name}' deleted successfully!")
+    log(f"Deleting pattern '{pattern_name}' (ID: {pattern_id})...")
+    pb.deletePattern(pattern_id)
+    log(f"Pattern '{pattern_name}' deleted successfully!")
 
 
 def _handle_write_mode(pb: Pixelblaze, input, write_target, img, variables, no_save):
     """Handle --write mode: save pattern to Pixelblaze."""
     is_file = pathlib.Path(input).is_file()
-
-    # Read code
-    if is_file:
-        code = read_input(input, "code")
-    else:
-        code = input
+    code = read_input(input, "code") if is_file else input
 
     # Determine pattern name/ID
     if write_target == '':
-        # Infer from filename
         check(is_file, "Pattern name required when not reading from file. Use: --write NAME")
         pattern_name = pathlib.Path(input).stem
         pattern_id = None
     elif Pixelblaze.isPatternId(write_target):
-        # It's a pattern ID to overwrite
-        pattern_id = write_target
-        # Get existing pattern name
-        patterns = pb.getPatternList()
-        pattern_name = patterns.get(pattern_id)
+        pattern_id, pattern_name = _find_pattern(pb, write_target)
         check(pattern_name, f"Pattern ID {write_target} not found")
     else:
-        # It's a pattern name
         pattern_name = write_target
         pattern_id = None
 
-    # Add export wrapper if needed
     if "export" not in code:
         code = 'export function render(index) { ' + code + ' ; }'
 
-    # Compile
     log("Compiling pattern...")
     bytecode = pb.compilePattern(code, allow_cache=True)
 
-    # Use preview or placeholder
     img = img or pathlib.Path(__file__).parent.parent / 'site/images/preview_placeholder.jpg'
     log(f"Loading preview image from {img}...")
     with open(img, 'rb') as f:
         preview_image = f.read()
 
-    # Save
     log(f"Saving pattern '{pattern_name}' (ID: {pattern_id})...")
     pb.savePattern(
         previewImage=preview_image,
@@ -499,72 +480,29 @@ def _handle_write_mode(pb: Pixelblaze, input, write_target, img, variables, no_s
     )
 
     log(f"Pattern '{pattern_name}' created successfully!")
-
-    # Set variables/controls if provided
-    if variables:
-        _set_vars_and_controls(pb, variables, not no_save)
+    _set_vars_and_controls(pb, variables, not no_save)
 
 
 def _handle_render_or_switch_mode(pb: Pixelblaze, input, variables, no_save, exact):
     """Handle render or switch mode based on input type."""
-    is_file = pathlib.Path(input).is_file()
+    if pathlib.Path(input).is_file():
+        _render_pattern(pb, read_input(input, "code"), variables)
+        return
 
-    if is_file:
-        # Render from file
-        code = read_input(input, "code")
-        _render_pattern(pb, code, variables)
-    elif Pixelblaze.isPatternId(input):
-        # Try to switch to pattern by ID
-        log("Fetching pattern list...")
-        patterns = pb.getPatternList()
+    # Try to find as existing pattern (by ID or name)
+    pattern_id, pattern_name = _find_pattern(pb, input, exact)
 
-        pattern_name = patterns.get(input)
-        check(pattern_name, f"Pattern ID '{input}' not found on Pixelblaze")
-
+    if pattern_id:
+        # Switch to existing pattern
         log(f"Switching to pattern: {pattern_name}")
-        pb.setActivePattern(input, saveToFlash=not no_save)
+        pb.setActivePattern(pattern_id, saveToFlash=not no_save)
 
         action = "activated" if no_save else "activated and saved"
         log(f"Pattern '{pattern_name}' {action}")
-
-        if variables:
-            _set_vars_and_controls(pb, variables, not no_save)
+        _set_vars_and_controls(pb, variables, not no_save)
     else:
-        # Try to find existing pattern by name
-        log("Fetching pattern list...")
-        patterns = pb.getPatternList()
-
-        matched_id = None
-        matched_name = None
-
-        if patterns:
-            pattern_regex = re.compile(input, re.IGNORECASE)
-
-            for pattern_id, pattern_name in patterns.items():
-                if exact:
-                    if pattern_name.lower() == input.lower():
-                        matched_id = pattern_id
-                        matched_name = pattern_name
-                        break
-                else:
-                    if pattern_regex.search(pattern_name):
-                        matched_id = pattern_id
-                        matched_name = pattern_name
-                        break
-
-        if matched_id:
-            # Switch to existing pattern
-            log(f"Switching to pattern: {matched_name}")
-            pb.setActivePattern(matched_id, saveToFlash=not no_save)
-
-            action = "activated" if no_save else "saved and activated"
-            log(f"Pattern '{matched_name}' {action}")
-
-            if variables:
-                _set_vars_and_controls(pb, variables, not no_save)
-        else:
-            # Treat as inline code
-            _render_pattern(pb, input, variables)
+        # Treat as inline code
+        _render_pattern(pb, input, variables)
 
 
 def _render_pattern(pb: Pixelblaze, code, variables):
@@ -577,19 +515,18 @@ def _render_pattern(pb: Pixelblaze, code, variables):
 
     log("Sending to renderer...")
     pb.sendPatternToRenderer(bytecode)
-
-    if variables:
-        _set_vars_and_controls(pb, variables)
+    _set_vars_and_controls(pb, variables)
 
     log("Pattern rendered successfully")
 
 
 def _set_vars_and_controls(pb: Pixelblaze, variables, save=False):
     """Set variables and/or controls on the active pattern."""
+    if not variables:
+        return
+
     log(f"Setting variables/controls: {variables}")
-    # Try to set as controls (UI sliders) - these get saved to flash
     pb.setActiveControls(variables, saveToFlash=save)
-    # Also try to set as variables (exported vars) - these don't persist
     pb.setActiveVariables(variables)
 
 
