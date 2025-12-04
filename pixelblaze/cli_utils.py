@@ -50,7 +50,7 @@ def cache_ip(ip_address):
 no_save_option = click.option(
     '--no-save',
     is_flag=True,
-    help='Do not save changes to flash (temporary only)'
+    help='Do not save option (vars, sequencer, etc.) changes to flash (temporary only)'
 )
 
 # Reusable Click arguments

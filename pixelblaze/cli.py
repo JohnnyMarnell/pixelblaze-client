@@ -334,8 +334,8 @@ def pattern(pb: Pixelblaze, input, write_target, img, var_args, no_save, exact):
     \b
     **Without --write (render/switch mode):**
     - If INPUT is a file path → render pattern from file
-    - Elif INPUT matches existing pattern → switch to that pattern
-    - Else → render INPUT as inline JavaScript code
+    - If INPUT matches existing pattern name or ID → switch to that pattern
+    - Otherwise → render INPUT as inline JavaScript code
 
     \b
     **With --write (save mode):**
@@ -371,13 +371,13 @@ def pattern(pb: Pixelblaze, input, write_target, img, var_args, no_save, exact):
 
     if write_target is not None:
         # ===== WRITE MODE: Save pattern to Pixelblaze =====
-        _handle_write_mode(pb, input, write_target, img, variables)
+        _handle_write_mode(pb, input, write_target, img, variables, no_save)
     else:
         # ===== RENDER/SWITCH MODE: Render or switch to pattern =====
         _handle_render_or_switch_mode(pb, input, variables, no_save, exact)
 
 
-def _handle_write_mode(pb: Pixelblaze, input, write_target, img, variables):
+def _handle_write_mode(pb: Pixelblaze, input, write_target, img, variables, no_save):
     """Handle --write mode: save pattern to Pixelblaze."""
     is_file = pathlib.Path(input).is_file()
 
@@ -429,11 +429,11 @@ def _handle_write_mode(pb: Pixelblaze, input, write_target, img, variables):
         id=pattern_id
     )
 
-    log(f"Pattern '{pattern_name}' saved successfully!")
+    log(f"Pattern '{pattern_name}' created successfully!")
 
     # Set variables/controls if provided
     if variables:
-        _set_vars_and_controls(pb, variables, True)
+        _set_vars_and_controls(pb, variables, not no_save)
 
 
 def _handle_render_or_switch_mode(pb: Pixelblaze, input, variables, no_save, exact):
@@ -444,6 +444,22 @@ def _handle_render_or_switch_mode(pb: Pixelblaze, input, variables, no_save, exa
         # Render from file
         code = read_input(input, "code")
         _render_pattern(pb, code, variables)
+    elif Pixelblaze.isPatternId(input):
+        # Try to switch to pattern by ID
+        log("Fetching pattern list...")
+        patterns = pb.getPatternList()
+
+        pattern_name = patterns.get(input)
+        check(pattern_name, f"Pattern ID '{input}' not found on Pixelblaze")
+
+        log(f"Switching to pattern: {pattern_name}")
+        pb.setActivePattern(input, saveToFlash=not no_save)
+
+        action = "activated" if no_save else "activated and saved"
+        log(f"Pattern '{pattern_name}' {action}")
+
+        if variables:
+            _set_vars_and_controls(pb, variables, not no_save)
     else:
         # Try to find existing pattern by name
         log("Fetching pattern list...")
