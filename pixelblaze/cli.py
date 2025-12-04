@@ -309,6 +309,11 @@ def set_duration(pb: Pixelblaze, seconds, no_save):
     help='Save pattern to Pixelblaze (optionally specify name or pattern ID to overwrite)'
 )
 @click.option(
+    '--rm',
+    is_flag=True,
+    help='Remove/delete the pattern from Pixelblaze'
+)
+@click.option(
     '--img',
     type=click.Path(exists=True),
     help='Path to preview image (100x150 JPEG) for --write. If omitted, generates SMPTE placeholder'
@@ -325,14 +330,14 @@ def set_duration(pb: Pixelblaze, seconds, no_save):
     is_flag=True,
     help='Require exact match for pattern name lookup'
 )
-def pattern(pb: Pixelblaze, input, write_target, img, var_args, no_save, exact):
+def pattern(pb: Pixelblaze, input, write_target, rm, img, var_args, no_save, exact):
     """
     Unified pattern command: switch to, render, or save patterns.
 
     INPUT can be a pattern name, file path, or inline JavaScript code.
 
     \b
-    **Without --write (render/switch mode):**
+    **Without --write or --rm (render/switch mode):**
     - If INPUT is a file path → render pattern from file
     - If INPUT matches existing pattern name or ID → switch to that pattern
     - Otherwise → render INPUT as inline JavaScript code
@@ -341,6 +346,11 @@ def pattern(pb: Pixelblaze, input, write_target, img, var_args, no_save, exact):
     **With --write (save mode):**
     - Saves the pattern to Pixelblaze filesystem
     - Optionally specify pattern name or ID to overwrite
+
+    \b
+    **With --rm (remove mode):**
+    - Removes the pattern from Pixelblaze
+    - INPUT must be a pattern name or ID
 
     \b
     Examples:
@@ -365,16 +375,75 @@ def pattern(pb: Pixelblaze, input, write_target, img, var_args, no_save, exact):
 
         # Overwrite existing pattern by ID
         pb pattern code.js --write abcd1234567890123
+
+        # Remove pattern
+        pb pattern rainbow --rm
+        pb pattern abcd1234567890123 --rm
     """
+    # Check for conflicting flags
+    check(not (write_target is not None and rm), "Cannot use --write and --rm together")
+
     # Parse variables
     variables = parse_vars(var_args) if var_args else {}
 
-    if write_target is not None:
+    if rm:
+        # ===== REMOVE MODE: Delete pattern from Pixelblaze =====
+        check(not variables, "Cannot use --var with --rm")
+        check(img is None, "Cannot use --img with --rm")
+        _handle_remove_mode(pb, input, exact)
+    elif write_target is not None:
         # ===== WRITE MODE: Save pattern to Pixelblaze =====
         _handle_write_mode(pb, input, write_target, img, variables, no_save)
     else:
         # ===== RENDER/SWITCH MODE: Render or switch to pattern =====
         _handle_render_or_switch_mode(pb, input, variables, no_save, exact)
+
+
+def _handle_remove_mode(pb: Pixelblaze, input, exact):
+    """Handle --rm mode: remove pattern from Pixelblaze."""
+    # Check if input is a file or looks like code
+    is_file = pathlib.Path(input).is_file()
+    check(not is_file, "Cannot use --rm with a file path. Specify pattern name or ID.")
+
+    # Check if it's a pattern ID
+    if Pixelblaze.isPatternId(input):
+        # Delete by ID
+        log("Fetching pattern list...")
+        patterns = pb.getPatternList()
+        pattern_name = patterns.get(input)
+        check(pattern_name, f"Pattern ID '{input}' not found on Pixelblaze")
+
+        log(f"Deleting pattern '{pattern_name}' (ID: {input})...")
+        pb.deletePattern(input)
+        log(f"Pattern '{pattern_name}' deleted successfully!")
+    else:
+        # Delete by name - need to find the ID first
+        log("Fetching pattern list...")
+        patterns = pb.getPatternList()
+
+        matched_id = None
+        matched_name = None
+
+        if patterns:
+            pattern_regex = re.compile(input, re.IGNORECASE)
+
+            for pattern_id, pattern_name in patterns.items():
+                if exact:
+                    if pattern_name.lower() == input.lower():
+                        matched_id = pattern_id
+                        matched_name = pattern_name
+                        break
+                else:
+                    if pattern_regex.search(pattern_name):
+                        matched_id = pattern_id
+                        matched_name = pattern_name
+                        break
+
+        check(matched_id, f"Pattern '{input}' not found on Pixelblaze")
+
+        log(f"Deleting pattern '{matched_name}' (ID: {matched_id})...")
+        pb.deletePattern(matched_id)
+        log(f"Pattern '{matched_name}' deleted successfully!")
 
 
 def _handle_write_mode(pb: Pixelblaze, input, write_target, img, variables, no_save):
