@@ -14,7 +14,7 @@ import click
 import pathlib
 from pixelblaze.pixelblaze import Pixelblaze, PBB
 from pixelblaze.cli.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json, jsons, \
-                                     get_cache_dir, check, parse_vars
+                                     get_cache_dir, check, parse_vars, get_pixelblaze
 
 @click.group()
 @click.option(
@@ -147,7 +147,7 @@ def map(pb: Pixelblaze, input, csv):
         pb map map.js                # Set map from file
         pb map < map.js              # Set map from stdin
     """
-    content = read_input(input, "map", required=False)
+    content, _ = read_input(input, "map", required=False)
     setting = content is not None
 
     if setting:
@@ -441,7 +441,7 @@ def _handle_remove_mode(pb: Pixelblaze, input, exact):
 def _handle_write_mode(pb: Pixelblaze, input, write_target, img, variables, no_save):
     """Handle --write mode: save pattern to Pixelblaze."""
     is_file = pathlib.Path(input).is_file()
-    code = read_input(input, "code") if is_file else input
+    code, _ = read_input(input, "code") if is_file else (input, False)
 
     # Determine pattern name/ID
     if write_target == '':
@@ -482,7 +482,8 @@ def _handle_write_mode(pb: Pixelblaze, input, write_target, img, variables, no_s
 def _handle_render_or_switch_mode(pb: Pixelblaze, input, variables, no_save, exact):
     """Handle render or switch mode based on input type."""
     if pathlib.Path(input).is_file():
-        _render_pattern(pb, read_input(input, "code"), variables)
+        code, _ = read_input(input, "code")
+        _render_pattern(pb, code, variables)
         return
 
     # Try to find as existing pattern (by ID or name)
@@ -550,6 +551,114 @@ def cfg(pb: Pixelblaze):
         'playlist': pb.getSequencerPlaylist(),
         'sequencer': pb.getConfigSequencer()
     })
+
+
+@cli(pixelblaze)
+def ls(pb: Pixelblaze):
+    """
+    List all files stored on the Pixelblaze's filesystem.
+
+    Returns a list of all files including patterns, configuration files,
+    and other assets stored on the device.
+
+    \b
+    Examples:
+        pb ls
+        pb ls | jq '.[]' -crM | grep '.c'    # Filter for control files
+    """
+    log("Fetching file list...")
+    jsons(pb.getFileList())
+
+
+@cli(pixelblaze)
+@click.argument('source', type=str)
+@click.argument('dest', type=str, required=False)
+@click.option(
+    '--write',
+    '-w',
+    is_flag=True,
+    help='Upload to Pixelblaze (SOURCE=local file, DEST=Pixelblaze path)'
+)
+def cp(pb: Pixelblaze, source, dest, write):
+    """
+    Copy files between the Pixelblaze and local filesystem.
+
+    Without --write (default): Download from Pixelblaze to local
+    - SOURCE is the filename on the Pixelblaze (as shown by 'pb ls')
+    - DEST is optional local path (defaults to current directory)
+
+    With --write: Upload from local to Pixelblaze
+    - SOURCE is the local file path (or Pixelblaze path if piping stdin)
+    - DEST is optional Pixelblaze path (defaults to /SOURCE_BASENAME)
+    - Supports piping binary data via stdin
+
+    \b
+    Examples (download from Pixelblaze):
+        pb cp /config.json                    # Save as ./config.json
+        pb cp /p/abc123                       # Save as ./abc123
+        pb cp /config.json my_config.json     # Save as ./my_config.json
+        pb cp /p/abc123 patterns/             # Save as ./patterns/abc123
+
+    \b
+    Examples (upload to Pixelblaze):
+        pb cp config.json --write             # Upload as /config.json
+        pb cp pattern.js --write /p/abc123    # Upload as /p/abc123
+        pb cp mymap.txt --write /pixelmap.txt # Upload as /pixelmap.txt
+        cat foo.html | gzip | pb cp /index.html.gz --write  # Pipe to Pixelblaze
+        cat img.jpg | pb cp /preview.jpg --write            # Binary via stdin
+    """
+    if write:
+        # Upload mode: local → Pixelblaze
+        content, is_stdin = read_input(source, name="file", binary=True)
+
+        if is_stdin:
+            # When using stdin, SOURCE is the destination on Pixelblaze
+            check(dest is None, "Cannot specify DEST when piping stdin (SOURCE becomes the Pixelblaze path)")
+            pixelblaze_path = source
+        else:
+            # Reading from file, SOURCE is local path
+            # Determine destination path on Pixelblaze
+            if dest is None:
+                # Default: use basename with leading slash
+                pixelblaze_path = f"/{pathlib.Path(source).name}"
+            else:
+                pixelblaze_path = dest
+
+        log(f"Uploading to Pixelblaze: {pixelblaze_path}")
+        success = pb.putFile(pixelblaze_path, content)
+
+        check(success, f"Failed to upload to '{pixelblaze_path}'")
+
+        size_kb = len(content) / 1024
+        log(f"Successfully uploaded → {pixelblaze_path} ({size_kb:.1f} KB)")
+
+    else:
+        # Download mode: Pixelblaze → local
+        log(f"Fetching file: {source}")
+        content = pb.getFile(source)
+
+        check(content is not None, f"File '{source}' not found on Pixelblaze")
+
+        # Determine destination path
+        if dest is None:
+            # Use basename of source file in current directory
+            dest = pathlib.Path(source).name
+        else:
+            dest_path = pathlib.Path(dest)
+            # If dest is a directory, use source basename in that directory
+            if dest_path.is_dir():
+                dest = dest_path / pathlib.Path(source).name
+
+        dest_path = pathlib.Path(dest)
+
+        # Create parent directories if needed
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        log(f"Writing to: {dest_path}")
+        dest_path.write_bytes(content)
+
+        size_kb = len(content) / 1024
+        log(f"Successfully copied {source} → {dest_path} ({size_kb:.1f} KB)")
 
 
 @cli(pixelblaze)
@@ -744,7 +853,6 @@ def pbb(ctx, output_file, ip, quiet, decode, binary):
         should_cleanup = False
     else:
         # Need to fetch from Pixelblaze
-        from pixelblaze.cli_utils import get_pixelblaze
         ctx.obj = ctx.obj or {}
         ctx.obj['ip'] = ip
 

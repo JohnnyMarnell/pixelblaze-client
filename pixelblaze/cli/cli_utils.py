@@ -1,5 +1,7 @@
 """CLI utilities for Pixelblaze controller."""
 
+from __future__ import annotations
+
 import sys
 import socket
 import click
@@ -123,47 +125,57 @@ def discover_pixelblaze(ip_address: str) -> str:
     )
 
 
-def read_input(value: Optional[str], name: str = "input", required: bool = True) -> str:
+def read_input(value: Optional[str], name: str = "input", required: bool = True, binary: bool = False) -> tuple[str | bytes, bool]:
     """
-    Read input from value, file path, or stdin.
+    Read input from stdin, file path, or value string.
 
-    If value is provided:
-      - If it's an existing file path, read the file
-      - Otherwise, treat it as the content itself
-    If value is None:
-      - If stdin is available (not a TTY), read from stdin
-      - Otherwise, raise an error
+    Checks stdin first (if piped), then file path, then treats value as inline content.
 
     Args:
         value: The input value (can be None, a file path, or content string)
         name: Name for error messages (e.g., "code", "map")
+        required: Whether input is required (raises if no input provided)
+        binary: If True, read files and stdin in binary mode (returns bytes)
 
     Returns:
-        str: The input content
+        tuple[str | bytes, bool]: (content, is_stdin) where:
+            - content: The input data (str in text mode, bytes in binary mode)
+            - is_stdin: True if content came from stdin, False otherwise
 
     Raises:
-        click.ClickException: If no input provided
+        click.ClickException: If no input provided and required=True
     """
     import os
 
+    # Check stdin first if it's piped (not a TTY)
+    if not sys.stdin.isatty():
+        if binary:
+            return (sys.stdin.buffer.read(), True)
+        else:
+            return (sys.stdin.read().strip(), True)
+
+    # No stdin, check value
     if value is not None:
         # Check if it's an existing file path
         if os.path.isfile(value):
-            with open(value, 'r') as f:
-                return f.read().strip()
-        # Otherwise treat it as the content itself
-        return value
+            mode = 'rb' if binary else 'r'
+            with open(value, mode) as f:
+                content = f.read()
+                return (content if binary else content.strip(), False)
+        # Otherwise treat it as the content itself (text mode only)
+        if binary:
+            raise click.ClickException(
+                f"Cannot use inline content in binary mode. Provide a file path or pipe via stdin."
+            )
+        return (value, False)
 
-    # No value provided, try stdin
-    if not sys.stdin.isatty():
-        return sys.stdin.read().strip()
-
+    # No stdin, no value
     if required:
         raise click.ClickException(
             f"No {name} provided. Supply {name} as text, a file path, or pipe via stdin."
         )
     else:
-        return None
+        return (None, False)
 
 
 def parse_json(text: str):

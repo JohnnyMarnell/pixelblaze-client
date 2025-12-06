@@ -166,6 +166,27 @@ pb pbb -d backup.pbb | jq '.files[].sourceCode?.main' -crM | bat -l js
 pb restore backup.pbb
 
 
+# File Operations (ls/cp)
+# =======================
+
+# List all files on Pixelblaze
+pb ls
+pb ls | jq '.[]' -crM | grep '.c'
+
+# Download a file from Pixelblaze
+pb cp /config.json
+pb cp /config.json backup_config.json
+
+# Backup the stock index.html.gz
+pb cp /index.html.gz bak.index.html.gz
+
+# Upload a file to Pixelblaze
+pb cp config.json --write
+
+# Upload custom HTML with gzip pipe
+cat custom.html | gzip | pb cp /index.html.gz --write
+
+
 # Advanced / Debugging
 # ====================
 
