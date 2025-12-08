@@ -7,6 +7,19 @@ This module provides a modern CLI tool for controlling Pixelblazes with
 flexible discovery, pattern rendering, and configuration management.
 """
 
+# ----------------------------------------------------------------------------
+#
+#    ██████╗██╗     ██╗
+#   ██╔════╝██║     ██║
+#   ██║     ██║     ██║
+#   ██║     ██║     ██║
+#   ╚██████╗███████╗██║
+#    ╚═════╝╚══════╝╚═╝
+#   ╔═╗┌─┐┌┬┐┌┬┐┌─┐┌┐┌┌┬┐  ╦  ┬┌┐┌┌─┐  ╦┌┐┌┌┬┐┌─┐┬─┐┌─┐┌─┐┌─┐┌─┐
+#   ║  │ │││││││├─┤│││ ││  ║  ││││├┤   ║│││ │ ├┤ ├┬┘├┤ ├─┤│  ├┤ 
+#   ╚═╝└─┘┴ ┴┴ ┴┴ ┴┘└┘─┴┘  ╚═╝┴┘└┘└─┘  ╩┘└┘ ┴ └─┘┴└─└  ┴ ┴└─┘└─┘
+#
+
 import json as jsonlib
 import time
 import re
@@ -330,7 +343,12 @@ def set_duration(pb: Pixelblaze, seconds, no_save):
     is_flag=True,
     help='Require exact match for pattern name lookup'
 )
-def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exact):
+@click.option(
+    '--lookup',
+    is_flag=True,
+    help='Force lookup of pattern name/ID instead of treating input as code'
+)
+def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exact, lookup):
     """
     Unified pattern command: switch to, render, or save patterns.
 
@@ -340,8 +358,11 @@ def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exac
     \b
     **Without --write or --rm (render/switch mode):**
     - If INPUT is a file path → render pattern from file
-    - If INPUT matches existing pattern name or ID → switch to that pattern
+    - If INPUT contains code-like syntax (operators, function calls, etc.) → render as JavaScript code
+    - If INPUT is a valid pattern ID → switch to that pattern
+    - If INPUT matches a pattern name → switch to that pattern
     - Otherwise → render INPUT as inline JavaScript code
+    - Use --lookup to force pattern name/ID lookup and skip code detection
 
     \b
     **With --write (save mode):**
@@ -351,12 +372,17 @@ def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exac
 
     \b
     Examples:
-        # Switch/Render/Remove
+        # Switch/Render
         pb pattern rainbow
         pb pattern code.js
         pb pattern abcd123456789012
+        pb pattern 'true && hsv(1,1,1) || hsv(0,0,0)'  # Renders as code
+        pb pattern 'hsv' --lookup                      # Force lookup (rather than code)
+
+    \b
+        # Remove
         pb pattern foo --rm
-  
+
     \b
         # Save (Write)
         pb pattern code.js --write              # Save as "code"
@@ -386,13 +412,49 @@ def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exac
 
     else:
         # ===== RENDER/SWITCH MODE =====
-        # If user provided a name but didn't say --write, we could warn, 
+        # If user provided a name but didn't say --write, we could warn,
         # but for now let's just ignore it or assume they meant to write?
         # Ideally, we strictly check:
         if name:
              log(f"Warning: Name argument '{name}' ignored because --write was not specified.")
-        
-        _handle_render_or_switch_mode(pb, input, variables, no_save, exact)
+
+        _handle_render_or_switch_mode(pb, input, variables, no_save, exact, lookup)
+
+
+def _looks_like_code(s: str) -> bool:
+    """
+    Detect if a string looks like JavaScript code rather than a pattern name.
+
+    Returns True if the string contains code-like patterns:
+    - Operators: &&, ||, +, -, *, /, %, ===, !==, ==, !=, <, >, <=, >=
+    - Function calls: word(
+    - Brackets: {, }, [, ], ;
+    - Comparisons and assignments: =, ?:
+    """
+    # Check for common code operators and patterns
+    code_indicators = [
+        '&&', '||',  # Logical operators
+        '++', '--',  # Increment/decrement
+        '===', '!==', '==', '!=',  # Comparisons
+        '<=', '>=', '=>',  # Comparisons and arrow functions
+        '{', '}', '[', ']', ';',  # Brackets and statements
+        '?', ':',  # Ternary operator
+    ]
+
+    # Check for obvious code patterns
+    for indicator in code_indicators:
+        if indicator in s:
+            return True
+
+    # Check for function calls (word followed by open paren)
+    if re.search(r'\w+\s*\(', s):
+        return True
+
+    # Check for math operators only if not at start (could be negative number)
+    if re.search(r'[\d\s]\s*[\+\-\*/%]\s*[\d\s]', s):
+        return True
+
+    return False
 
 
 def _find_pattern(pb: Pixelblaze, search: str, exact: bool = False):
@@ -479,11 +541,19 @@ def _handle_write_mode(pb: Pixelblaze, input, write_target, img, variables, no_s
     _set_vars_and_controls(pb, variables, not no_save)
 
 
-def _handle_render_or_switch_mode(pb: Pixelblaze, input, variables, no_save, exact):
+def _handle_render_or_switch_mode(pb: Pixelblaze, input, variables, no_save, exact, lookup=False):
     """Handle render or switch mode based on input type."""
     if pathlib.Path(input).is_file():
         code, _ = read_input(input, "code")
         _render_pattern(pb, code, variables)
+        return
+
+    # Determine if input looks like code or a pattern lookup
+    input_looks_like_code = _looks_like_code(input)
+
+    # If input looks like code and --lookup is not set, treat as inline code
+    if input_looks_like_code and not lookup:
+        _render_pattern(pb, input, variables)
         return
 
     # Try to find as existing pattern (by ID or name)
@@ -498,7 +568,9 @@ def _handle_render_or_switch_mode(pb: Pixelblaze, input, variables, no_save, exa
         log(f"Pattern '{pattern_name}' {action}")
         _set_vars_and_controls(pb, variables, not no_save)
     else:
-        # Treat as inline code
+        # Not found as pattern, treat as inline code (unless --lookup was specified)
+        if lookup:
+            check(False, f"Pattern '{input}' not found on Pixelblaze (use without --lookup to treat as code)")
         _render_pattern(pb, input, variables)
 
 
@@ -1034,6 +1106,98 @@ def clear(compiler, ip):
             log("Compiler cache cleared")
         else:
             log("No compiler cache to clear")
+
+
+@pixelblaze.command()
+@click.option('--wait', is_flag=True, help='Wait for device to come back online after reboot')
+@click.pass_context
+def reboot(ctx, wait):
+    """
+    Reboot the Pixelblaze device.
+
+    Can be useful for getting out of non-responsive state.
+
+    \b
+    Examples:
+        pb reboot
+        pb reboot --wait    # Wait for device to come back online
+    """
+    import requests
+    from pixelblaze.cli.cli_utils import discover_pixelblaze
+
+    # Get IP address - will be discovered inside get_pixelblaze if needed
+    device_ip = None
+
+    def send_reboot(ip):
+        """Send reboot command via direct HTTP POST."""
+        url = f"http://{ip}/reboot"
+        log(f"Sending reboot command to {ip}...")
+        try:
+            response = requests.post(url, timeout=5)
+            if response.status_code in [200, 404]:
+                return True
+            response.raise_for_status()
+        except requests.RequestException as e:
+            log(f"Error sending reboot: {e}")
+            return False
+        return True
+
+    # Try normal method first
+    try:
+        with get_pixelblaze(ctx) as pb:
+            log("Rebooting Pixelblaze...")
+            pb.reboot()
+            log("Reboot command sent successfully")
+            device_ip = pb.ipAddress
+    except ConnectionResetError as e:
+        if e.errno == 54:
+            log("Device websocket not responding, trying direct HTTP reboot...")
+            # Discover IP if not already done
+            ip_address = ctx.obj.get('ip', 'auto')
+            discovered_ip = discover_pixelblaze(ip_address)
+            if send_reboot(discovered_ip):
+                log("Reboot command sent successfully (via HTTP)")
+                device_ip = discovered_ip
+            else:
+                log("Failed to send reboot command")
+                return
+        else:
+            raise
+    except Exception as e:
+        # For any other connection issues, try direct POST
+        log(f"Connection failed ({type(e).__name__}), trying direct HTTP reboot...")
+        # Discover IP if not already done
+        ip_address = ctx.obj.get('ip', 'auto')
+        discovered_ip = discover_pixelblaze(ip_address)
+        if send_reboot(discovered_ip):
+            log("Reboot command sent successfully (via HTTP)")
+            device_ip = discovered_ip
+        else:
+            log("Failed to send reboot command")
+            return
+
+    if wait:
+        log("Waiting for device to come back online...")
+        # Give the device time to actually reboot
+        time.sleep(2)
+
+        reconnected = False
+        attempts = 0
+        max_attempts = 60  # 60 seconds timeout
+
+        while not reconnected and attempts < max_attempts:
+            try:
+                # Try to create a fresh connection using context manager
+                with Pixelblaze(device_ip) as test_pb:
+                    test_pb.getConfigSettings()
+                    reconnected = True
+                    log("Device is back online!")
+            except Exception:
+                attempts += 1
+                time.sleep(1)
+
+        if not reconnected:
+            log("Warning: Timed out waiting for device to reconnect")
 
 
 def main():
