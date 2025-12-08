@@ -27,7 +27,7 @@ import click
 import pathlib
 from pixelblaze.pixelblaze import Pixelblaze, PBB
 from pixelblaze.cli.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json, jsons, \
-                                     get_cache_dir, check, parse_vars, get_pixelblaze
+                                     get_cache_dir, check, parse_vars, get_pixelblaze, discover_pixelblaze
 
 @click.group()
 @click.option(
@@ -883,14 +883,12 @@ def ping(pb: Pixelblaze, count):
     check(successful > 0, "Failed to ping Pixelblaze")
 
 
-@click.command()
+@cli(pixelblaze, conn=False)
 @click.argument('output_file', required=False)
-@click.option('--ip', default='auto', help='IP address of Pixelblaze')
 @click.option('--quiet', '-q', is_flag=True, help='Suppress verbose progress output')
 @click.option('--decode', '-d', is_flag=True, help='Decode base64 file contents in output')
 @click.option('--binary', is_flag=True, help='Include binary content as base64 (with --decode)')
-@click.pass_context
-def pbb(ctx, output_file, ip, quiet, decode, binary):
+def pbb(ctx, output_file, quiet, decode, binary):
     """
     Export a Pixelblaze Binary Backup (.pbb file).
 
@@ -925,9 +923,6 @@ def pbb(ctx, output_file, ip, quiet, decode, binary):
         should_cleanup = False
     else:
         # Need to fetch from Pixelblaze
-        ctx.obj = ctx.obj or {}
-        ctx.obj['ip'] = ip
-
         log("Creating backup from Pixelblaze...")
         with get_pixelblaze(ctx) as pb:
             backup = PBB.fromPixelblaze(pb, verbose=not quiet)
@@ -1030,9 +1025,6 @@ def restore(pb: Pixelblaze, input_file):
     log("Restore complete!")
 
 
-pixelblaze.add_command(pbb)
-
-
 @pixelblaze.group()
 def cache():
     """
@@ -1108,9 +1100,8 @@ def clear(compiler, ip):
             log("No compiler cache to clear")
 
 
-@pixelblaze.command()
+@cli(pixelblaze, conn=False)
 @click.option('--wait', is_flag=True, help='Wait for device to come back online after reboot')
-@click.pass_context
 def reboot(ctx, wait):
     """
     Reboot the Pixelblaze device.
@@ -1123,12 +1114,10 @@ def reboot(ctx, wait):
         pb reboot --wait    # Wait for device to come back online
     """
     import requests
-    from pixelblaze.cli.cli_utils import discover_pixelblaze
 
-    # Get IP address - will be discovered inside get_pixelblaze if needed
     device_ip = None
 
-    def send_reboot(ip):
+    def send_reboot_http(ip):
         """Send reboot command via direct HTTP POST."""
         url = f"http://{ip}/reboot"
         log(f"Sending reboot command to {ip}...")
@@ -1152,10 +1141,8 @@ def reboot(ctx, wait):
     except ConnectionResetError as e:
         if e.errno == 54:
             log("Device websocket not responding, trying direct HTTP reboot...")
-            # Discover IP if not already done
-            ip_address = ctx.obj.get('ip', 'auto')
-            discovered_ip = discover_pixelblaze(ip_address)
-            if send_reboot(discovered_ip):
+            discovered_ip = discover_pixelblaze(ctx)
+            if send_reboot_http(discovered_ip):
                 log("Reboot command sent successfully (via HTTP)")
                 device_ip = discovered_ip
             else:
@@ -1166,10 +1153,8 @@ def reboot(ctx, wait):
     except Exception as e:
         # For any other connection issues, try direct POST
         log(f"Connection failed ({type(e).__name__}), trying direct HTTP reboot...")
-        # Discover IP if not already done
-        ip_address = ctx.obj.get('ip', 'auto')
-        discovered_ip = discover_pixelblaze(ip_address)
-        if send_reboot(discovered_ip):
+        discovered_ip = discover_pixelblaze(ctx)
+        if send_reboot_http(discovered_ip):
             log("Reboot command sent successfully (via HTTP)")
             device_ip = discovered_ip
         else:

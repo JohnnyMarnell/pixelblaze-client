@@ -161,7 +161,7 @@ def test_cli():
     else:
         print("\n13. No original pattern to restore (was unknown)")
 
-    print("\n✅ All tests passed!")
+    print("\n✅  All tests passed!")
 
 def run_cmd(*args):
     """Run a CLI command and return the result."""

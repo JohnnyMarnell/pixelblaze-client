@@ -58,12 +58,12 @@ no_save_option = click.option(
 # Reusable Click arguments
 input_arg = click.argument('input', required=False)
 
-def discover_pixelblaze(ip_address: str) -> str:
+def discover_pixelblaze(ctx: click.Context) -> str:
     """
     Discovers a Pixelblaze IP address using the specified strategy.
 
     Args:
-        ip_address: Either an explicit IP, "auto", or None
+        ctx: Click context containing IP address in ctx.obj['ip']
 
     Returns:
         str: The discovered or specified IP address
@@ -71,6 +71,8 @@ def discover_pixelblaze(ip_address: str) -> str:
     Raises:
         click.ClickException: If no Pixelblaze can be found
     """
+    ip_address = ctx.obj.get('ip', 'auto')
+
     if ip_address and ip_address != "auto":
         cache_ip(ip_address)  # Cache explicitly provided IP
         return ip_address
@@ -295,16 +297,14 @@ def get_pixelblaze(ctx: click.Context) -> Pixelblaze:
     Raises:
         click.ClickException: If connection fails
     """
-    ip_address = ctx.obj['ip']
-
-    discovered_ip = discover_pixelblaze(ip_address)
+    discovered_ip = discover_pixelblaze(ctx)
     ctx.obj['ip'] = discovered_ip  # Update with actual IP used
     pb = Pixelblaze(discovered_ip)
     ctx.obj['pixelblaze'] = pb
     return pb
 
 
-def cli(cli_group, **click_kwargs) -> Callable:
+def cli(cli_group, conn=True, **click_kwargs) -> Callable:
     """
     Factory function to create a cli decorator bound to a Click CLI group.
 
@@ -313,14 +313,21 @@ def cli(cli_group, **click_kwargs) -> Callable:
     and wrapping the function body in a context manager.
 
     Usage:
-        @pixelblaze.cli()
+        @cli(pixelblaze)
         @click.argument('level', type=float, required=False)
         @click.option('--no-save', is_flag=True)
         def brightness(pb, level, no_save):
             pb.setBrightnessSlider(level)
 
+        @cli(pixelblaze, conn=False)
+        def reboot(ctx, wait):
+            # Handle connection manually
+            pass
+
     Args:
         cli_group: The CLI group to add the command to
+        conn: If True (default), automatically connects and passes Pixelblaze instance.
+              If False, passes context and lets function handle connection.
         **click_kwargs: Additional kwargs to pass to @cli.command()
 
     Returns:
@@ -329,8 +336,13 @@ def cli(cli_group, **click_kwargs) -> Callable:
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(ctx: click.Context, *args, **kwargs):
-            with get_pixelblaze(ctx) as pb:
-                return func(pb, *args, **kwargs)
+            if conn:
+                # Default behavior: connect and pass pb
+                with get_pixelblaze(ctx) as pb:
+                    return func(pb, *args, **kwargs)
+            else:
+                # Pass context, let function handle connection
+                return func(ctx, *args, **kwargs)
 
         # Apply click.pass_context and cli.command() decorators
         wrapper = click.pass_context(wrapper)
