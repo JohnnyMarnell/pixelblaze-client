@@ -313,8 +313,8 @@ def set_duration(pb: Pixelblaze, seconds, no_save):
 
 
 @cli(pixelblaze)
-@click.argument('input', type=str)
-@click.argument('name', type=str, required=False) # New optional second argument
+@click.argument('input', type=str, required=False)
+@click.argument('name', type=str, required=False)
 @click.option(
     '--write',
     '-w',
@@ -353,6 +353,7 @@ def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exac
     Unified pattern command: switch to, render, or save patterns.
 
     INPUT can be a pattern name, file path, or inline JavaScript code.
+    INPUT can also be read from stdin if not provided.
     NAME (optional) is the target pattern name or ID for --write operations.
 
     \b
@@ -380,6 +381,11 @@ def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exac
         pb pattern 'hsv' --lookup                      # Force lookup (rather than code)
 
     \b
+        # Read from stdin
+        echo 'render code here' | pb pattern
+        cat code.js | pb pattern --write "My Pattern"
+
+    \b
         # Remove
         pb pattern foo --rm
 
@@ -393,6 +399,11 @@ def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exac
     # Check for conflicting flags
     check(not (write and rm), "Cannot use --write and --rm together")
     check(not (rm and name), "Cannot use extra argument with --rm")
+
+    # Read from stdin if input not provided
+    input_from_stdin = False
+    if input is None:
+        input, input_from_stdin = read_input(None, name="pattern", required=True)
 
     # Parse variables
     variables = parse_vars(var_args) if var_args else {}
@@ -418,7 +429,7 @@ def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exac
         if name:
              log(f"Warning: Name argument '{name}' ignored because --write was not specified.")
 
-        _handle_render_or_switch_mode(pb, input, variables, no_save, exact, lookup)
+        _handle_render_or_switch_mode(pb, input, variables, no_save, exact, lookup, from_stdin=input_from_stdin)
 
 
 def _looks_like_code(s: str) -> bool:
@@ -541,9 +552,10 @@ def _handle_write_mode(pb: Pixelblaze, input, write_target, img, variables, no_s
     _set_vars_and_controls(pb, variables, not no_save)
 
 
-def _handle_render_or_switch_mode(pb: Pixelblaze, input, variables, no_save, exact, lookup=False):
+def _handle_render_or_switch_mode(pb: Pixelblaze, input, variables, no_save, exact, lookup=False, from_stdin=False):
     """Handle render or switch mode based on input type."""
-    if pathlib.Path(input).is_file():
+    # Only check if it's a file if it didn't come from stdin
+    if not from_stdin and pathlib.Path(input).is_file():
         code, _ = read_input(input, "code")
         _render_pattern(pb, code, variables)
         return
