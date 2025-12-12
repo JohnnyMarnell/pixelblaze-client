@@ -1014,7 +1014,8 @@ def pbb(ctx, output_file, quiet, decode, binary):
 
 @cli(pixelblaze)
 @click.argument('input_file')
-def restore(pb: Pixelblaze, input_file):
+@click.option('--quiet', '-q', is_flag=True, help='Suppress verbose progress output')
+def restore(pb: Pixelblaze, input_file, quiet):
     """
     Restore a Pixelblaze from a Binary Backup (.pbb file).
 
@@ -1033,7 +1034,7 @@ def restore(pb: Pixelblaze, input_file):
 
     log(f"Restoring from {input_file}...")
     backup = PBB.fromFile(input_file)
-    backup.toPixelblaze(pb)
+    backup.toPixelblaze(pb, verbose=not quiet)
     log("Restore complete!")
 
 
