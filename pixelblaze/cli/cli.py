@@ -1,0 +1,1290 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Command-line interface for Pixelblaze LED controllers.
+
+This module provides a modern CLI tool for controlling Pixelblazes with
+flexible discovery, pattern rendering, and configuration management.
+"""
+
+# ----------------------------------------------------------------------------
+#
+#    ██████╗██╗     ██╗
+#   ██╔════╝██║     ██║
+#   ██║     ██║     ██║
+#   ██║     ██║     ██║
+#   ╚██████╗███████╗██║
+#    ╚═════╝╚══════╝╚═╝
+#   ╔═╗┌─┐┌┬┐┌┬┐┌─┐┌┐┌┌┬┐  ╦  ┬┌┐┌┌─┐  ╦┌┐┌┌┬┐┌─┐┬─┐┌─┐┌─┐┌─┐┌─┐
+#   ║  │ │││││││├─┤│││ ││  ║  ││││├┤   ║│││ │ ├┤ ├┬┘├┤ ├─┤│  ├┤ 
+#   ╚═╝└─┘┴ ┴┴ ┴┴ ┴┘└┘─┴┘  ╚═╝┴┘└┘└─┘  ╩┘└┘ ┴ └─┘┴└─└  ┴ ┴└─┘└─┘
+#
+
+import json as jsonlib
+import time
+import re
+import click
+import pathlib
+from pixelblaze.pixelblaze import Pixelblaze, PBB
+from pixelblaze.cli.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json, jsons, \
+                                     get_cache_dir, check, parse_vars, get_pixelblaze, discover_pixelblaze
+
+@click.group()
+@click.option(
+    '--ip',
+    default='auto',
+    help='IP address of Pixelblaze (default: auto discover mode, checks 192.168.4.1 first for Ad Hoc, then network scan)',
+    show_default=True
+)
+@click.option(
+    '--timeout',
+    type=float,
+    default=5.0,
+    help='Command timeout in seconds (default: 5.0)',
+    show_default=True
+)
+@click.pass_context
+def pixelblaze(ctx, ip, timeout):
+    """
+    Pixelblaze LED Controller CLI
+
+    Control Pixelblaze devices from the command line.
+    """
+    ctx.ensure_object(dict)
+    ctx.obj['ip'] = ip
+    ctx.obj['timeout'] = timeout
+
+
+@cli(pixelblaze)
+@click.argument('count', type=int, required=False)
+@no_save_option
+def pixels(pb: Pixelblaze, count, no_save):
+    """
+    Get or set the number of pixels configured on the Pixelblaze.
+
+    \b
+    Examples:
+        pb pixels              # Get current pixel count
+        pb pixels 300          # Set pixel count to 300 (saved to flash)
+        pb pixels 300 --no-save   # Set pixel count to 300 (temporary only)
+    """
+    if count is None:
+        current_count = pb.getPixelCount()
+        click.echo(f"{current_count}")
+    else:
+        pb.setPixelCount(count, saveToFlash=not no_save)
+        action = "set" if no_save else "saved"
+        log(f"Pixel count {action} to {count}")
+
+
+@cli(pixelblaze)
+@click.argument('brightness', type=float, default=1.0, required=False)
+@click.option(
+    '--play-sequencer',
+    is_flag=True,
+    help='Also start/resume the pattern sequencer'
+)
+@no_save_option
+def on(pb: Pixelblaze, brightness, play_sequencer, no_save):
+    """
+    Turn on the Pixelblaze by setting brightness.
+
+    This command sets the brightness to the specified level (default: 1.0).
+    Optionally, you can also start/resume the sequencer.
+
+    \b
+    Examples:
+        pb on                       # Set brightness to 1.0 (full, saved to flash)
+        pb on 0.5                   # Set brightness to 50% (saved to flash)
+        pb on --play-sequencer      # Set brightness to 1.0 and start sequencer (saved)
+        pb on 0.8 --no-save         # Set brightness to 80% (temporary only)
+    """
+    check(0.0 <= brightness <= 1.0, "Brightness must be between 0.0 and 1.0")
+
+    log(f"Setting brightness to {brightness}...")
+    pb.setBrightnessSlider(brightness, saveToFlash=not no_save)
+
+    if play_sequencer:
+        log("Starting sequencer...")
+        pb.playSequencer(saveToFlash=not no_save)
+
+    action = "turned on" if no_save else "saved and turned on"
+    log(f"Pixelblaze {action} (brightness: {brightness})")
+
+
+@cli(pixelblaze)
+@click.option(
+    '--pause-sequencer',
+    is_flag=True,
+    help='Also pause the pattern sequencer'
+)
+@no_save_option
+def off(pb: Pixelblaze, pause_sequencer, no_save):
+    """
+    Turn off the Pixelblaze by setting brightness to zero.
+
+    This command sets the brightness to 0, effectively turning off all LEDs.
+    Optionally, you can also pause the sequencer to stop pattern changes.
+
+    \b
+    Examples:
+        pb off                      # Set brightness to 0 (saved to flash)
+        pb off --pause-sequencer    # Set brightness to 0 and pause sequencer (saved)
+        pb off --no-save            # Set brightness to 0 (temporary only)
+    """
+    log("Setting brightness to 0...")
+    pb.setBrightnessSlider(0.0, saveToFlash=not no_save)
+
+    if pause_sequencer:
+        log("Pausing sequencer...")
+        pb.pauseSequencer(saveToFlash=not no_save)
+
+    action = "turned off" if no_save else "saved and turned off"
+    log(f"Pixelblaze {action}")
+
+
+@cli(pixelblaze)
+@input_arg
+@click.option('--csv', is_flag=True, help='Output as csv instead of Pixelblaze 3-arrays')
+def map(pb: Pixelblaze, input, csv):
+    """
+    Get or set the pixel map function.
+
+    INPUT is an optional JavaScript file path or inline code. Can also be
+    piped via stdin. If no input is provided, the current map function
+    is displayed.
+
+    \b
+    Examples:
+        pb map                       # Get current map coordinates (normalized 0-1)
+        pb map map.js                # Set map from file
+        pb map < map.js              # Set map from stdin
+    """
+    content, _ = read_input(input, "map", required=False)
+    setting = content is not None
+
+    if setting:
+        if "function" in content:
+            log(f"Setting map function...")
+            pb.setMapFunction(content)
+        else:
+            # Also supporting numbers as strings
+            log(f"Setting map coordinates...")
+            pb.setMapCoordinates(parse_json(jsonlib.dumps(parse_json(content)).replace('"', "")))
+    elif csv:
+        log(f"Fetching map coordinates as CSV...")
+        coords = pb.getMapCoordinates()
+        click.echo("index,x,y,z")
+        for i in range(0, len(coords[0])):
+            click.echo(f"{i},{coords[0][i]},{coords[1][i]},{coords[2][i]}")
+    else:
+        log(f"Fetching map config...")
+        jsons({'coordinates': pb.getMapCoordinates(), 'fn': pb.getMapFunction()})
+
+
+@pixelblaze.group()
+def seq():
+    """
+    Sequencer and playlist control commands.
+
+    Control the Pixelblaze pattern sequencer, including play/pause,
+    navigation, and playlist management.
+    """
+    pass
+
+
+@cli(seq)
+@no_save_option
+def pause(pb: Pixelblaze, no_save):
+    """
+    Pause the pattern sequencer.
+
+    \b
+    Examples:
+        pb seq pause           # Pause sequencer (saved to flash)
+        pb seq pause --no-save    # Pause (temporary only)
+    """
+    log("Pausing sequencer...")
+    pb.pauseSequencer(saveToFlash=not no_save)
+    action = "paused" if no_save else "paused and saved"
+    log(f"Sequencer {action}")
+
+
+@cli(seq)
+@no_save_option
+def play(pb: Pixelblaze, no_save):
+    """
+    Start/resume the pattern sequencer.
+
+    \b
+    Examples:
+        pb seq play           # Start/resume sequencer (saved to flash)
+        pb seq play --no-save    # Start (temporary only)
+    """
+    log("Starting sequencer...")
+    pb.playSequencer(saveToFlash=not no_save)
+    action = "started" if no_save else "started and saved"
+    log(f"Sequencer {action}")
+
+
+@cli(seq)
+@no_save_option
+def next(pb: Pixelblaze, no_save):
+    """
+    Advance to the next pattern in the sequence.
+
+    Works with ShuffleAll or Playlist sequencer modes.
+
+    \b
+    Examples:
+        pb seq next           # Next pattern (saved to flash)
+        pb seq next --no-save    # Next pattern (temporary only)
+    """
+    log("Advancing to next pattern...")
+    pb.nextSequencer(saveToFlash=not no_save)
+    action = "Advanced to next pattern" if no_save else "Advanced to next pattern and saved"
+    log(action)
+
+
+@cli(seq)
+def rand(pb: Pixelblaze):
+    """
+    Jump to a random pattern.
+
+    Selects a random pattern from all available patterns on the Pixelblaze.
+
+    \b
+    Examples:
+        pb seq rand    # Jump to random pattern
+    """
+    import random as rand
+
+    log("Getting pattern list...")
+    patterns = pb.getPatternList()
+
+    check(patterns, "No patterns found on Pixelblaze")
+
+    pattern_id = rand.choice(list(patterns.keys()))
+    pattern_name = patterns[pattern_id]
+
+    log(f"Selecting random pattern: {pattern_name}")
+    pb.setActivePattern(pattern_id)
+    log(f"Now playing: {pattern_name}")
+
+
+@cli(seq, name='len')
+@click.argument('seconds', type=float)
+@no_save_option
+def set_duration(pb: Pixelblaze, seconds, no_save):
+    """
+    Set the duration for all patterns in the sequencer playlist.
+
+    SECONDS is the duration in seconds for each pattern.
+
+    Updates the sequencer playlist to change pattern durations.
+
+    \b
+    Examples:
+        pb seq len 10          # Set all durations to 10 seconds (saved)
+        pb seq len 30 --no-save   # Set to 30 seconds (temporary only)
+    """
+    check(seconds > 0, "Duration must be greater than 0")
+
+    milliseconds = int(seconds * 1000)
+
+    log("Getting current playlist...")
+    playlist = pb.getSequencerPlaylist()
+
+    items = playlist.get['playlist']['items']
+    check(items, "Playlist is empty")
+
+    original_count = len(items)
+    for item in items:
+        item['ms'] = milliseconds
+
+    log(f"Setting {original_count} pattern(s) to {seconds} seconds each...")
+    pb.setSequencerPlaylist(playlist)
+
+    if not no_save:
+        log("Saving playlist to flash...")
+
+    action = "set" if no_save else "saved"
+    log(f"Playlist updated and {action}: all patterns set to {seconds}s")
+
+
+@cli(pixelblaze)
+@click.argument('input', type=str, required=False)
+@click.argument('name', type=str, required=False)
+@click.option(
+    '--write',
+    '-w',
+    is_flag=True,
+    help='Save pattern to Pixelblaze (uses NAME argument or filename stem)'
+)
+@click.option(
+    '--rm',
+    is_flag=True,
+    help='Remove/delete the pattern from Pixelblaze'
+)
+@click.option(
+    '--img',
+    type=click.Path(exists=True),
+    help='Path to preview image (100x150 JPEG) for --write. If omitted, generates SMPTE placeholder'
+)
+@click.option(
+    '--var',
+    'var_args',
+    multiple=True,
+    help='Variables/controls in flexible format: key value, key:value, or \'{json5}\''
+)
+@no_save_option
+@click.option(
+    '--exact',
+    is_flag=True,
+    help='Require exact match for pattern name lookup'
+)
+@click.option(
+    '--lookup',
+    is_flag=True,
+    help='Force lookup of pattern name/ID instead of treating input as code'
+)
+@click.option(
+    '--cat',
+    is_flag=True,
+    help='Print the source code of an existing pattern'
+)
+def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exact, lookup, cat):
+    """
+    Unified pattern command: switch to, render, or save patterns.
+
+    INPUT can be a pattern name, file path, or inline JavaScript code.
+    INPUT can also be read from stdin if not provided.
+    NAME (optional) is the target pattern name or ID for --write operations.
+
+    \b
+    **Without --write or --rm (render/switch mode):**
+    - If INPUT is a file path → render pattern from file
+    - If INPUT contains code-like syntax (operators, function calls, etc.) → render as JavaScript code
+    - If INPUT is a valid pattern ID → switch to that pattern
+    - If INPUT matches a pattern name → switch to that pattern
+    - Otherwise → render INPUT as inline JavaScript code
+    - Use --lookup to force pattern name/ID lookup and skip code detection
+
+    \b
+    **With --write (save mode):**
+    - Saves the pattern to Pixelblaze filesystem
+    - Uses NAME if provided, otherwise derives name from filename
+    - If NAME matches an existing ID, that pattern is overwritten
+
+    \b
+    **With --cat (print source mode):**
+    - Prints the source code of an existing pattern
+    - INPUT should be a pattern name or ID
+
+    \b
+    Examples:
+        # Switch/Render
+        pb pattern rainbow
+        pb pattern code.js
+        pb pattern abcd123456789012
+        pb pattern 'true && hsv(1,1,1) || hsv(0,0,0)'  # Renders as code
+        pb pattern 'hsv' --lookup                      # Force lookup (rather than code)
+
+    \b
+        # Read from stdin
+        echo 'render code here' | pb pattern
+        cat code.js | pb pattern --write "My Pattern"
+
+    \b
+        # Remove
+        pb pattern foo --rm
+
+    \b
+        # Print source code
+        pb pattern rainbow --cat
+        pb pattern abc123456789012 --cat
+
+    \b
+        # Save (Write)
+        pb pattern code.js --write              # Save as "code"
+        pb pattern code.js --write "New Name"   # Save as "New Name"
+        pb pattern "hsv(0,1,1)" --write "Solid" # inline, requires name
+        pb pattern code.js --write abcd123456789012 # Overwrite existing
+    """
+    # Check for conflicting flags
+    check(not (write and rm), "Cannot use --write and --rm together")
+    check(not (write and cat), "Cannot use --write and --cat together")
+    check(not (rm and cat), "Cannot use --rm and --cat together")
+    check(not (rm and name), "Cannot use extra argument with --rm")
+    check(not (cat and name), "Cannot use NAME argument with --cat")
+
+    # Handle --cat mode early
+    if cat:
+        # --cat requires an INPUT (pattern name or ID)
+        check(input is not None, "Pattern name or ID required for --cat")
+        _handle_cat_mode(pb, input, exact)
+        return
+
+    # In write mode, handle stdin + name argument case
+    # When piping: cat file | pb pattern --write name
+    # Click parses 'name' as 'input' arg, so swap them if needed
+    if write and input is not None and name is None:
+        # If input doesn't look like code and isn't a file, it's probably the target name
+        if not pathlib.Path(input).is_file() and not _looks_like_code(input):
+            name = input
+            input = None
+
+    # Read from stdin if input not provided
+    input_from_stdin = False
+    if input is None:
+        input, input_from_stdin = read_input(None, name="pattern", required=True)
+
+    # Parse variables
+    variables = parse_vars(var_args) if var_args else {}
+
+    if rm:
+        # ===== REMOVE MODE =====
+        check(not variables, "Cannot use --var with --rm")
+        check(img is None, "Cannot use --img with --rm")
+        _handle_remove_mode(pb, input, exact)
+
+    elif write:
+        # ===== WRITE MODE =====
+        # Map the new 'name' arg to the internal 'write_target' logic
+        # If name is None, pass '' so logic knows to use filename stem
+        target = name if name else ''
+        _handle_write_mode(pb, input, target, img, variables, no_save, input_from_stdin)
+
+    else:
+        # ===== RENDER/SWITCH MODE =====
+        # If user provided a name but didn't say --write, we could warn,
+        # but for now let's just ignore it or assume they meant to write?
+        # Ideally, we strictly check:
+        if name:
+             log(f"Warning: Name argument '{name}' ignored because --write was not specified.")
+
+        _handle_render_or_switch_mode(pb, input, variables, no_save, exact, lookup, from_stdin=input_from_stdin)
+
+
+def _looks_like_code(s: str) -> bool:
+    """
+    Detect if a string looks like JavaScript code rather than a pattern name.
+
+    Returns True if the string contains code-like patterns:
+    - Operators: &&, ||, +, -, *, /, %, ===, !==, ==, !=, <, >, <=, >=
+    - Function calls: word(
+    - Brackets: {, }, [, ], ;
+    - Comparisons and assignments: =, ?:
+    """
+    # Check for common code operators and patterns
+    code_indicators = [
+        '&&', '||',  # Logical operators
+        '++', '--',  # Increment/decrement
+        '===', '!==', '==', '!=',  # Comparisons
+        '<=', '>=', '=>',  # Comparisons and arrow functions
+        '{', '}', '[', ']', ';',  # Brackets and statements
+        '?', ':',  # Ternary operator
+    ]
+
+    # Check for obvious code patterns
+    for indicator in code_indicators:
+        if indicator in s:
+            return True
+
+    # Check for function calls (word followed by open paren)
+    if re.search(r'\w+\s*\(', s):
+        return True
+
+    # Check for math operators only if not at start (could be negative number)
+    if re.search(r'[\d\s]\s*[\+\-\*/%]\s*[\d\s]', s):
+        return True
+
+    return False
+
+
+def _find_pattern(pb: Pixelblaze, search: str, exact: bool = False):
+    """Find a pattern by name or ID.
+
+    Returns:
+        tuple: (pattern_id, pattern_name) or (None, None) if not found
+    """
+    log("Fetching pattern list...")
+    patterns = pb.getPatternList()
+
+    # Try by ID first
+    if Pixelblaze.isPatternId(search):
+        pattern_name = patterns.get(search)
+        return (search, pattern_name) if pattern_name else (None, None)
+
+    # Search by name
+    if not patterns:
+        return (None, None)
+
+    pattern_regex = re.compile(search, re.IGNORECASE)
+
+    for pattern_id, pattern_name in patterns.items():
+        if exact:
+            if pattern_name.lower() == search.lower():
+                return (pattern_id, pattern_name)
+        else:
+            if pattern_regex.search(pattern_name):
+                return (pattern_id, pattern_name)
+
+    return (None, None)
+
+
+def _handle_cat_mode(pb: Pixelblaze, input, exact):
+    """Handle --cat mode: print pattern source code."""
+    pattern_id, pattern_name = _find_pattern(pb, input, exact)
+    check(pattern_id, f"Pattern '{input}' not found on Pixelblaze")
+
+    log(f"Fetching source code for '{pattern_name}' (ID: {pattern_id})...")
+    source_code = pb.getPatternSourceCode(pattern_id)
+    check(source_code, f"Failed to retrieve source code for pattern '{pattern_name}'")
+
+    # Parse the JSON to extract the actual source
+    try:
+        source_obj = jsonlib.loads(source_code)
+        actual_source = source_obj.get('main', source_code)
+    except:
+        actual_source = source_code
+
+    click.echo(actual_source)
+
+
+def _handle_remove_mode(pb: Pixelblaze, input, exact):
+    """Handle --rm mode: remove pattern from Pixelblaze."""
+    check(not pathlib.Path(input).is_file(), "Cannot use --rm with a file path. Specify pattern name or ID.")
+
+    pattern_id, pattern_name = _find_pattern(pb, input, exact)
+    check(pattern_id, f"Pattern '{input}' not found on Pixelblaze")
+
+    log(f"Deleting pattern '{pattern_name}' (ID: {pattern_id})...")
+    pb.deletePattern(pattern_id)
+    log(f"Pattern '{pattern_name}' deleted successfully!")
+
+
+def _handle_write_mode(pb: Pixelblaze, input, write_target, img, variables, no_save, from_stdin=False):
+    """Handle --write mode: save pattern to Pixelblaze."""
+    # If input came from stdin, it's already the code content; otherwise check if it's a file
+    is_file = not from_stdin and pathlib.Path(input).is_file()
+    code, _ = read_input(input, "code") if is_file else (input, False)
+
+    # Determine pattern name/ID
+    if write_target == '':
+        check(is_file, "Pattern name required when not reading from file. Use: --write NAME")
+        pattern_name = pathlib.Path(input).stem
+        pattern_id = None
+    elif Pixelblaze.isPatternId(write_target):
+        pattern_id, pattern_name = _find_pattern(pb, write_target)
+        check(pattern_name, f"Pattern ID {write_target} not found")
+    else:
+        pattern_name = write_target
+        pattern_id = None
+
+    if "export" not in code:
+        code = 'export function render(index) { ' + code + ' ; }'
+
+    img = img or pathlib.Path(__file__).parent / '../../site/images/preview_placeholder.jpg'
+    log(f"Loading preview image from {img}...")
+    with open(img, 'rb') as f:
+        preview_image = f.read()
+
+    log(f"Saving pattern '{pattern_name}' (Supplied ID: {pattern_id})...")
+    pattern_id = pb.savePattern(
+        previewImage=preview_image,
+        sourceCode=code,
+        name=pattern_name,
+        id=pattern_id,
+        allowCache=True
+    )
+
+    log(f"Pattern '{pattern_name}' (ID: {pattern_id}) created successfully!")
+    _set_vars_and_controls(pb, variables, not no_save)
+    jsons({'id': pattern_id})
+
+
+def _handle_render_or_switch_mode(pb: Pixelblaze, input, variables, no_save, exact, lookup=False, from_stdin=False):
+    """Handle render or switch mode based on input type."""
+    # Only check if it's a file if it didn't come from stdin
+    if not from_stdin and pathlib.Path(input).is_file():
+        code, _ = read_input(input, "code")
+        _render_pattern(pb, code, variables)
+        return
+
+    # Determine if input looks like code or a pattern lookup
+    input_looks_like_code = _looks_like_code(input)
+
+    # If input looks like code and --lookup is not set, treat as inline code
+    if input_looks_like_code and not lookup:
+        _render_pattern(pb, input, variables)
+        return
+
+    # Try to find as existing pattern (by ID or name)
+    pattern_id, pattern_name = _find_pattern(pb, input, exact)
+
+    if pattern_id:
+        # Switch to existing pattern
+        log(f"Switching to pattern: {pattern_name}")
+        pb.setActivePattern(pattern_id, saveToFlash=not no_save)
+
+        action = "activated" if no_save else "activated and saved"
+        log(f"Pattern '{pattern_name}' {action}")
+        _set_vars_and_controls(pb, variables, not no_save)
+    else:
+        # Not found as pattern, treat as inline code (unless --lookup was specified)
+        if lookup:
+            check(False, f"Pattern '{input}' not found on Pixelblaze (use without --lookup to treat as code)")
+        _render_pattern(pb, input, variables)
+
+
+def _render_pattern(pb: Pixelblaze, code, variables):
+    """Compile and render a pattern to the Pixelblaze."""
+    if "export" not in code:
+        code = 'export function render(index) { ' + code + ' ; }'
+
+    log("Compiling pattern...")
+    bytecode = pb.compilePattern(code, allow_cache=True)
+
+    log("Sending to renderer...")
+    pb.sendPatternToRenderer(bytecode)
+    _set_vars_and_controls(pb, variables)
+
+    log("Pattern rendered successfully")
+
+
+def _set_vars_and_controls(pb: Pixelblaze, variables, save=False):
+    """Set variables and/or controls on the active pattern."""
+    if not variables:
+        return
+
+    log(f"Setting variables/controls: {variables}")
+    pb.setActiveControls(variables, saveToFlash=save)
+    pb.setActiveVariables(variables)
+
+
+@cli(pixelblaze)
+def cfg(pb: Pixelblaze):
+    """
+    Fetch and display most of the configuration from the Pixelblaze.
+
+    This mimics the web UI's initial configuration fetch, retrieving:
+    - Device config
+    - Pattern list
+    - Playlist
+    - Sequencer settings
+    - And more
+
+    \b
+    Examples:
+        pb cfg
+        pb cfg | yq -P          # Pretty-printed YAML
+    """
+    log("Fetching configurations...")
+    jsons({
+        'config': pb.getConfigSettings(),
+        'patterns': pb.getPatternList(),
+        'playlist': pb.getSequencerPlaylist(),
+        'sequencer': pb.getConfigSequencer()
+    })
+
+
+@cli(pixelblaze)
+def ls(pb: Pixelblaze):
+    """
+    List all files stored on the Pixelblaze's filesystem.
+
+    Returns a list of all files including patterns, configuration files,
+    and other assets stored on the device.
+
+    \b
+    Examples:
+        pb ls
+        pb ls | jq '.[]' -crM | grep '.c'    # Filter for control files
+    """
+    log("Fetching file list...")
+    jsons(pb.getFileList())
+
+
+@cli(pixelblaze)
+@click.argument('source', type=str)
+@click.argument('dest', type=str, required=False)
+@click.option(
+    '--write',
+    '-w',
+    is_flag=True,
+    help='Upload to Pixelblaze (SOURCE=local file, DEST=Pixelblaze path)'
+)
+def cp(pb: Pixelblaze, source, dest, write):
+    """
+    Copy files between the Pixelblaze and local filesystem.
+
+    Without --write (default): Download from Pixelblaze to local
+    - SOURCE is the filename on the Pixelblaze (as shown by 'pb ls')
+    - DEST is optional local path (defaults to current directory)
+
+    With --write: Upload from local to Pixelblaze
+    - SOURCE is the local file path (or Pixelblaze path if piping stdin)
+    - DEST is optional Pixelblaze path (defaults to /SOURCE_BASENAME)
+    - Supports piping binary data via stdin
+
+    \b
+    Examples (download from Pixelblaze):
+        pb cp /config.json                    # Save as ./config.json
+        pb cp /p/abc123                       # Save as ./abc123
+        pb cp /config.json my_config.json     # Save as ./my_config.json
+        pb cp /p/abc123 patterns/             # Save as ./patterns/abc123
+
+    \b
+    Examples (upload to Pixelblaze):
+        pb cp config.json --write             # Upload as /config.json
+        pb cp pattern.js --write /p/abc123    # Upload as /p/abc123
+        pb cp mymap.txt --write /pixelmap.txt # Upload as /pixelmap.txt
+        cat foo.html | gzip | pb cp /index.html.gz --write  # Pipe to Pixelblaze
+        cat img.jpg | pb cp /preview.jpg --write            # Binary via stdin
+    """
+    if write:
+        # Upload mode: local → Pixelblaze
+        content, is_stdin = read_input(source, name="file", binary=True)
+
+        if is_stdin:
+            # When using stdin, SOURCE is the destination on Pixelblaze
+            check(dest is None, "Cannot specify DEST when piping stdin (SOURCE becomes the Pixelblaze path)")
+            pixelblaze_path = source
+        else:
+            # Reading from file, SOURCE is local path
+            # Determine destination path on Pixelblaze
+            if dest is None:
+                # Default: use basename with leading slash
+                pixelblaze_path = f"/{pathlib.Path(source).name}"
+            else:
+                pixelblaze_path = dest
+
+        log(f"Uploading to Pixelblaze: {pixelblaze_path}")
+        success = pb.putFile(pixelblaze_path, content)
+
+        check(success, f"Failed to upload to '{pixelblaze_path}'")
+
+        size_kb = len(content) / 1024
+        log(f"Successfully uploaded → {pixelblaze_path} ({size_kb:.1f} KB)")
+
+    else:
+        # Download mode: Pixelblaze → local
+        log(f"Fetching file: {source}")
+        content = pb.getFile(source)
+
+        check(content is not None, f"File '{source}' not found on Pixelblaze")
+
+        # Determine destination path
+        if dest is None:
+            # Use basename of source file in current directory
+            dest = pathlib.Path(source).name
+        else:
+            dest_path = pathlib.Path(dest)
+            # If dest is a directory, use source basename in that directory
+            if dest_path.is_dir():
+                dest = dest_path / pathlib.Path(source).name
+
+        dest_path = pathlib.Path(dest)
+
+        # Create parent directories if needed
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        log(f"Writing to: {dest_path}")
+        dest_path.write_bytes(content)
+
+        size_kb = len(content) / 1024
+        log(f"Successfully copied {source} → {dest_path} ({size_kb:.1f} KB)")
+
+
+@cli(pixelblaze)
+@click.argument('files', nargs=-1, required=True)
+def rm(pb: Pixelblaze, files):
+    """
+    Remove one or more files or patterns from the Pixelblaze.
+
+    FILES can be paths on the Pixelblaze (e.g., /config.json) or pattern IDs.
+    If a FILE looks like a pattern ID, it's treated as /p/<id>.
+
+    \b
+    Examples:
+        pb rm /config.json           # Remove a file
+        pb rm abc123456789012       # Remove a pattern (by ID)
+        pb rm /p/abc123456789012    # Remove a pattern (by full path)
+        pb rm abc123 def456 /data.json  # Remove multiple items
+    """
+    for file in files:
+        # Check if it's a pattern ID
+        if Pixelblaze.isPatternId(file):
+            # Treat as pattern ID
+            log(f"Deleting pattern '{file}'...")
+            pb.deletePattern(file)
+            log(f"Pattern '{file}' deleted successfully!")
+        else:
+            # Treat as file path
+            log(f"Deleting file '{file}'...")
+            success = pb.deleteFile(file)
+            check(success, f"Failed to delete file '{file}'")
+            log(f"File '{file}' deleted successfully!")
+
+
+@cli(pixelblaze)
+@click.argument('json', type=str)
+@click.option(
+    '--expect',
+    type=str,
+    help='Expected response key (e.g., "ack", "playlist")'
+)
+def ws(pb: Pixelblaze, json, expect):
+    """
+    Send arbitrary JSON to the Pixelblaze websocket.
+
+    JSON_DATA is the JSON object to send (as a string).
+
+    \b
+    Examples:
+        pb ws '{ping:true}'
+        pb ws '{"getConfig":true}' --expect config
+        pb ws '{brightness:0.5, save:false}'
+        pb ws '{activeProgramId:"abc123", save:true}'
+        pb ws '{'getPlaylist':"_defaultplaylist_"}' --expect playlist
+    """
+    json_obj = parse_json(json)
+
+    # Send the websocket message, if no --expect is provided, wait for any non-chatty text response
+    if expect == "stats":
+        expect = pb.messageTypes.specialStats
+    response = pb.wsSendJson(json_obj, expectedResponse=expect, waitForAnyResponse=(expect is None))
+
+    if response is None:
+        log("No response (fire-and-forget command?)")
+    elif isinstance(response, bytes):
+        log("Binary response:")
+        click.echo(response.hex())
+    else:
+        log("Response:")
+        try:
+            jsons(jsonlib.loads(response))
+        except:
+            # Not JSON, just print it
+            click.echo(response)
+
+
+@click.argument('args', nargs=-1, required=True)
+@click.option(
+    '--control',
+    is_flag=True,
+    help='Set as UI controls (sliders) instead of variables'
+)
+@no_save_option
+@cli(pixelblaze)
+def var(pb: Pixelblaze, args, control, no_save):
+    """
+    Set variables or UI controls on the active pattern.
+
+    Variables are pattern exports (export var myVar), while controls are
+    UI sliders (export function sliderMyControl(v)).
+
+    Supports multiple input formats that can be mixed:
+    - key value pairs: pb var foo bar
+    - colon-separated: pb var foo:bar
+    - JSON5 objects: pb var '{a:1, b:2}'
+    - combined: pb var foo 2 bar:3 '{baz:true}'
+
+    \b
+    Examples:
+        pb var globalSpeed .3              # Set variable to number
+        pb var foo bar                     # Set variable to string
+        pb var foo 1                       # Set variable to number 1
+        pb var 'foo:bar baz'               # Set foo to "bar baz" (colon format)
+        pb var '{a:1, b:2}'                # Set multiple from JSON5 object
+        pb var foo 2 bar:3 '{baz:true}'    # Mix all formats
+        pb var --control hue 0.33          # Set UI control
+        pb var foo bar --no-save           # Don't save to flash
+    """
+    variables = parse_vars(args)
+    check(variables, "No variables specified")
+
+    if control:
+        log(f"Setting controls: {variables}")
+        pb.setActiveControls(variables, saveToFlash=not no_save)
+    else:
+        log(f"Setting variables: {variables}")
+        pb.setActiveVariables(variables)
+
+    log("Variables set successfully")
+
+
+@click.option(
+    '--count',
+    '-c',
+    type=int,
+    default=5,
+    help='Number of pings to send (default: 5)'
+)
+@cli(pixelblaze)
+def ping(pb: Pixelblaze, count):
+    """
+    Test connection latency to the Pixelblaze.
+
+    Sends ping requests and measures round-trip time to determine
+    network latency and Pixelblaze responsiveness.
+
+    \b
+    Examples:
+        pb ping              # Send 5 pings (default)
+        pb ping -c 10        # Send 10 pings
+        pb ping --count 3    # Send 3 pings
+    """
+    log(f"Pinging Pixelblaze...\n")
+
+    times = []
+    successful = 0
+    failed = 0
+
+    for i in range(count):
+        try:
+            start = time.time()
+            response = pb.sendPing()
+            elapsed = (time.time() - start) * 1000
+
+            if response is not None:
+                successful += 1
+                times.append(elapsed)
+                log(f"Ping {i+1}: {elapsed:.2f}ms")
+            else:
+                failed += 1
+                log(f"Ping {i+1}: timeout")
+
+            if i < count - 1:
+                time.sleep(0.1)
+
+        except Exception as e:
+            failed += 1
+            log(f"Ping {i+1}: error - {e}")
+
+    if times:
+        min_time = min(times)
+        max_time = max(times)
+        avg_time = sum(times) / len(times)
+
+        log(f"\n--- Ping statistics ---")
+        log(f"Packets: Sent = {count}, Received = {successful}, Lost = {failed} ({failed*100//count}% loss)")
+        log(f"Round-trip times: min = {min_time:.2f}ms, max = {max_time:.2f}ms, avg = {avg_time:.2f}ms")
+
+        click.echo(f"{avg_time:.2f}")
+    else:
+        log(f"\nAll pings failed")
+    check(successful > 0, "Failed to ping Pixelblaze")
+
+
+@cli(pixelblaze, conn=False)
+@click.argument('output_file', required=False)
+@click.option('--quiet', '-q', is_flag=True, help='Suppress verbose progress output')
+@click.option('--decode', '-d', is_flag=True, help='Decode base64 file contents in output')
+@click.option('--binary', is_flag=True, help='Include binary content as base64 (with --decode)')
+def pbb(ctx, output_file, quiet, decode, binary):
+    """
+    Export a Pixelblaze Binary Backup (.pbb file).
+
+    Backs up the entire Pixelblaze configuration including patterns, settings,
+    map data, and all configuration files.
+
+    If no output file is specified, outputs to stdout as JSON.
+    If a filename is provided, saves as a .pbb file (auto-appends .pbb extension if missing).
+    If the file already exists, uses that file instead of connecting to Pixelblaze.
+
+    \b
+    Examples:
+        pb --ip 192.168.1.24 pbb                    # Output to stdout
+        pb --ip 192.168.1.24 pbb backup             # Save to backup.pbb
+        pb --ip 192.168.1.24 pbb my_config.pbb      # Save to my_config.pbb
+        pb --ip 192.168.1.24 pbb -q backup          # Quiet mode
+        pb pbb -d backup.pbb                        # Decode existing file
+        pb pbb -d --binary backup.pbb               # Include binary as base64
+    """
+    import pathlib
+    import base64
+
+    # Determine the actual file path
+    if output_file:
+        if not output_file.endswith('.pbb'):
+            output_file += '.pbb'
+
+    # Check if file exists and should be used
+    if output_file and pathlib.Path(output_file).exists():
+        log(f"Using existing file: {output_file}")
+        temp_file = output_file
+        should_cleanup = False
+    else:
+        # Need to fetch from Pixelblaze
+        log("Creating backup from Pixelblaze...")
+        with get_pixelblaze(ctx) as pb:
+            backup = PBB.fromPixelblaze(pb, verbose=not quiet)
+
+            if output_file:
+                backup.toFile(output_file)
+                log(f"Backup saved to {output_file}")
+                return
+            else:
+                temp_file = '/tmp/pixelblaze_backup_temp.pbb'
+                backup.toFile(temp_file)
+                should_cleanup = True
+
+    # Read and potentially decode the file
+    content = pathlib.Path(temp_file).read_text()
+
+    if decode:
+        # Decode base64 entries
+        from pixelblaze.pixelblaze import PBP
+
+        data = jsonlib.loads(content)
+        if 'files' in data:
+            decoded_files = {}
+            for filename, b64_content in data['files'].items():
+                try:
+                    # Decode base64
+                    decoded = base64.b64decode(b64_content)
+
+                    # Check if it's a PBP (Pixelblaze Binary Pattern) file
+                    if filename.startswith('/p/') and len(decoded) > 36:
+                        try:
+                            # Parse PBP format
+                            pbp = PBP.fromBytes(filename.split('/')[-1], decoded)
+                            decoded_files[filename] = {
+                                'name': pbp.name,
+                                'sourceCode': jsonlib.loads(pbp.sourceCode),
+                                'preview': '<jpeg>' if not binary else base64.b64encode(pbp.jpeg).decode('utf-8'),
+                                'byteCode': '<bytecode>' if not binary else base64.b64encode(pbp.byteCode).decode('utf-8')
+                            }
+                            continue
+                        except Exception:
+                            # Not a valid PBP, try other formats
+                            pass
+
+                    # Try to parse as UTF-8 text
+                    try:
+                        text = decoded.decode('utf-8')
+                        # Try to parse as JSON
+                        try:
+                            decoded_files[filename] = jsonlib.loads(text)
+                        except jsonlib.JSONDecodeError:
+                            # Not JSON, just text
+                            decoded_files[filename] = text
+                    except UnicodeDecodeError:
+                        # Binary content (images, etc.)
+                        if binary:
+                            decoded_files[filename] = b64_content
+                        else:
+                            # Detect image format
+                            if decoded.startswith(b'\xff\xd8\xff'):
+                                decoded_files[filename] = '<jpeg>'
+                            elif decoded.startswith(b'\x89PNG'):
+                                decoded_files[filename] = '<png>'
+                            else:
+                                decoded_files[filename] = '<binary>'
+                except Exception:
+                    # If decode fails, keep original
+                    decoded_files[filename] = b64_content
+
+            data['files'] = decoded_files
+            content = jsonlib.dumps(data, indent=2)
+
+    click.echo(content)
+    if should_cleanup:
+        pathlib.Path(temp_file).unlink()
+
+
+@cli(pixelblaze)
+@click.argument('input_file')
+@click.option('--quiet', '-q', is_flag=True, help='Suppress verbose progress output')
+def restore(pb: Pixelblaze, input_file, quiet):
+    """
+    Restore a Pixelblaze from a Binary Backup (.pbb file).
+
+    Restores the entire Pixelblaze configuration from a .pbb backup file,
+    including patterns, settings, map data, and all configuration files.
+
+    WARNING: This will overwrite all current patterns and settings!
+
+    \b
+    Examples:
+        pb --ip 192.168.1.24 restore backup.pbb
+        pb --ip 192.168.1.24 restore my_config.pbb
+    """
+    if not input_file.endswith('.pbb'):
+        input_file += '.pbb'
+
+    log(f"Restoring from {input_file}...")
+    backup = PBB.fromFile(input_file)
+    backup.toPixelblaze(pb, verbose=not quiet)
+    log("Restore complete!")
+
+
+@pixelblaze.group()
+def cache():
+    """
+    Manage Pixelblaze CLI cache.
+
+    The cache stores the last used IP address and compiled pattern compilers
+    to speed up CLI operations.
+    """
+    pass
+
+
+@cache.command()
+def show():
+    """Show cache location and contents."""
+    cache_dir = get_cache_dir()
+
+    log(f"Cache directory: {cache_dir}")
+    log("")
+
+    # Show IP cache
+    ip_file = cache_dir / 'last_ip.txt'
+    if ip_file.exists():
+        log(f"Cached IP: {ip_file.read_text().strip()}")
+    else:
+        log("Cached IP: (none)")
+
+    # Show compiler cache
+    compiler_cache = cache_dir / 'compiler_cache'
+    if compiler_cache.exists():
+        cached_compilers = list(compiler_cache.glob('*.js'))
+        if cached_compilers:
+            log(f"\nCached compilers ({len(cached_compilers)}):")
+            for compiler_file in sorted(cached_compilers):
+                version = compiler_file.stem
+                size_kb = compiler_file.stat().st_size / 1024
+                log(f"  - Version {version} ({size_kb:.1f} KB)")
+        else:
+            log("\nCached compilers: (none)")
+    else:
+        log("\nCached compilers: (none)")
+
+
+@cache.command()
+@click.option('--compiler', is_flag=True, help='Only clear compiler cache')
+@click.option('--ip', is_flag=True, help='Only clear IP cache')
+def clear(compiler, ip):
+    """Clear the cache."""
+    import shutil
+
+    cache_dir = get_cache_dir()
+
+    if not compiler and not ip:
+        # Clear everything
+        if click.confirm(f"Clear all cache in {cache_dir}?", err=True):
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            log("Cache cleared")
+        return
+
+    if ip:
+        ip_file = cache_dir / 'last_ip.txt'
+        if ip_file.exists():
+            ip_file.unlink()
+            log("IP cache cleared")
+        else:
+            log("No IP cache to clear")
+
+    if compiler:
+        compiler_cache = cache_dir / 'compiler_cache'
+        if compiler_cache.exists():
+            shutil.rmtree(compiler_cache, ignore_errors=True)
+            log("Compiler cache cleared")
+        else:
+            log("No compiler cache to clear")
+
+
+@cli(pixelblaze, conn=False)
+@click.option('--wait', is_flag=True, help='Wait for device to come back online after reboot')
+def reboot(ctx, wait):
+    """
+    Reboot the Pixelblaze device.
+
+    Can be useful for getting out of non-responsive state.
+
+    \b
+    Examples:
+        pb reboot
+        pb reboot --wait    # Wait for device to come back online
+    """
+    import requests
+
+    device_ip = None
+
+    def send_reboot_http(ip):
+        """Send reboot command via direct HTTP POST."""
+        url = f"http://{ip}/reboot"
+        log(f"Sending reboot command to {ip}...")
+        try:
+            response = requests.post(url, timeout=5)
+            if response.status_code in [200, 404]:
+                return True
+            response.raise_for_status()
+        except requests.RequestException as e:
+            log(f"Error sending reboot: {e}")
+            return False
+        return True
+
+    # Try normal method first
+    try:
+        with get_pixelblaze(ctx) as pb:
+            log("Rebooting Pixelblaze...")
+            pb.reboot()
+            log("Reboot command sent successfully")
+            device_ip = pb.ipAddress
+    except ConnectionResetError as e:
+        if e.errno == 54:
+            log("Device websocket not responding, trying direct HTTP reboot...")
+            discovered_ip = discover_pixelblaze(ctx)
+            if send_reboot_http(discovered_ip):
+                log("Reboot command sent successfully (via HTTP)")
+                device_ip = discovered_ip
+            else:
+                log("Failed to send reboot command")
+                return
+        else:
+            raise
+    except Exception as e:
+        # For any other connection issues, try direct POST
+        log(f"Connection failed ({type(e).__name__}), trying direct HTTP reboot...")
+        discovered_ip = discover_pixelblaze(ctx)
+        if send_reboot_http(discovered_ip):
+            log("Reboot command sent successfully (via HTTP)")
+            device_ip = discovered_ip
+        else:
+            log("Failed to send reboot command")
+            return
+
+    if wait:
+        log("Waiting for device to come back online...")
+        # Give the device time to actually reboot
+        time.sleep(2)
+
+        reconnected = False
+        attempts = 0
+        max_attempts = 60  # 60 seconds timeout
+
+        while not reconnected and attempts < max_attempts:
+            try:
+                # Try to create a fresh connection using context manager
+                with Pixelblaze(device_ip) as test_pb:
+                    test_pb.getConfigSettings()
+                    reconnected = True
+                    log("Device is back online!")
+            except Exception:
+                attempts += 1
+                time.sleep(1)
+
+        if not reconnected:
+            log("Warning: Timed out waiting for device to reconnect")
+
+
+def main():
+    """Entry point for the CLI."""
+    pixelblaze(obj={})
+
+
+if __name__ == '__main__':
+    main()

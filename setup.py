@@ -8,7 +8,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name = 'pixelblaze-client',
-    version = "1.1.6",
+    version = "1.1.7",
     description = 'Library for Pixelblaze addressable LED controller.',
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -29,8 +29,16 @@ setuptools.setup(
       "websocket-client",
       "requests",
       "pytz",
-      "mini-racer"
+      "mini-racer",
+      "click>=8.0",
+      "json5",
+      "lzstring",
     ],
     packages=["pixelblaze"],
     python_requires='>=3.9',
+    entry_points={
+        'console_scripts': [
+            'pb=pixelblaze.cli.cli:main',
+        ],
+    },
 )

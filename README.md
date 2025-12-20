@@ -26,12 +26,22 @@ Sample code illustrating usage is provided in the [examples directory](examples/
 
 **Please note that version 1.0.0 was a major refactoring and enhancement of the library, with many new features and significant changes.** The API surface is completely new. See the the [API documentation](#documentation) for details.  
 
-## Current Version [**v1.1.6**] - 2025-9-2
+## Current Version [**v1.1.7**] - 2025-12-3
 
 #### Fixed
-* Remove unused re.T import that was causing problems with recent Python versions
-* Replaced deprecated py-mini-racer with mini-racer 
-* Fixed long-standing bug in output expander board configuration handling
+
+* Added retry for `WebSocketBadStatusException`
+* Fix `savePattern()` functionality and API (add missing PBP feature)
+* Various utf-8 / encoding bugs
+* PBP putFile path
+* Add an integration-ish test!
+
+#### Added
+
+* Created handy `pb` cli
+* Implement `waitForAnyResponse` (non-chatty) for WS send
+* Cache mini-racer compile eval for speed
+* Add and use `PBP.fromComponents()`
 
 ### Older Versions
 

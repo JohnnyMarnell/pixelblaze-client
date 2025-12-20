@@ -76,6 +76,7 @@ import random
 import base64
 import binascii
 import struct
+import lzstring
 import pathlib
 import pytz
 import traceback
@@ -430,11 +431,13 @@ class Pixelblaze:
                         self.ws = websocket.create_connection(uri, sockopt=(
                         (socket.SOL_SOCKET, socket.SO_REUSEADDR, 1), (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),))
                     break
-                except websocket._exceptions.WebSocketConnectionClosedException:
-                    # print("Open failed.  Retry # ",retryCount)
+                except (websocket._exceptions.WebSocketConnectionClosedException,
+                        websocket._exceptions.WebSocketBadStatusException):
+                    # Connection failed - retry after a short delay
                     retryCount += 1
                     if retryCount >= self.max_open_retries:
                         raise
+                    time.sleep(0.1 * retryCount)  # Slight backoffs, 100ms, 200ms, 300ms etc
 
             self.ws.settimeout(self.default_recv_timeout)
             self.connected = True
@@ -587,12 +590,13 @@ class Pixelblaze:
             except:
                 raise
 
-    def wsSendJson(self, command: dict, *, expectedResponse=None) -> Union[str, bytes, None]:
+    def wsSendJson(self, command: dict, *, expectedResponse=None, waitForAnyResponse=False) -> Union[str, bytes, None]:
         """Send a JSON-formatted command to the Pixelblaze, and optionally wait for a suitable response.
 
         Args:
             command (dict): A Python dictionary which will be sent to the Pixelblaze as a JSON command.
             expectedResponse (str, optional): If present, the initial key of the expected JSON response to the command. Defaults to None.
+            waitForAnyResponse (bool, optional): If True and expectedResponse is None, wait for any non-chatty text response. Defaults to False (fire-and-forget).
 
         Returns:
             Union[str, bytes, None]: The message received from the Pixelblaze (of type bytes for binaryMessageTypes, otherwise of type str), or None if a timeout occurred.
@@ -604,13 +608,14 @@ class Pixelblaze:
                 self._connection_maint()
                 self.ws.send(json.dumps(command, indent=None, separators=(',', ':')).encode("utf-8"))
 
-                if expectedResponse is None:
+                if expectedResponse is None and not waitForAnyResponse:
                     return None
 
                     # If the pipe broke while we were sending, restart from the beginning.
                 if self.connectionBroken: break
 
-                # Wait for the expected response.
+                # Wait for the expected response (or any non-chatty response if waitForAnyResponse=True).
+                response = None
                 while True:
                     # Loop until we get the right text response.
                     if type(expectedResponse) is str:
@@ -623,6 +628,10 @@ class Pixelblaze:
                     # Or the right binary response.
                     elif type(expectedResponse) is self.messageTypes:
                         response = self.wsReceive(binaryMessageType=expectedResponse)
+                        break
+                    # Or just accept any non-chatty text response.
+                    elif waitForAnyResponse:
+                        response = self.wsReceive(binaryMessageType=None)
                         break
                 # Now that we've got the right response, return it.
                 return response
@@ -662,7 +671,8 @@ class Pixelblaze:
                 # Break the frame into manageable chunks.
                 response = None
                 maxFrameSize = 8192  ### the webUI source code says limit for v2 is 1024 but this still works...
-                if binaryMessageType == self.messageTypes.putByteCode: maxFrameSize = 1280
+                if binaryMessageType == self.messageTypes.putByteCode or binaryMessageType == self.messageTypes.putSourceCode:
+                    maxFrameSize = 1280
                 for i in range(0, len(blob), maxFrameSize):
 
                     # Set the frame header values.
@@ -673,7 +683,7 @@ class Pixelblaze:
                     if (len(blob) - i) <= maxFrameSize:
                         frameFlag |= self.frameTypes.frameLast
                     else:
-                        frameFlag = self.frameTypes.frameMiddle
+                        frameFlag |= self.frameTypes.frameMiddle
                     frameHeader[1] = frameFlag.value
 
                     # Send the packet.
@@ -1298,18 +1308,47 @@ class Pixelblaze:
             str: A string representation of a JSON dictionary containing the pattern source code.
         """
         sources = self.wsSendJson({"getSources": patternId}, expectedResponse=self.messageTypes.getSourceCode)
-        if sources is not None: return _LZstring.decompress(sources)
+        if sources is not None: return Pixelblaze._decompress_from_uint8array(sources)
         return None
 
-    def compilePattern(self, patternCode: str) -> bytes:
+    def compilePattern(self, patternCode: str, allow_cache: bool = False) -> bytes:
         """Compiles pattern sourcecode into a bytecode blob.
 
         Args:
             patternCode (str): The PBscript sourcecode of the pattern.
+            allow_cache (bool): If True, use cached compiler if available. Defaults to False for backwards compatibility.
 
         Returns:
             bytes: a compiled blob of bytecode, ready to send to the Pixelblaze using `sendPatternToRenderer()`.
         """
+
+        def _get_compiler_cache_dir():
+            """Get the compiler cache directory."""
+            import sys
+            if sys.platform == 'win32':
+                cache_dir = pathlib.Path.home() / 'AppData' / 'Local' / 'pixelblaze' / 'compiler_cache'
+            else:
+                cache_dir = pathlib.Path.home() / '.config' / 'pixelblaze' / 'compiler_cache'
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            return cache_dir
+
+        def _get_cached_compiler(version: str):
+            """Get cached compiler code for a specific version."""
+            try:
+                cache_file = _get_compiler_cache_dir() / f"{version}.js"
+                if cache_file.exists():
+                    return cache_file.read_text()
+            except Exception:
+                pass
+            return None
+
+        def _cache_compiler(version: str, compiler_code: str):
+            """Cache compiler code for future use."""
+            try:
+                cache_file = _get_compiler_cache_dir() / f"{version}.js"
+                cache_file.write_text(compiler_code)
+            except Exception:
+                pass
 
         # Firmware-dependent adapters.
         def getSubstring(text: str, startValue: str, endValue: str):
@@ -1381,23 +1420,29 @@ class Pixelblaze:
                 # print("Using v3AdapterV3")
                 return v3AdapterV3
 
-        # Download the webUI from the Pixelblaze and extract the pieces we need for compilation.
-        webUI = gzip.decompress(self.getFile("/index.html.gz")).decode('utf-8-sig')
+        # Try to get compiler from cache first if allowed
         version = self.getVersion()
-        # DEBUG BLOCK -- REMOVE BEFORE COMMITTING
-        # print(webUI.encode('utf-8-sig'))
-        # quit(0)
-        # DEBUG BLOCK -- REMOVE BEFORE COMMITTING
-        components = getAdapter(float(version))(webUI)
-        # print("Hardware Variant: ", components["hardwareVariant"].encode('utf-8-sig'))
-        # print("Constants: ", components["constants"].encode('utf-8'))
-        # print("Extended Operators: ", components["extendedOperators"].encode('utf-8'))
-        # print("Compiler: ", components["compiler"].encode('utf-8-sig'))
+        compiler = None
+        if allow_cache:
+            compiler = _get_cached_compiler(version)
 
-        # Build up the compilation environment from bits and pieces.
-        compiler = 'window = {};\nvar predefinedGlobals = ["pixelCount"];\n' + components["hardwareVariant"] + '\n' + \
-                   components["constants"] + '\n' + components["extendedOperators"] + '\n' + components[
-                       "compiler"] + '\n' + """
+        if compiler is None:
+            # Download the webUI from the Pixelblaze and extract the pieces we need for compilation.
+            webUI = gzip.decompress(self.getFile("/index.html.gz")).decode('utf-8-sig')
+            # DEBUG BLOCK -- REMOVE BEFORE COMMITTING
+            # print(webUI.encode('utf-8-sig'))
+            # quit(0)
+            # DEBUG BLOCK -- REMOVE BEFORE COMMITTING
+            components = getAdapter(float(version))(webUI)
+            # print("Hardware Variant: ", components["hardwareVariant"].encode('utf-8-sig'))
+            # print("Constants: ", components["constants"].encode('utf-8'))
+            # print("Extended Operators: ", components["extendedOperators"].encode('utf-8'))
+            # print("Compiler: ", components["compiler"].encode('utf-8-sig'))
+
+            # Build up the compilation environment from bits and pieces.
+            compiler = 'window = {};\nvar predefinedGlobals = ["pixelCount"];\n' + components["hardwareVariant"] + '\n' + \
+                       components["constants"] + '\n' + components["extendedOperators"] + '\n' + components[
+                           "compiler"] + '\n' + """
             const compilePattern = (src) => {
                 try {
                     compilerOptions = { predefinedGlobals: predefinedGlobals, extendedOperators: extendedOperators, constants: constants }
@@ -1424,6 +1469,10 @@ class Pixelblaze:
                 }
             }
             """
+
+            # Cache the compiler for future use if caching is enabled
+            if allow_cache:
+                _cache_compiler(version, compiler)
 
         # Load the compiler into the interpreter.
         ctx = MiniRacer()
@@ -1464,10 +1513,35 @@ class Pixelblaze:
         # Return the completed bytecode blob.
         return bytecode
 
+    _pattern_id_chars = "23456789ABCDEFGHJKLMNPQRSTWXYZabcdefghijkmnopqrstuvwxyz"
     def makeId(self):
-        e = "23456789ABCDEFGHJKLMNPQRSTWXYZabcdefghijkmnopqrstuvwxyz"
         # build a 17-character ID consisting of characters from the list above
-        return ''.join(random.choice(e) for _ in range(17))
+        return ''.join(random.choice(Pixelblaze._pattern_id_chars) for _ in range(17))
+    
+    @staticmethod
+    def isPatternId(id: str):
+        return len(id) == 17 and all(c in Pixelblaze._pattern_id_chars for c in id)
+
+    @staticmethod
+    def _compress_to_uint8array(text: str) -> bytes:
+        """Compress text and encode as Uint8Array format (matching JavaScript LZString.compressToUint8Array)."""
+        compressed_str = lzstring.LZString.compress(text) or ""
+        return b''.join(
+            (ord(c) >> 8).to_bytes(1, 'big') + (ord(c) & 0xFF).to_bytes(1, 'big')
+            for c in compressed_str
+        )
+
+    @staticmethod
+    def _decompress_from_uint8array(data: bytes) -> str:
+        """Decompress from Uint8Array format (matching JavaScript LZString.decompressFromUint8Array)."""
+        if data is None or len(data) == 0:
+            return ""
+        # Convert byte pairs back to 16-bit characters
+        compressed_str = ''.join(
+            chr((data[i] << 8) | data[i + 1])
+            for i in range(0, len(data), 2)
+        )
+        return lzstring.LZString.decompress(compressed_str) or ""
 
     def calculate_crc32(self, data):
         return binascii.crc32(data) & 0xffffffff
@@ -1490,19 +1564,31 @@ class Pixelblaze:
         self.wsSendJson({"pause": False}, expectedResponse="ack")
         time.sleep(0.25)
 
-    def savePattern(self, *, previewImage: bytes, sourceCode: str, byteCode: bytes):
-        """Saves a new pattern to the Pixelblaze filesystem.  Mimics the effects of the 'Save' button.
-
-        If you don't know how to generate the previewImage and byteCode components, you don't want to do this.
+    def savePattern(self, *, previewImage: bytes, sourceCode: str, name: str, id: str = None, allowCache: bool = False) -> str:
+        """Saves a new pattern to the Pixelblaze. Mimics the effects of the 'Save' button in the Web UI.
 
         Args:
-            previewImage (bytes): A JPEG image in which each column represents a particular LED and each row represents an iteration of the pattern.
-            sourceCode (str): A string representation of a JSON dictionary containing the pattern source code.
-            byteCode (bytes): A valid blob of bytecode as generated by the Editor tab in the Pixelblaze webUI.
+            previewImage (bytes): A JPEG image preview.
+            sourceCode (str): The raw pattern source code (e.g. "export function render...").
+            name (str): The name of the pattern.
+            patternId (str, optional): The 17-character ID to use. If None, one will be generated.
         """
-        self.wsSendBinary(self.messageTypes.previewImage, previewImage, expectedResponse="ack")
-        self.wsSendBinary(self.messageTypes.putSourceCode, _LZstring.compress(sourceCode), expectedResponse="ack")
-        self.wsSendBinary(self.messageTypes.putByteCode, byteCode, expectedResponse="ack")
+        if id is None:
+            id = self.makeId()
+        
+        byteCode = self.compilePattern(sourceCode, allowCache)
+        pbp = PBP.fromComponents(
+            patternId=id,
+            name=name,
+            previewImage=previewImage,
+            byteCode=byteCode,
+            sourceCode=sourceCode
+        )
+
+        pbp.toPixelblaze(self)
+        return id
+
+        
 
     # --- MAPPER tab: Pixelmap settings
 
@@ -1512,7 +1598,8 @@ class Pixelblaze:
         Returns:
             str: The text of the mapFunction.
         """
-        return self.getFile("/pixelmap.txt")
+        result = self.getFile("/pixelmap.txt")
+        return result.decode('utf-8') if result else None
 
     def setMapCoordinates(self, mapCoordinates: list) -> bool:
         """Sets raw coordinates for the map
@@ -2797,6 +2884,7 @@ class PBP:
     - [`fromFile()`](method-fromfile)
     - [`fromIpAddress()`](method-fromipaddress)
     - [`fromPixelblaze()`](method-frompixelblaze)
+    - [`fromComponents()`](method-fromcomponents)
 
     **PROPERTIES**
     - [`id()`](method-id)
@@ -2900,6 +2988,62 @@ class PBP:
         """
         return PBP.fromBytes(patternId, pb.getFile(f"/p/{patternId}"))
 
+    @staticmethod
+    def fromComponents(patternId: str, *, name: str, previewImage: bytes, byteCode: bytes, sourceCode: str) -> 'PBP':
+        """Creates and returns a new Pixelblaze Binary Pattern (PBP) by building it from individual components.
+
+        Args:
+            patternId (str): The 17-character pattern ID.
+            name (str): The human-readable pattern name.
+            previewImage (bytes): JPEG preview image data.
+            byteCode (bytes): Compiled bytecode.
+            sourceCode (str): Pattern js source code (e.g. exported render function...).
+
+        Returns:
+            PBP: A new Pixelblaze Binary Pattern object.
+        """
+        # Wrap source code in JSON container {"main": ...}, convert to string
+        # This is required by the firmware to identify the source file.
+        source_payload_str = json.dumps({"main": sourceCode}, separators=(',', ':'))
+        
+        # Encode components
+        name_bytes = name.encode('utf-8')
+        jpeg_bytes = previewImage
+        bytecode_bytes = byteCode
+        
+        # Compress source code and encode as Uint8Array format (matching JavaScript)
+        source_bytes = Pixelblaze._compress_to_uint8array(source_payload_str)
+
+        # Calculate offsets (header is 36 bytes)
+        header_size = 36
+        name_offset = header_size
+        name_length = len(name_bytes)
+
+        jpeg_offset = name_offset + name_length
+        jpeg_length = len(jpeg_bytes)
+
+        bytecode_offset = jpeg_offset + jpeg_length
+        bytecode_length = len(bytecode_bytes)
+
+        source_offset = bytecode_offset + bytecode_length
+        source_length = len(source_bytes)
+
+        # Build header (9 DWORDs = 36 bytes, little-endian)
+        # Format: version, nameOffset, nameLength, jpegOffset, jpegLength,
+        #         bytecodeOffset, bytecodeLength, sourceOffset, sourceLength
+        header = struct.pack('<9I',
+            2,  # version (v3 firmware uses version 2)
+            name_offset, name_length,
+            jpeg_offset, jpeg_length,
+            bytecode_offset, bytecode_length,
+            source_offset, source_length
+        )
+
+        # Concatenate all parts to create the binary blob
+        blob = header + name_bytes + jpeg_bytes + bytecode_bytes + source_bytes
+
+        return PBP.fromBytes(patternId, blob)
+
     # Class properties:
     @property
     def id(self) -> str:
@@ -2952,7 +3096,7 @@ class PBP:
         """
         # Calculate the offset for this component.
         offsets = struct.unpack('<9I', self.__binaryData[:36])
-        return _LZstring.decompress(self.__binaryData[offsets[7]:offsets[7] + offsets[8]])
+        return Pixelblaze._decompress_from_uint8array(self.__binaryData[offsets[7]:offsets[7] + offsets[8]])
 
     # Class methods:
     def toFile(self, fileName: str = None):
@@ -2985,7 +3129,10 @@ class PBP:
         Args:
             pb (Pixelblaze): An active Pixelblaze object.
         """
-        pb.putFile(self.id, self.__binaryData)
+        # Send via WebSocket using Packet Type 1 (putSourceCode / SAVEPROGRAMSOURCEFILE)
+        # The firmware expects: patternId (17 bytes) + binary blob
+        payload = self.__id.encode('utf-8') + self.__binaryData
+        pb.wsSendBinary(pb.messageTypes.putSourceCode, payload, expectedResponse="ack")
 
     def toEPE(
             self) -> 'EPE':  # 'Quoted' to defer resolution of forward reference; or could use 'from __future__ import annotations'
@@ -3181,349 +3328,6 @@ class EPE:
 
 
 # ----------------------------------------------------------------------------
-
-class _LZstring:
-    # LZstring code borrowed (and truncated) from https://github.com/marcel-dancak/lz-string-python, which
-    # on a cursory examination seems to be largely a copy of https://github.com/eduardtomasek/lz-string-python,
-    # which has been forked to https://github.com/gkovacs/lz-string-python and published in PyPi as lzstring 1.0.4,
-    # but which has unresolved merge issues with the parent repository, so who do you trust? Might as well
-    # keep a private copy until somebody sorts it out.
-
-    @staticmethod
-    def decompress(compressed):
-        if compressed is None: return ""
-        if compressed == "": return None
-
-        resetValue = 128
-        dictionary = {}
-        enlargeIn = 4
-        dictSize = 4
-        numBits = 3
-        entry = ""
-        result = []
-
-        val = compressed[0]
-        position = resetValue
-        index = 1
-
-        for i in range(3): dictionary[i] = i
-
-        bits = 0
-        maxpower = math.pow(2, 2)
-        power = 1
-
-        while power != maxpower:
-            resb = val & position
-            position >>= 1
-            if position == 0:
-                position = resetValue
-                val = compressed[index]
-                index += 1
-
-            bits |= power if resb > 0 else 0
-            power <<= 1
-
-        next = bits
-        if next == 0:
-            bits = 0
-            maxpower = math.pow(2, 8)
-            power = 1
-            while power != maxpower:
-                resb = val & position
-                position >>= 1
-                if position == 0:
-                    position = resetValue
-                    val = compressed[index]
-                    index += 1
-                bits |= power if resb > 0 else 0
-                power <<= 1
-            c = chr(bits)
-        elif next == 1:
-            bits = 0
-            maxpower = math.pow(2, 16)
-            power = 1
-            while power != maxpower:
-                resb = val & position
-                position >>= 1
-                if position == 0:
-                    position = resetValue
-                    val = compressed[index]
-                    index += 1
-                bits |= power if resb > 0 else 0
-                power <<= 1
-            c = chr(bits)
-        elif next == 2:
-            return ""
-
-        dictionary[3] = c
-        w = c
-        result.append(c)
-        counter = 0
-        while True:
-            counter += 1
-            if index > len(compressed): return ""
-
-            bits = 0
-            maxpower = math.pow(2, numBits)
-            power = 1
-            while power != maxpower:
-                resb = val & position
-                position >>= 1
-                if position == 0:
-                    position = resetValue
-                    val = compressed[index]
-                    index += 1
-                bits |= power if resb > 0 else 0
-                power <<= 1
-
-            c = bits
-            if c == 0:
-                bits = 0
-                maxpower = math.pow(2, 8)
-                power = 1
-                while power != maxpower:
-                    resb = val & position
-                    position >>= 1
-                    if position == 0:
-                        position = resetValue
-                        val = compressed[index]
-                        index += 1
-                    bits |= power if resb > 0 else 0
-                    power <<= 1
-
-                dictionary[dictSize] = chr(bits)
-                dictSize += 1
-                c = dictSize - 1
-                enlargeIn -= 1
-            elif c == 1:
-                bits = 0
-                maxpower = math.pow(2, 16)
-                power = 1
-                while power != maxpower:
-                    resb = val & position
-                    position >>= 1
-                    if position == 0:
-                        position = resetValue
-                        val = compressed[index]
-                        index += 1
-                    bits |= power if resb > 0 else 0
-                    power <<= 1
-                dictionary[dictSize] = chr(bits)
-                dictSize += 1
-                c = dictSize - 1
-                enlargeIn -= 1
-            elif c == 2:
-                return "".join(result)
-
-            if enlargeIn == 0:
-                enlargeIn = math.pow(2, numBits)
-                numBits += 1
-
-            if c in dictionary:
-                entry = dictionary[c]
-            else:
-                if c == dictSize:
-                    entry = w + w[0]
-                else:
-                    return None
-            result.append(entry)
-
-            # Add w+entry[0] to the dictionary.
-            dictionary[dictSize] = w + entry[0]
-            dictSize += 1
-            enlargeIn -= 1
-
-            w = entry
-            if enlargeIn == 0:
-                enlargeIn = math.pow(2, numBits)
-                numBits += 1
-
-    def compress(uncompressed):
-        if (uncompressed is None):
-            return ""
-
-        bitsPerChar = 16
-        getCharFromInt = chr
-        context_dictionary = {}
-        context_dictionaryToCreate = {}
-        context_c = ""
-        context_wc = ""
-        context_w = ""
-        context_enlargeIn = 2  # Compensate for the first entry which should not count
-        context_dictSize = 3
-        context_numBits = 2
-        context_data = []
-        context_data_val = 0
-        context_data_position = 0
-
-        for ii in range(len(uncompressed)):
-            context_c = uncompressed[ii]
-            if context_c not in context_dictionary:
-                context_dictionary[context_c] = context_dictSize
-                context_dictSize += 1
-                context_dictionaryToCreate[context_c] = True
-
-            context_wc = context_w + context_c
-            if context_wc in context_dictionary:
-                context_w = context_wc
-            else:
-                if context_w in context_dictionaryToCreate:
-                    if ord(context_w[0]) < 256:
-                        for i in range(context_numBits):
-                            context_data_val = (context_data_val << 1)
-                            if context_data_position == bitsPerChar - 1:
-                                context_data_position = 0
-                                context_data.append(getCharFromInt(context_data_val))
-                                context_data_val = 0
-                            else:
-                                context_data_position += 1
-                        value = ord(context_w[0])
-                        for i in range(8):
-                            context_data_val = (context_data_val << 1) | (value & 1)
-                            if context_data_position == bitsPerChar - 1:
-                                context_data_position = 0
-                                context_data.append(getCharFromInt(context_data_val))
-                                context_data_val = 0
-                            else:
-                                context_data_position += 1
-                            value = value >> 1
-
-                    else:
-                        value = 1
-                        for i in range(context_numBits):
-                            context_data_val = (context_data_val << 1) | value
-                            if context_data_position == bitsPerChar - 1:
-                                context_data_position = 0
-                                context_data.append(getCharFromInt(context_data_val))
-                                context_data_val = 0
-                            else:
-                                context_data_position += 1
-                            value = 0
-                        value = ord(context_w[0])
-                        for i in range(16):
-                            context_data_val = (context_data_val << 1) | (value & 1)
-                            if context_data_position == bitsPerChar - 1:
-                                context_data_position = 0
-                                context_data.append(getCharFromInt(context_data_val))
-                                context_data_val = 0
-                            else:
-                                context_data_position += 1
-                            value = value >> 1
-                    context_enlargeIn -= 1
-                    if context_enlargeIn == 0:
-                        context_enlargeIn = math.pow(2, context_numBits)
-                        context_numBits += 1
-                    del context_dictionaryToCreate[context_w]
-                else:
-                    value = context_dictionary[context_w]
-                    for i in range(context_numBits):
-                        context_data_val = (context_data_val << 1) | (value & 1)
-                        if context_data_position == bitsPerChar - 1:
-                            context_data_position = 0
-                            context_data.append(getCharFromInt(context_data_val))
-                            context_data_val = 0
-                        else:
-                            context_data_position += 1
-                        value = value >> 1
-
-                context_enlargeIn -= 1
-                if context_enlargeIn == 0:
-                    context_enlargeIn = math.pow(2, context_numBits)
-                    context_numBits += 1
-
-                # Add wc to the dictionary.
-                context_dictionary[context_wc] = context_dictSize
-                context_dictSize += 1
-                context_w = str(context_c)
-
-        # Output the code for w.
-        if context_w != "":
-            if context_w in context_dictionaryToCreate:
-                if ord(context_w[0]) < 256:
-                    for i in range(context_numBits):
-                        context_data_val = (context_data_val << 1)
-                        if context_data_position == bitsPerChar - 1:
-                            context_data_position = 0
-                            context_data.append(getCharFromInt(context_data_val))
-                            context_data_val = 0
-                        else:
-                            context_data_position += 1
-                    value = ord(context_w[0])
-                    for i in range(8):
-                        context_data_val = (context_data_val << 1) | (value & 1)
-                        if context_data_position == bitsPerChar - 1:
-                            context_data_position = 0
-                            context_data.append(getCharFromInt(context_data_val))
-                            context_data_val = 0
-                        else:
-                            context_data_position += 1
-                        value = value >> 1
-                else:
-                    value = 1
-                    for i in range(context_numBits):
-                        context_data_val = (context_data_val << 1) | value
-                        if context_data_position == bitsPerChar - 1:
-                            context_data_position = 0
-                            context_data.append(getCharFromInt(context_data_val))
-                            context_data_val = 0
-                        else:
-                            context_data_position += 1
-                        value = 0
-                    value = ord(context_w[0])
-                    for i in range(16):
-                        context_data_val = (context_data_val << 1) | (value & 1)
-                        if context_data_position == bitsPerChar - 1:
-                            context_data_position = 0
-                            context_data.append(getCharFromInt(context_data_val))
-                            context_data_val = 0
-                        else:
-                            context_data_position += 1
-                        value = value >> 1
-                context_enlargeIn -= 1
-                if context_enlargeIn == 0:
-                    context_enlargeIn = math.pow(2, context_numBits)
-                    context_numBits += 1
-                del context_dictionaryToCreate[context_w]
-            else:
-                value = context_dictionary[context_w]
-                for i in range(context_numBits):
-                    context_data_val = (context_data_val << 1) | (value & 1)
-                    if context_data_position == bitsPerChar - 1:
-                        context_data_position = 0
-                        context_data.append(getCharFromInt(context_data_val))
-                        context_data_val = 0
-                    else:
-                        context_data_position += 1
-                    value = value >> 1
-
-        context_enlargeIn -= 1
-        if context_enlargeIn == 0:
-            context_enlargeIn = math.pow(2, context_numBits)
-            context_numBits += 1
-
-        # Mark the end of the stream
-        value = 2
-        for i in range(context_numBits):
-            context_data_val = (context_data_val << 1) | (value & 1)
-            if context_data_position == bitsPerChar - 1:
-                context_data_position = 0
-                context_data.append(getCharFromInt(context_data_val))
-                context_data_val = 0
-            else:
-                context_data_position += 1
-            value = value >> 1
-
-        # Flush the last char
-        while True:
-            context_data_val = (context_data_val << 1)
-            if context_data_position == bitsPerChar - 1:
-                context_data.append(getCharFromInt(context_data_val))
-                break
-            else:
-                context_data_position += 1
-
-        return "".join(context_data)
-
 
 # ----------------------------------------------------------------------------
 #
