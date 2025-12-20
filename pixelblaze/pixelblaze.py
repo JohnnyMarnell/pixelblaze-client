@@ -1308,7 +1308,7 @@ class Pixelblaze:
             str: A string representation of a JSON dictionary containing the pattern source code.
         """
         sources = self.wsSendJson({"getSources": patternId}, expectedResponse=self.messageTypes.getSourceCode)
-        if sources is not None: return _LZstring.decompress(sources)
+        if sources is not None: return Pixelblaze._decompress_from_uint8array(sources)
         return None
 
     def compilePattern(self, patternCode: str, allow_cache: bool = False) -> bytes:
@@ -1521,6 +1521,27 @@ class Pixelblaze:
     @staticmethod
     def isPatternId(id: str):
         return len(id) == 17 and all(c in Pixelblaze._pattern_id_chars for c in id)
+
+    @staticmethod
+    def _compress_to_uint8array(text: str) -> bytes:
+        """Compress text and encode as Uint8Array format (matching JavaScript LZString.compressToUint8Array)."""
+        compressed_str = lzstring.LZString.compress(text) or ""
+        return b''.join(
+            (ord(c) >> 8).to_bytes(1, 'big') + (ord(c) & 0xFF).to_bytes(1, 'big')
+            for c in compressed_str
+        )
+
+    @staticmethod
+    def _decompress_from_uint8array(data: bytes) -> str:
+        """Decompress from Uint8Array format (matching JavaScript LZString.decompressFromUint8Array)."""
+        if data is None or len(data) == 0:
+            return ""
+        # Convert byte pairs back to 16-bit characters
+        compressed_str = ''.join(
+            chr((data[i] << 8) | data[i + 1])
+            for i in range(0, len(data), 2)
+        )
+        return lzstring.LZString.decompress(compressed_str) or ""
 
     def calculate_crc32(self, data):
         return binascii.crc32(data) & 0xffffffff
@@ -2991,12 +3012,7 @@ class PBP:
         bytecode_bytes = byteCode
         
         # Compress source code and encode as Uint8Array format (matching JavaScript)
-        # Matches LZString.compressToUint8Array() in the UI:
-        compressed_str = lzstring.LZString.compress(source_payload_str) or ""
-        source_bytes = b''.join(
-            (ord(c) >> 8).to_bytes(1, 'big') + (ord(c) & 0xFF).to_bytes(1, 'big')
-            for c in compressed_str
-        )
+        source_bytes = Pixelblaze._compress_to_uint8array(source_payload_str)
 
         # Calculate offsets (header is 36 bytes)
         header_size = 36
@@ -3080,7 +3096,7 @@ class PBP:
         """
         # Calculate the offset for this component.
         offsets = struct.unpack('<9I', self.__binaryData[:36])
-        return _LZstring.decompress(self.__binaryData[offsets[7]:offsets[7] + offsets[8]])
+        return Pixelblaze._decompress_from_uint8array(self.__binaryData[offsets[7]:offsets[7] + offsets[8]])
 
     # Class methods:
     def toFile(self, fileName: str = None):
@@ -3313,349 +3329,6 @@ class EPE:
 
 
 # ----------------------------------------------------------------------------
-
-class _LZstring:
-    # LZstring code borrowed (and truncated) from https://github.com/marcel-dancak/lz-string-python, which
-    # on a cursory examination seems to be largely a copy of https://github.com/eduardtomasek/lz-string-python,
-    # which has been forked to https://github.com/gkovacs/lz-string-python and published in PyPi as lzstring 1.0.4,
-    # but which has unresolved merge issues with the parent repository, so who do you trust? Might as well
-    # keep a private copy until somebody sorts it out.
-
-    @staticmethod
-    def decompress(compressed):
-        if compressed is None: return ""
-        if compressed == "": return None
-
-        resetValue = 128
-        dictionary = {}
-        enlargeIn = 4
-        dictSize = 4
-        numBits = 3
-        entry = ""
-        result = []
-
-        val = compressed[0]
-        position = resetValue
-        index = 1
-
-        for i in range(3): dictionary[i] = i
-
-        bits = 0
-        maxpower = math.pow(2, 2)
-        power = 1
-
-        while power != maxpower:
-            resb = val & position
-            position >>= 1
-            if position == 0:
-                position = resetValue
-                val = compressed[index]
-                index += 1
-
-            bits |= power if resb > 0 else 0
-            power <<= 1
-
-        next = bits
-        if next == 0:
-            bits = 0
-            maxpower = math.pow(2, 8)
-            power = 1
-            while power != maxpower:
-                resb = val & position
-                position >>= 1
-                if position == 0:
-                    position = resetValue
-                    val = compressed[index]
-                    index += 1
-                bits |= power if resb > 0 else 0
-                power <<= 1
-            c = chr(bits)
-        elif next == 1:
-            bits = 0
-            maxpower = math.pow(2, 16)
-            power = 1
-            while power != maxpower:
-                resb = val & position
-                position >>= 1
-                if position == 0:
-                    position = resetValue
-                    val = compressed[index]
-                    index += 1
-                bits |= power if resb > 0 else 0
-                power <<= 1
-            c = chr(bits)
-        elif next == 2:
-            return ""
-
-        dictionary[3] = c
-        w = c
-        result.append(c)
-        counter = 0
-        while True:
-            counter += 1
-            if index > len(compressed): return ""
-
-            bits = 0
-            maxpower = math.pow(2, numBits)
-            power = 1
-            while power != maxpower:
-                resb = val & position
-                position >>= 1
-                if position == 0:
-                    position = resetValue
-                    val = compressed[index]
-                    index += 1
-                bits |= power if resb > 0 else 0
-                power <<= 1
-
-            c = bits
-            if c == 0:
-                bits = 0
-                maxpower = math.pow(2, 8)
-                power = 1
-                while power != maxpower:
-                    resb = val & position
-                    position >>= 1
-                    if position == 0:
-                        position = resetValue
-                        val = compressed[index]
-                        index += 1
-                    bits |= power if resb > 0 else 0
-                    power <<= 1
-
-                dictionary[dictSize] = chr(bits)
-                dictSize += 1
-                c = dictSize - 1
-                enlargeIn -= 1
-            elif c == 1:
-                bits = 0
-                maxpower = math.pow(2, 16)
-                power = 1
-                while power != maxpower:
-                    resb = val & position
-                    position >>= 1
-                    if position == 0:
-                        position = resetValue
-                        val = compressed[index]
-                        index += 1
-                    bits |= power if resb > 0 else 0
-                    power <<= 1
-                dictionary[dictSize] = chr(bits)
-                dictSize += 1
-                c = dictSize - 1
-                enlargeIn -= 1
-            elif c == 2:
-                return "".join(result)
-
-            if enlargeIn == 0:
-                enlargeIn = math.pow(2, numBits)
-                numBits += 1
-
-            if c in dictionary:
-                entry = dictionary[c]
-            else:
-                if c == dictSize:
-                    entry = w + w[0]
-                else:
-                    return None
-            result.append(entry)
-
-            # Add w+entry[0] to the dictionary.
-            dictionary[dictSize] = w + entry[0]
-            dictSize += 1
-            enlargeIn -= 1
-
-            w = entry
-            if enlargeIn == 0:
-                enlargeIn = math.pow(2, numBits)
-                numBits += 1
-
-    def compress(uncompressed):
-        if (uncompressed is None):
-            return ""
-
-        bitsPerChar = 16
-        getCharFromInt = chr
-        context_dictionary = {}
-        context_dictionaryToCreate = {}
-        context_c = ""
-        context_wc = ""
-        context_w = ""
-        context_enlargeIn = 2  # Compensate for the first entry which should not count
-        context_dictSize = 3
-        context_numBits = 2
-        context_data = []
-        context_data_val = 0
-        context_data_position = 0
-
-        for ii in range(len(uncompressed)):
-            context_c = uncompressed[ii]
-            if context_c not in context_dictionary:
-                context_dictionary[context_c] = context_dictSize
-                context_dictSize += 1
-                context_dictionaryToCreate[context_c] = True
-
-            context_wc = context_w + context_c
-            if context_wc in context_dictionary:
-                context_w = context_wc
-            else:
-                if context_w in context_dictionaryToCreate:
-                    if ord(context_w[0]) < 256:
-                        for i in range(context_numBits):
-                            context_data_val = (context_data_val << 1)
-                            if context_data_position == bitsPerChar - 1:
-                                context_data_position = 0
-                                context_data.append(getCharFromInt(context_data_val))
-                                context_data_val = 0
-                            else:
-                                context_data_position += 1
-                        value = ord(context_w[0])
-                        for i in range(8):
-                            context_data_val = (context_data_val << 1) | (value & 1)
-                            if context_data_position == bitsPerChar - 1:
-                                context_data_position = 0
-                                context_data.append(getCharFromInt(context_data_val))
-                                context_data_val = 0
-                            else:
-                                context_data_position += 1
-                            value = value >> 1
-
-                    else:
-                        value = 1
-                        for i in range(context_numBits):
-                            context_data_val = (context_data_val << 1) | value
-                            if context_data_position == bitsPerChar - 1:
-                                context_data_position = 0
-                                context_data.append(getCharFromInt(context_data_val))
-                                context_data_val = 0
-                            else:
-                                context_data_position += 1
-                            value = 0
-                        value = ord(context_w[0])
-                        for i in range(16):
-                            context_data_val = (context_data_val << 1) | (value & 1)
-                            if context_data_position == bitsPerChar - 1:
-                                context_data_position = 0
-                                context_data.append(getCharFromInt(context_data_val))
-                                context_data_val = 0
-                            else:
-                                context_data_position += 1
-                            value = value >> 1
-                    context_enlargeIn -= 1
-                    if context_enlargeIn == 0:
-                        context_enlargeIn = math.pow(2, context_numBits)
-                        context_numBits += 1
-                    del context_dictionaryToCreate[context_w]
-                else:
-                    value = context_dictionary[context_w]
-                    for i in range(context_numBits):
-                        context_data_val = (context_data_val << 1) | (value & 1)
-                        if context_data_position == bitsPerChar - 1:
-                            context_data_position = 0
-                            context_data.append(getCharFromInt(context_data_val))
-                            context_data_val = 0
-                        else:
-                            context_data_position += 1
-                        value = value >> 1
-
-                context_enlargeIn -= 1
-                if context_enlargeIn == 0:
-                    context_enlargeIn = math.pow(2, context_numBits)
-                    context_numBits += 1
-
-                # Add wc to the dictionary.
-                context_dictionary[context_wc] = context_dictSize
-                context_dictSize += 1
-                context_w = str(context_c)
-
-        # Output the code for w.
-        if context_w != "":
-            if context_w in context_dictionaryToCreate:
-                if ord(context_w[0]) < 256:
-                    for i in range(context_numBits):
-                        context_data_val = (context_data_val << 1)
-                        if context_data_position == bitsPerChar - 1:
-                            context_data_position = 0
-                            context_data.append(getCharFromInt(context_data_val))
-                            context_data_val = 0
-                        else:
-                            context_data_position += 1
-                    value = ord(context_w[0])
-                    for i in range(8):
-                        context_data_val = (context_data_val << 1) | (value & 1)
-                        if context_data_position == bitsPerChar - 1:
-                            context_data_position = 0
-                            context_data.append(getCharFromInt(context_data_val))
-                            context_data_val = 0
-                        else:
-                            context_data_position += 1
-                        value = value >> 1
-                else:
-                    value = 1
-                    for i in range(context_numBits):
-                        context_data_val = (context_data_val << 1) | value
-                        if context_data_position == bitsPerChar - 1:
-                            context_data_position = 0
-                            context_data.append(getCharFromInt(context_data_val))
-                            context_data_val = 0
-                        else:
-                            context_data_position += 1
-                        value = 0
-                    value = ord(context_w[0])
-                    for i in range(16):
-                        context_data_val = (context_data_val << 1) | (value & 1)
-                        if context_data_position == bitsPerChar - 1:
-                            context_data_position = 0
-                            context_data.append(getCharFromInt(context_data_val))
-                            context_data_val = 0
-                        else:
-                            context_data_position += 1
-                        value = value >> 1
-                context_enlargeIn -= 1
-                if context_enlargeIn == 0:
-                    context_enlargeIn = math.pow(2, context_numBits)
-                    context_numBits += 1
-                del context_dictionaryToCreate[context_w]
-            else:
-                value = context_dictionary[context_w]
-                for i in range(context_numBits):
-                    context_data_val = (context_data_val << 1) | (value & 1)
-                    if context_data_position == bitsPerChar - 1:
-                        context_data_position = 0
-                        context_data.append(getCharFromInt(context_data_val))
-                        context_data_val = 0
-                    else:
-                        context_data_position += 1
-                    value = value >> 1
-
-        context_enlargeIn -= 1
-        if context_enlargeIn == 0:
-            context_enlargeIn = math.pow(2, context_numBits)
-            context_numBits += 1
-
-        # Mark the end of the stream
-        value = 2
-        for i in range(context_numBits):
-            context_data_val = (context_data_val << 1) | (value & 1)
-            if context_data_position == bitsPerChar - 1:
-                context_data_position = 0
-                context_data.append(getCharFromInt(context_data_val))
-                context_data_val = 0
-            else:
-                context_data_position += 1
-            value = value >> 1
-
-        # Flush the last char
-        while True:
-            context_data_val = (context_data_val << 1)
-            if context_data_position == bitsPerChar - 1:
-                context_data.append(getCharFromInt(context_data_val))
-                break
-            else:
-                context_data_position += 1
-
-        return "".join(context_data)
-
 
 # ----------------------------------------------------------------------------
 #

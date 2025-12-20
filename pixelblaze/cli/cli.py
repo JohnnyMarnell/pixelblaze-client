@@ -348,7 +348,12 @@ def set_duration(pb: Pixelblaze, seconds, no_save):
     is_flag=True,
     help='Force lookup of pattern name/ID instead of treating input as code'
 )
-def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exact, lookup):
+@click.option(
+    '--cat',
+    is_flag=True,
+    help='Print the source code of an existing pattern'
+)
+def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exact, lookup, cat):
     """
     Unified pattern command: switch to, render, or save patterns.
 
@@ -372,6 +377,11 @@ def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exac
     - If NAME matches an existing ID, that pattern is overwritten
 
     \b
+    **With --cat (print source mode):**
+    - Prints the source code of an existing pattern
+    - INPUT should be a pattern name or ID
+
+    \b
     Examples:
         # Switch/Render
         pb pattern rainbow
@@ -390,6 +400,11 @@ def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exac
         pb pattern foo --rm
 
     \b
+        # Print source code
+        pb pattern rainbow --cat
+        pb pattern abc123456789012 --cat
+
+    \b
         # Save (Write)
         pb pattern code.js --write              # Save as "code"
         pb pattern code.js --write "New Name"   # Save as "New Name"
@@ -398,7 +413,17 @@ def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exac
     """
     # Check for conflicting flags
     check(not (write and rm), "Cannot use --write and --rm together")
+    check(not (write and cat), "Cannot use --write and --cat together")
+    check(not (rm and cat), "Cannot use --rm and --cat together")
     check(not (rm and name), "Cannot use extra argument with --rm")
+    check(not (cat and name), "Cannot use NAME argument with --cat")
+
+    # Handle --cat mode early
+    if cat:
+        # --cat requires an INPUT (pattern name or ID)
+        check(input is not None, "Pattern name or ID required for --cat")
+        _handle_cat_mode(pb, input, exact)
+        return
 
     # In write mode, handle stdin + name argument case
     # When piping: cat file | pb pattern --write name
@@ -506,6 +531,25 @@ def _find_pattern(pb: Pixelblaze, search: str, exact: bool = False):
                 return (pattern_id, pattern_name)
 
     return (None, None)
+
+
+def _handle_cat_mode(pb: Pixelblaze, input, exact):
+    """Handle --cat mode: print pattern source code."""
+    pattern_id, pattern_name = _find_pattern(pb, input, exact)
+    check(pattern_id, f"Pattern '{input}' not found on Pixelblaze")
+
+    log(f"Fetching source code for '{pattern_name}' (ID: {pattern_id})...")
+    source_code = pb.getPatternSourceCode(pattern_id)
+    check(source_code, f"Failed to retrieve source code for pattern '{pattern_name}'")
+
+    # Parse the JSON to extract the actual source
+    try:
+        source_obj = jsonlib.loads(source_code)
+        actual_source = source_obj.get('main', source_code)
+    except:
+        actual_source = source_code
+
+    click.echo(actual_source)
 
 
 def _handle_remove_mode(pb: Pixelblaze, input, exact):
