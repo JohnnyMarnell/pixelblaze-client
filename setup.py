@@ -32,6 +32,7 @@ setuptools.setup(
       "mini-racer",
       "click>=8.0",
       "json5",
+      "lzstring",
     ],
     packages=["pixelblaze"],
     python_requires='>=3.9',

@@ -400,6 +400,15 @@ def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exac
     check(not (write and rm), "Cannot use --write and --rm together")
     check(not (rm and name), "Cannot use extra argument with --rm")
 
+    # In write mode, handle stdin + name argument case
+    # When piping: cat file | pb pattern --write name
+    # Click parses 'name' as 'input' arg, so swap them if needed
+    if write and input is not None and name is None:
+        # If input doesn't look like code and isn't a file, it's probably the target name
+        if not pathlib.Path(input).is_file() and not _looks_like_code(input):
+            name = input
+            input = None
+
     # Read from stdin if input not provided
     input_from_stdin = False
     if input is None:
@@ -419,7 +428,7 @@ def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exac
         # Map the new 'name' arg to the internal 'write_target' logic
         # If name is None, pass '' so logic knows to use filename stem
         target = name if name else ''
-        _handle_write_mode(pb, input, target, img, variables, no_save)
+        _handle_write_mode(pb, input, target, img, variables, no_save, input_from_stdin)
 
     else:
         # ===== RENDER/SWITCH MODE =====
@@ -511,9 +520,10 @@ def _handle_remove_mode(pb: Pixelblaze, input, exact):
     log(f"Pattern '{pattern_name}' deleted successfully!")
 
 
-def _handle_write_mode(pb: Pixelblaze, input, write_target, img, variables, no_save):
+def _handle_write_mode(pb: Pixelblaze, input, write_target, img, variables, no_save, from_stdin=False):
     """Handle --write mode: save pattern to Pixelblaze."""
-    is_file = pathlib.Path(input).is_file()
+    # If input came from stdin, it's already the code content; otherwise check if it's a file
+    is_file = not from_stdin and pathlib.Path(input).is_file()
     code, _ = read_input(input, "code") if is_file else (input, False)
 
     # Determine pattern name/ID
@@ -531,25 +541,23 @@ def _handle_write_mode(pb: Pixelblaze, input, write_target, img, variables, no_s
     if "export" not in code:
         code = 'export function render(index) { ' + code + ' ; }'
 
-    log("Compiling pattern...")
-    bytecode = pb.compilePattern(code, allow_cache=True)
-
     img = img or pathlib.Path(__file__).parent / '../../site/images/preview_placeholder.jpg'
     log(f"Loading preview image from {img}...")
     with open(img, 'rb') as f:
         preview_image = f.read()
 
-    log(f"Saving pattern '{pattern_name}' (ID: {pattern_id})...")
-    pb.savePattern(
+    log(f"Saving pattern '{pattern_name}' (Supplied ID: {pattern_id})...")
+    pattern_id = pb.savePattern(
         previewImage=preview_image,
         sourceCode=code,
-        byteCode=bytecode,
         name=pattern_name,
-        id=pattern_id
+        id=pattern_id,
+        allowCache=True
     )
 
-    log(f"Pattern '{pattern_name}' created successfully!")
+    log(f"Pattern '{pattern_name}' (ID: {pattern_id}) created successfully!")
     _set_vars_and_controls(pb, variables, not no_save)
+    jsons({'id': pattern_id})
 
 
 def _handle_render_or_switch_mode(pb: Pixelblaze, input, variables, no_save, exact, lookup=False, from_stdin=False):
@@ -743,6 +751,37 @@ def cp(pb: Pixelblaze, source, dest, write):
 
         size_kb = len(content) / 1024
         log(f"Successfully copied {source} → {dest_path} ({size_kb:.1f} KB)")
+
+
+@cli(pixelblaze)
+@click.argument('files', nargs=-1, required=True)
+def rm(pb: Pixelblaze, files):
+    """
+    Remove one or more files or patterns from the Pixelblaze.
+
+    FILES can be paths on the Pixelblaze (e.g., /config.json) or pattern IDs.
+    If a FILE looks like a pattern ID, it's treated as /p/<id>.
+
+    \b
+    Examples:
+        pb rm /config.json           # Remove a file
+        pb rm abc123456789012       # Remove a pattern (by ID)
+        pb rm /p/abc123456789012    # Remove a pattern (by full path)
+        pb rm abc123 def456 /data.json  # Remove multiple items
+    """
+    for file in files:
+        # Check if it's a pattern ID
+        if Pixelblaze.isPatternId(file):
+            # Treat as pattern ID
+            log(f"Deleting pattern '{file}'...")
+            pb.deletePattern(file)
+            log(f"Pattern '{file}' deleted successfully!")
+        else:
+            # Treat as file path
+            log(f"Deleting file '{file}'...")
+            success = pb.deleteFile(file)
+            check(success, f"Failed to delete file '{file}'")
+            log(f"File '{file}' deleted successfully!")
 
 
 @cli(pixelblaze)
