@@ -3131,8 +3131,7 @@ class PBP:
         """
         # Send via WebSocket using Packet Type 1 (putSourceCode / SAVEPROGRAMSOURCEFILE)
         # The firmware expects: patternId (17 bytes) + binary blob
-        # Accessing private member _PBP__binaryData is necessary as PBP doesn't expose the raw blob publically
-        payload = self._PBP__id.encode('utf-8') + self._PBP__binaryData
+        payload = self.__id.encode('utf-8') + self.__binaryData
         pb.wsSendBinary(pb.messageTypes.putSourceCode, payload, expectedResponse="ack")
 
     def toEPE(
