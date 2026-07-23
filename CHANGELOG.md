@@ -13,7 +13,10 @@ Changes are categorized into the following types:
 - **Security** -- in case of vulnerabilities.
 
 ---
-## Current Version [**v1.1.7**] - 2025-12-3
+
+## Current Version is [**v1.1.8**] - 2026-07-22
+
+## [**v1.1.7**] - 2025-12-3
 
 #### Fixed
 

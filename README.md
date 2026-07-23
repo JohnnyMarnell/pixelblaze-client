@@ -26,22 +26,14 @@ Sample code illustrating usage is provided in the [examples directory](examples/
 
 **Please note that version 1.0.0 was a major refactoring and enhancement of the library, with many new features and significant changes.** The API surface is completely new. See the the [API documentation](#documentation) for details.  
 
-## Current Version [**v1.1.7**] - 2025-12-3
+## Current Version [**v1.1.8**] - 2026-07-22
 
 #### Fixed
 
-* Added retry for `WebSocketBadStatusException`
-* Fix `savePattern()` functionality and API (add missing PBP feature)
-* Various utf-8 / encoding bugs
-* PBP putFile path
-* Add an integration-ish test!
+* gh issue #28: Fixed a bug in the lightweight enumerator that caused it to fail to enumerate devices when called multiple times.  The enumerator now resets its internal list of seen devices each time it is called.
 
 #### Added
-
-* Created handy `pb` cli
-* Implement `waitForAnyResponse` (non-chatty) for WS send
-* Cache mini-racer compile eval for speed
-* Add and use `PBP.fromComponents()`
+* No new functionality in this release.
 
 ### Older Versions
 

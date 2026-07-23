@@ -15,7 +15,7 @@ This module contains the following classes:
 """
 
 # ----------------------------------------------------------------------------
-# Copyright 2020-2025 by the pixelblaze-client team
+# Copyright 2020-2026 by the pixelblaze-client team
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy of this
 # software and associated documentation files (the "Software"), to deal in the Software
@@ -35,10 +35,11 @@ This module contains the following classes:
 #
 # ----------------------------------------------------------------------------
 
-__version__ = "1.1.6"
+__version__ = "1.1.8"
 
 # | Version | Date       | Author        | Comment
 # |---------|------------|---------------|--------------------------------------------------
+# |  v1.1.8 | 09/02/2025 | zranger1,     | Fix gh issue #28, (lightweight enumerator)
 # |  v1.1.6 | 09/02/2025 | TheMariday,   | Fix expander data bug, remove unused imports
 # |         |            | zwily,        | replace py-mini-racer with mini-racer
 # |         |            | zranger1      |
@@ -299,7 +300,6 @@ class Pixelblaze:
         listenSocket = None
         timeout = 0
         timeStop = 0
-        seenPixelblazes = []
         enumeratorType = EnumeratorTypes.noType
         proxyUrl = None
 
@@ -319,6 +319,8 @@ class Pixelblaze:
                 This method is not intended to be called directly; use the static methods [`EnumerateAddresses`](#method-enumerateaddresses) or [`EnumerateDevices`](#method-enumeratedevices) to create and return an iterator object.
             """
             try:
+                # clear seenPixelblazes so we start fresh if the enumerator is used multiple times.
+                self.seenPixelblazes = []
                 self.enumeratorType = enumeratorType
                 self.timeout = timeout
                 self.proxyUrl = proxyUrl
