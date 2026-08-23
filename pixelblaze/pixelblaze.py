@@ -1122,15 +1122,19 @@ class Pixelblaze:
         """
         return json.loads(self.wsSendJson({"getPlaylist": playlistId}, expectedResponse="playlist"))
 
-    def setSequencerPlaylist(self, playlistContents: dict, playlistId: str = "_defaultplaylist_"):
+    def setSequencerPlaylist(self, playlistContents: dict, playlistId: str = "_defaultplaylist_", *, saveToFlash: bool = False):
         """Replaces the entire contents of the specified playlist.  At the moment, only the default playlist is supported by the Pixelblaze.
 
         Args:
             playlistContents (dict): The new playlist contents.
             playlistId (str, optional): The name of the playlist (for future enhancement; currently only '_defaultplaylist_' is supported). Defaults to "_defaultplaylist_".
+            saveToFlash (bool, optional): If True, adds an outer `save: true` so the firmware writes the playlist to `/l/<playlistId>` (persists across reboots). Defaults to False (RAM-only — lost on reboot).
         """
         self.latestSequencer = None  # clear cache to force refresh
-        ignored = self.wsSendJson(playlistContents, expectedResponse=None)
+        payload = dict(playlistContents)
+        if saveToFlash:
+            payload['save'] = True
+        ignored = self.wsSendJson(payload, expectedResponse=None)
 
     def addToSequencerPlaylist(self, playlistContents: dict, *, patternId: str, duration: int) -> dict:
         """Appends a new entry to the specified playlist.
@@ -2249,6 +2253,95 @@ class Pixelblaze:
         if configSettings is None: configSettings = self.getConfigSettings()
         return configSettings.get('networkPowerSave', False)
 
+    # --- SETTINGS menu: WIFI settings (HTTP-only, no WebSocket required)
+
+    class wifiModes(IntEnum):
+        """WiFi operating modes reported by the Pixelblaze."""
+        modeClient = 3
+        modeAccessPoint = 6
+        modeSetup = 255
+
+    @staticmethod
+    def getWifiStatus(ipAddress: str, timeout: float = 5.0) -> dict:
+        """Returns the current WiFi status of the Pixelblaze.
+
+        This is an HTTP-only call that works even in ad-hoc/setup mode without a WebSocket connection.
+
+        Args:
+            ipAddress (str): The IP address of the Pixelblaze.
+            timeout (float): Request timeout in seconds. Defaults to 5.0.
+
+        Returns:
+            dict: WiFi status with keys: status (int), ip (str), ssid (str), mac (str).
+        """
+        response = requests.get(f"http://{ipAddress}/wifistatus", timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    @staticmethod
+    def getWifiScan(ipAddress: str, timeout: float = 15.0, poll_interval: float = 1.0) -> list[dict]:
+        """Scans for available WiFi access points.
+
+        This is an HTTP-only call that works even in ad-hoc/setup mode without a WebSocket connection.
+        Polls until the scan completes.
+
+        Args:
+            ipAddress (str): The IP address of the Pixelblaze.
+            timeout (float): Maximum time to wait for scan results in seconds. Defaults to 15.0.
+            poll_interval (float): Time between poll attempts in seconds. Defaults to 1.0.
+
+        Returns:
+            list[dict]: List of access points, each with keys: rssi (int), ssid (str), bssid (str), channel (int), secure (bool).
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            response = requests.get(f"http://{ipAddress}/wifiscan", timeout=5.0)
+            response.raise_for_status()
+            result = response.json()
+            if isinstance(result, list):
+                return result
+            # Still scanning — {"scanning": 1}
+            time.sleep(poll_interval)
+        return []
+
+    @staticmethod
+    def setWifiConfig(ipAddress: str, mode: str, ssid: str = "", passphrase: str = "", discover: bool = True, timeout: float = 5.0) -> dict:
+        """Sets the WiFi configuration on the Pixelblaze.
+
+        This is an HTTP-only call that works even in ad-hoc/setup mode without a WebSocket connection.
+
+        Args:
+            ipAddress (str): The IP address of the Pixelblaze.
+            mode (str): WiFi mode — "CLIENT", "AP", or "SETUP".
+            ssid (str): The SSID of the network to join or create. Defaults to "".
+            passphrase (str): The password for the network. Defaults to "".
+            discover (bool): Whether to enable Electromage discovery. Defaults to True.
+            timeout (float): Request timeout in seconds. Defaults to 5.0.
+
+        Returns:
+            dict: Response from the Pixelblaze, typically {"ack": 1}.
+        """
+        payload = {
+            "mode": mode,
+            "ssid": ssid,
+            "passphrase": passphrase,
+            "discover": "true" if discover else "false",
+        }
+        response = requests.post(
+            f"http://{ipAddress}/wifisave",
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+            timeout=timeout,
+        )
+        if response.status_code == 400:
+            # Return the raw response for debugging
+            raise requests.HTTPError(
+                f"400 Bad Request from /wifisave (body: {response.text!r})",
+                response=response,
+            )
+        response.raise_for_status()
+        return response.json()
+
     # --- SETTINGS menu: UPDATES settings
 
     class updateStates(IntEnum):
@@ -3134,7 +3227,23 @@ class PBP:
         # Send via WebSocket using Packet Type 1 (putSourceCode / SAVEPROGRAMSOURCEFILE)
         # The firmware expects: patternId (17 bytes) + binary blob
         payload = self.__id.encode('utf-8') + self.__binaryData
-        pb.wsSendBinary(pb.messageTypes.putSourceCode, payload, expectedResponse="ack")
+
+        # Pattern binary sending was often failing until this method of
+        # fire-and-forget with 20ms inter-chunk delay, no per-chunk ack waiting:
+        maxFrameSize = 1280
+        for i in range(0, len(payload), maxFrameSize):
+            frameHeader = bytearray(2)
+            frameHeader[0] = pb.messageTypes.putSourceCode.value  # 1
+            flags = 0
+            if i == 0:
+                flags |= 1  # START
+            if (len(payload) - i) > maxFrameSize:
+                flags |= 2  # CONTINUE
+            else:
+                flags |= 4  # END
+            frameHeader[1] = flags
+            pb.ws.send_binary(bytes(frameHeader) + payload[i:i + maxFrameSize])
+            time.sleep(0.02)
 
     def toEPE(
             self) -> 'EPE':  # 'Quoted' to defer resolution of forward reference; or could use 'from __future__ import annotations'
