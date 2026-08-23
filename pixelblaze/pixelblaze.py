@@ -2249,6 +2249,66 @@ class Pixelblaze:
         if configSettings is None: configSettings = self.getConfigSettings()
         return configSettings.get('networkPowerSave', False)
 
+    # --- SETTINGS menu: Sensor input sources
+
+    class sensorSources(IntEnum):
+        """Sensor-input source preference (per accelSrc/soundSrc/lightSrc/analogSrc).
+
+        Two values, matching the stock Settings-page dropdown. Each is a
+        *preference* — the firmware falls back to the other source if the
+        preferred one isn't reporting.
+        """
+        preferRemote = 0     # Prefer OTA/remote sensor data (e.g. audio capture tool)
+        preferLocal  = 1     # Prefer local (onboard / Sensor Expansion Board)
+
+    def getSensorSources(self, configSettings: dict = None) -> dict:
+        """Returns all sensor input source preferences.
+
+        Args:
+            configSettings (dict, optional): If provided, extracts values from the results of a previous call to `getConfigSettings`; otherwise, fetches the configSettings from the Pixelblaze anew. Defaults to None.
+
+        Returns:
+            dict: Dictionary with keys 'accel', 'light', 'sound', 'analog' mapped to source preference (0=preferRemote, 1=preferLocal).
+        """
+        if configSettings is None: configSettings = self.getConfigSettings()
+        return {
+            "accel": configSettings.get("accelSrc", 0),
+            "light": configSettings.get("lightSrc", 0),
+            "sound": configSettings.get("soundSrc", 0),
+            "analog": configSettings.get("analogSrc", 0),
+        }
+
+    def setSensorSources(self, accel: int = None, light: int = None, sound: int = None, analog: int = None, *, saveToFlash: bool = False):
+        """Sets multiple sensor input source preferences at once.
+
+        Useful for bulk configuration of all sensor inputs in a single command.
+
+        Args:
+            accel (int, optional): Accelerometer source preference (0=preferRemote, 1=preferLocal). Defaults to None (no change).
+            light (int, optional): Light sensor source preference. Defaults to None (no change).
+            sound (int, optional): Audio/sound sensor source preference. Defaults to None (no change).
+            analog (int, optional): Analog input source preference. Defaults to None (no change).
+            saveToFlash (bool): If True, saves the settings to persistent flash storage. Defaults to False.
+
+        Examples:
+            # Prefer remote (OTA) audio sensor data from a host bridge
+            pb.setSensorSources(sound=Pixelblaze.sensorSources.preferRemote, saveToFlash=True)
+
+            # Prefer local hardware for all sensors
+            pb.setSensorSources(accel=1, light=1, sound=1, analog=1)
+        """
+        payload = {}
+        if accel is not None: payload["accelSrc"] = int(accel)
+        if light is not None: payload["lightSrc"] = int(light)
+        if sound is not None: payload["soundSrc"] = int(sound)
+        if analog is not None: payload["analogSrc"] = int(analog)
+
+        if saveToFlash:
+            payload["save"] = True
+
+        if payload:  # Only send if there's something to set
+            self.wsSendJson(payload, expectedResponse=None)
+
     # --- SETTINGS menu: UPDATES settings
 
     class updateStates(IntEnum):
