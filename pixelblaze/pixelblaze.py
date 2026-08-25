@@ -731,6 +731,34 @@ class Pixelblaze:
                 self._open()
                 # raise
 
+    def wsSendBinaryChunked(self, binaryMessageType: messageTypes, payload: bytes, *, maxFrameSize: int = 1280, sleepTime: float = 0.02):
+        """Fire-and-forget chunked binary send with no per-chunk ack wait.
+
+        Sibling of `wsSendBinary` for message types where waiting on a
+        per-chunk response is unreliable (e.g. `putSourceCode`). Builds the
+        2-byte frame header internally, filling byte 1 with the continuation
+        flags for each chunk.
+
+        Args:
+            binaryMessageType (messageTypes): The binary message type to send.
+            payload (bytes): The body to send, split at `maxFrameSize`.
+            maxFrameSize (int, optional): Chunk size in bytes. Defaults to 1280.
+            sleepTime (float, optional): Delay between chunks in seconds. Defaults to 0.02.
+        """
+        frameHeader = bytearray(2)
+        frameHeader[0] = binaryMessageType.value
+        for i in range(0, len(payload), maxFrameSize):
+            flags = self.frameTypes.frameNone
+            if i == 0:
+                flags |= self.frameTypes.frameFirst
+            if (len(payload) - i) > maxFrameSize:
+                flags |= self.frameTypes.frameMiddle
+            else:
+                flags |= self.frameTypes.frameLast
+            frameHeader[1] = flags.value
+            self.ws.send_binary(bytes(frameHeader) + payload[i:i + maxFrameSize])
+            time.sleep(sleepTime)
+
     def getPeers(self):
         """A new command, added to the API but not yet implemented as of v2.29/v3.24, that will return a list of all the Pixelblazes visible on the local network segment.
 
@@ -3228,22 +3256,9 @@ class PBP:
         # The firmware expects: patternId (17 bytes) + binary blob
         payload = self.__id.encode('utf-8') + self.__binaryData
 
-        # Pattern binary sending was often failing until this method of
-        # fire-and-forget with 20ms inter-chunk delay, no per-chunk ack waiting:
-        maxFrameSize = 1280
-        for i in range(0, len(payload), maxFrameSize):
-            frameHeader = bytearray(2)
-            frameHeader[0] = pb.messageTypes.putSourceCode.value  # 1
-            flags = 0
-            if i == 0:
-                flags |= 1  # START
-            if (len(payload) - i) > maxFrameSize:
-                flags |= 2  # CONTINUE
-            else:
-                flags |= 4  # END
-            frameHeader[1] = flags
-            pb.ws.send_binary(bytes(frameHeader) + payload[i:i + maxFrameSize])
-            time.sleep(0.02)
+        # Pattern binary sending was often failing until we switched to
+        # fire-and-forget chunked send with no per-chunk ack waiting.
+        pb.wsSendBinaryChunked(pb.messageTypes.putSourceCode, payload)
 
     def toEPE(
             self) -> 'EPE':  # 'Quoted' to defer resolution of forward reference; or could use 'from __future__ import annotations'
