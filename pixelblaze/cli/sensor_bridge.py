@@ -133,6 +133,11 @@ class SoundBridge:
         self._frame_count = 0
         self._start_time = 0
 
+        # Peak-hold across each log interval so transients (claps) are visible
+        self._peak_energy = 0.0
+        self._peak_mag = 0.0
+        self._peak_freq = 0.0
+
         # AGC state
         self._agc_level = 1.0       # current auto-gain multiplier
         self._agc_target = 0.15     # target peak level for frequency bins
@@ -229,6 +234,12 @@ class SoundBridge:
 
         self.pb.setActiveVariables(variables)
 
+        if data["energyAverage"] > self._peak_energy:
+            self._peak_energy = data["energyAverage"]
+        if data["maxFrequencyMagnitude"] > self._peak_mag:
+            self._peak_mag = data["maxFrequencyMagnitude"]
+            self._peak_freq = data["maxFrequency"]
+
         self._frame_count += 1
         if self._frame_count % self.fps == 0:
             elapsed = time.time() - self._start_time
@@ -236,7 +247,10 @@ class SoundBridge:
             agc_str = f" agc={self._agc_level:.1f}x" if self.agc else ""
             import sys
             print(f"\r  {self._frame_count} frames, {actual_fps:.1f} fps, "
-                  f"energy={data['energyAverage']:.4f} "
-                  f"maxFreqMag={data['maxFrequencyMagnitude']:.4f} "
-                  f"maxFreq={data['maxFrequency']:.0f}Hz{agc_str}    ",
+                  f"energy_peak={self._peak_energy:.4f} "
+                  f"maxFreqMag_peak={self._peak_mag:.4f} "
+                  f"maxFreq={self._peak_freq:.0f}Hz{agc_str}    ",
                   end="", file=sys.stderr, flush=True)
+            self._peak_energy = 0.0
+            self._peak_mag = 0.0
+            self._peak_freq = 0.0
