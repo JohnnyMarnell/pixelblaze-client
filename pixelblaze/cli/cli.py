@@ -1237,6 +1237,55 @@ def setup(ctx):
     log("WiFi reset to setup mode — look for a 'Pixelblaze_*' network")
 
 
+@cli(wifi)
+def peers(pb: Pixelblaze):
+    """
+    List the sync-group members this Pixelblaze can see, including itself.
+
+    Follower devices don't broadcast LAN beacons, so `pb find` won't see
+    them via the standard discovery path. This command asks the device
+    for its current view of the sync group. The connected device is
+    prepended to the list and marked with `*`.
+
+    \b
+    Examples:
+        pb wifi peers
+        pb wifi peers --ip 192.168.1.230
+    """
+    peers = pb.getPeers()
+
+    # getPeers returns only *other* members, not self — synthesize a self row
+    # from the device's own config so users see the whole group.
+    cfg = pb.getConfigSettings()
+    self_entry = {
+        'id': cfg.get('chipId', 0),
+        'address': pb.ipAddress,
+        'name': cfg.get('name', '?'),
+        'ver': cfg.get('ver', '?'),
+        'isFollowing': 1 if cfg.get('leaderId', 0) else 0,
+        'nodeId': cfg.get('nodeId', 0),
+        'followerCount': sum(1 for p in peers if p.get('isFollowing')),
+        'self': True,
+    }
+    all_members = [self_entry] + peers
+    jsons(all_members)
+
+    log(f"\n    {'NAME':<20} {'ADDRESS':<15} {'CHIPID':>10} {'NODE':>5} {'ROLE':<10} {'VER':<6} {'FOLLOWERS':>9}")
+    log(f"    {'─' * 20} {'─' * 15} {'─' * 10} {'─' * 5} {'─' * 10} {'─' * 6} {'─' * 9}")
+    for p in all_members:
+        role = 'follower' if p.get('isFollowing') else 'leader'
+        marker = '*' if p.get('self') else ' '
+        # Firmware only fills followerCount reliably from the reporting device's
+        # own perspective. From a follower's vantage, a leader peer always
+        # reports 0 — mark that unknown instead of parroting a wrong number.
+        if p.get('self') or p.get('isFollowing'):
+            fc = str(p.get('followerCount', 0))
+        else:
+            fc = '?'
+        log(f"  {marker:<1} {p.get('name', '?'):<20} {p.get('address', '?'):<15} {p.get('id', 0):>10} "
+            f"{p.get('nodeId', 0):>5} {role:<10} {p.get('ver', '?'):<6} {fc:>9}")
+
+
 ## ─── Cat ──────────────────────────────────────────────────────────────────────
 
 def _strip_js(source: str) -> str:
