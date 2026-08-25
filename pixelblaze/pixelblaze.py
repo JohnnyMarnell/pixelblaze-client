@@ -759,14 +759,30 @@ class Pixelblaze:
             self.ws.send_binary(bytes(frameHeader) + payload[i:i + maxFrameSize])
             time.sleep(sleepTime)
 
-    def getPeers(self):
-        """A new command, added to the API but not yet implemented as of v2.29/v3.24, that will return a list of all the Pixelblazes visible on the local network segment.
+    def getPeers(self) -> list[dict]:
+        """Returns the sync-group peers this Pixelblaze is aware of.
+
+        In group-sync (leader/follower) setups, follower devices do not
+        broadcast LAN beacons on UDP:1889 — so `EnumerateAddresses` misses
+        them. `getPeers` asks the Pixelblaze for its current view of the
+        sync group, which the firmware maintains via peer-to-peer discovery.
+
+        Confirmed working on firmware v3.51.
 
         Returns:
-            TBD: To be defined once @wizard implements the function.
+            list[dict]: One entry per peer, empty list if no peers. Each entry:
+                id (int): chipId of the peer.
+                address (str): IPv4 address.
+                name (str): device name.
+                ver (str): firmware version.
+                isFollowing (int): 1 if this peer is a follower, 0 if leader/solo.
+                nodeId (int): sync-group node id.
+                followerCount (int): number of followers this peer has.
         """
-        self.wsSendJson({"getPeers": True})
-        return self.wsReceive(binaryMessageType=None)
+        response = self.wsSendJson({"getPeers": True}, expectedResponse="peers")
+        if response is None:
+            return []
+        return json.loads(response).get("peers", [])
 
     # --- PIXELBLAZE FILESYSTEM FUNCTIONS:
 

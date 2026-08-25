@@ -277,6 +277,21 @@ def _discover_ips(timeout: int = 2000) -> list[str]:
     except Exception as e:
         log(f"Enumeration error: {e}")
 
+    # Follower enrichment — follower devices don't broadcast beacons, but any
+    # beacon-visible peer knows about them via the sync group. Ask each for
+    # its peer list and union in anything new.
+    for ip in list(ips):
+        try:
+            with Pixelblaze(ip) as pb:
+                for peer in pb.getPeers():
+                    peer_ip = peer.get('address')
+                    if peer_ip and peer_ip not in seen:
+                        seen.add(peer_ip)
+                        ips.append(peer_ip)
+                        log(f"  Found @ {peer_ip} (via {ip} sync group)")
+        except Exception as e:
+            log(f"  Peer query failed on {ip}: {e}")
+
     return ips
 
 
