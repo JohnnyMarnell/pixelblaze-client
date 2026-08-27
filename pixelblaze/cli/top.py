@@ -23,6 +23,7 @@ import click
 from pixelblaze.pixelblaze import Pixelblaze
 from pixelblaze.cli.cli_utils import (
     _fetch_device_config,
+    _read_cache,
     enumerate_pixelblazes,
     log,
     update_device_cache,
@@ -35,7 +36,10 @@ RESET = "\x1b[0m"
 BOLD = "\x1b[1m"
 DIM = "\x1b[2m"
 INVERT = "\x1b[7m"
-CLEAR_HOME = "\x1b[2J\x1b[H"
+# Cursor home + erase-to-end-of-screen. Some terminals treat `\x1b[2J` (erase
+# entire screen) as a scroll, which leaves ghost frames stacked in scrollback;
+# home-then-erase-down redraws cleanly everywhere.
+CLEAR_HOME = "\x1b[H\x1b[J"
 CLEAR_LINE_END = "\x1b[K"
 HIDE_CURSOR = "\x1b[?25l"
 SHOW_CURSOR = "\x1b[?25h"
@@ -101,8 +105,32 @@ class TopMonitor:
 
         for dev in initial_devices:
             ip = dev.get("ip")
-            if ip:
-                self._ensure_worker(ip)
+            if not ip:
+                continue
+            self._ensure_worker(ip)
+            # If the seed came from the on-disk cache, prime the row with
+            # its last-known name / pattern / etc. so the table isn't blank
+            # while the worker's first config fetch is in flight.
+            self._seed_row_from_cache(ip, dev)
+
+    def _seed_row_from_cache(self, ip: str, dev: dict):
+        with self._lock:
+            row = self._rows.get(ip)
+            if not row:
+                return
+            row.name = dev.get("name") or row.name
+            row.ver = str(dev.get("ver") or row.ver)
+            row.pixel_count = dev.get("pixelCount", row.pixel_count)
+            row.brightness = dev.get("brightness", row.brightness)
+            active_id = dev.get("activePatternId") or ""
+            if active_id:
+                row.active_pattern_id = active_id
+                patterns = dev.get("patterns") or {}
+                row.active_pattern_name = (
+                    patterns.get(active_id)
+                    or dev.get("activePatternName")
+                    or row.active_pattern_name
+                )
 
     def stop(self):
         self._stop.set()
@@ -222,18 +250,23 @@ class TopMonitor:
 
     def rediscover_loop(self, timeout_ms: int):
         """Background: periodically re-enumerate to pick up devices that
-        rejoined the network at a new IP or came online after startup."""
-        while not self._stop.wait(self._rediscover_seconds):
+        rejoined the network at a new IP or came online after startup.
+
+        Runs one sweep immediately (so `pb top` doesn't start with an empty
+        table when there's nothing cached) and then on a fixed interval."""
+        while not self._stop.is_set():
             try:
-                # Suppress the enumerate_pixelblazes log spam by swapping stderr
-                # briefly — the main loop owns the terminal now.
+                # Suppress the enumerate_pixelblazes log spam by swapping
+                # stderr briefly — the main loop owns the terminal now.
                 new_devices = _quiet_enumerate(timeout_ms)
             except Exception:
-                continue
+                new_devices = []
             for dev in new_devices:
                 ip = dev.get("ip")
                 if ip:
                     self._ensure_worker(ip)
+            if self._stop.wait(self._rediscover_seconds):
+                return
 
 
 def _quiet_enumerate(timeout_ms: int) -> list[dict]:
@@ -328,6 +361,25 @@ def _pad(s: str, width: int, right: bool) -> str:
     return s.rjust(width) if right else s.ljust(width)
 
 
+def _fit_columns(term_width: int) -> list[tuple[str, int, bool]]:
+    """Return the prefix of COLUMNS whose full-width layout fits in
+    `term_width`. Guarantees we never truncate mid-column, so we never
+    show half a value like `1` for a SEEN of `1.2s`."""
+    sep_width = 2  # matches "  ".join(...) in _render
+    picked: list[tuple[str, int, bool]] = []
+    used = 0
+    for col in COLUMNS:
+        _, w, _ = col
+        add = w + (sep_width if picked else 0)
+        if used + add > term_width:
+            break
+        picked.append(col)
+        used += add
+    # If even the first column can't fit (weirdly narrow terminal), still
+    # show something rather than nothing.
+    return picked or [COLUMNS[0]]
+
+
 def _render(rows: list[Row], color: bool, sort_key: str) -> str:
     now = time.monotonic()
 
@@ -343,7 +395,15 @@ def _render(rows: list[Row], color: bool, sort_key: str) -> str:
     rows = sorted(rows, key=sort_val)
 
     term_width = shutil.get_terminal_size((120, 40)).columns
+    columns = _fit_columns(term_width)
     lines = []
+    if not rows:
+        lines.append(_c(
+            " pb top  " + time.strftime("%H:%M:%S")
+            + "   waiting for discovery… (nothing cached)"
+            + CLEAR_LINE_END, "grey", color))
+        lines.append(_c("  (q or ^C to quit)", "grey", color) + CLEAR_LINE_END)
+        return "\n".join(lines)
 
     # Header line.
     total = len(rows)
@@ -361,9 +421,9 @@ def _render(rows: list[Row], color: bool, sort_key: str) -> str:
     lines.append("")
 
     # Column headers.
-    header = "  ".join(_pad(h, w, r) for h, w, r in COLUMNS)
-    lines.append(_c(header[:term_width], "grey", color))
-    lines.append(_c("─" * min(len(header), term_width), "grey", color))
+    header = "  ".join(_pad(h, w, r) for h, w, r in columns)
+    lines.append(_c(header, "grey", color))
+    lines.append(_c("─" * len(header), "grey", color))
 
     for row in rows:
         glyph, label, color_name = _health(row, now)
@@ -390,15 +450,16 @@ def _render(rows: list[Row], color: bool, sort_key: str) -> str:
             row.ver or "-",
             seen,
         ]
-        line = "  ".join(_pad(c, w, r) for c, (_, w, r) in zip(cells, COLUMNS))
-        line = line[:term_width]
+        line = "  ".join(_pad(c, w, r) for c, (_, w, r) in zip(cells, columns))
         # Color the whole row by status color (down = red, stale = yellow, ok = default).
         row_color = None if label == "ok" else color_name
         lines.append(_c(line, row_color, color) + CLEAR_LINE_END)
 
         if row.error and label != "ok":
-            err_line = _c(f"    ↳ {row.error}", "grey", color)
-            lines.append(err_line[: term_width] + CLEAR_LINE_END)
+            err_text = f"    ↳ {row.error}"
+            if len(err_text) > term_width:
+                err_text = err_text[: max(0, term_width - 1)] + "…"
+            lines.append(_c(err_text, "grey", color) + CLEAR_LINE_END)
 
     lines.append("")
     lines.append(_c("  (q or ^C to quit)", "grey", color) + CLEAR_LINE_END)
@@ -437,6 +498,11 @@ def register(cli_group):
         drop off the WiFi stay on the table as `down` and pop back to green
         when they rejoin.
 
+        Starts instantly — the initial table is seeded from the on-disk
+        device cache (whatever `pb find` / previous CLI calls last saw),
+        and a background thread runs beacon discovery on a loop to pick
+        up new/moved devices. Rows appear the moment their worker connects.
+
         \b
         Examples:
             pb top                        # Live dashboard, redraws every 1s
@@ -448,14 +514,15 @@ def register(cli_group):
         """
         color = sys.stdout.isatty() and not no_color
 
-        log("Discovering Pixelblazes…")
-        initial = enumerate_pixelblazes(timeout=scan_timeout, slow=False)
-        if not initial:
-            raise click.ClickException("No Pixelblazes found on the network.")
-
-        monitor = TopMonitor(initial, rediscover_seconds=rediscover)
-
         if once:
+            # One-shot mode: run a blocking discovery so the exit snapshot
+            # actually reflects the current LAN, not just whatever we cached.
+            log("Discovering Pixelblazes…")
+            initial = enumerate_pixelblazes(timeout=scan_timeout, slow=False)
+            if not initial:
+                raise click.ClickException("No Pixelblazes found on the network.")
+            monitor = TopMonitor(initial, rediscover_seconds=rediscover)
+
             # Config fetch takes a beat, then stats stream at ~1 Hz — give
             # every worker enough headroom to publish at least one frame.
             deadline = time.monotonic() + 6.0
@@ -471,7 +538,17 @@ def register(cli_group):
                 click.echo(_render(snap, color=color, sort_key=sort_key))
             return
 
-        # Rediscovery thread.
+        # Live mode: don't block on discovery. Seed from the on-disk device
+        # cache so the table draws instantly with whatever we last knew,
+        # then let the rediscovery thread find/update everything else in
+        # the background. New devices appear as rows the moment their
+        # worker connects; devices that have moved IPs light up on the
+        # next rediscovery cycle.
+        cached = _read_cache().get("devices", {}) or {}
+        seed = list(cached.values())
+        monitor = TopMonitor(seed, rediscover_seconds=rediscover)
+
+        # Rediscovery thread — runs its first sweep immediately.
         threading.Thread(
             target=monitor.rediscover_loop, args=(scan_timeout,),
             daemon=True, name="pb-top-rediscover",
