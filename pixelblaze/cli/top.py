@@ -386,7 +386,8 @@ def _fit_columns(term_width: int) -> list[tuple[str, int, bool]]:
     return picked or [COLUMNS[0]]
 
 
-def _render(rows: list[Row], color: bool, sort_key: str) -> str:
+def _render(rows: list[Row], color: bool, sort_key: str,
+            active_only: bool = False) -> str:
     now = time.monotonic()
 
     # Health rank: ok=0, stale=1, down=2. Used to pin live devices to the
@@ -396,6 +397,12 @@ def _render(rows: list[Row], color: bool, sort_key: str) -> str:
     health_rank = {"ok": 0, "stale": 1, "down": 2}
     def _health_key(r: Row) -> int:
         return health_rank[_health(r, now)[1]]
+
+    hidden = 0
+    if active_only:
+        kept = [r for r in rows if _health(r, now)[1] != "down"]
+        hidden = len(rows) - len(kept)
+        rows = kept
 
     def _name_key(r: Row) -> str:
         return (r.name or "~").lower()
@@ -419,9 +426,15 @@ def _render(rows: list[Row], color: bool, sort_key: str) -> str:
     columns = _fit_columns(term_width)
     lines = []
     if not rows:
+        empty_msg = (
+            "no active devices"
+            if active_only and hidden
+            else "waiting for discovery… (nothing cached)"
+        )
         lines.append(_c(
             " pb top  " + time.strftime("%H:%M:%S")
-            + "   waiting for discovery… (nothing cached)"
+            + f"   {empty_msg}"
+            + (f"  (hidden: {hidden} down)" if hidden else "")
             + CLEAR_LINE_END, "grey", color))
         lines.append(_c("  (q or ^C to quit)", "grey", color) + CLEAR_LINE_END)
         return "\n".join(lines)
@@ -438,6 +451,8 @@ def _render(rows: list[Row], color: bool, sort_key: str) -> str:
         f"{_c(f'stale {stale}', 'yellow', color)}  "
         f"{_c(f'down {down}', 'red', color)}"
     )
+    if active_only and hidden:
+        banner += _c(f"  (hidden: {hidden} down)", "grey", color)
     lines.append(_c(banner + CLEAR_LINE_END, None, color))
     lines.append("")
 
@@ -510,10 +525,14 @@ def register(cli_group):
                   default="active", show_default=True,
                   help="Sort rows. Every option pins active devices above stale/down; "
                        "`active` (default) then breaks ties by name.")
+    @click.option("--active", "-a", "active_only", is_flag=True,
+                  help="Only show devices currently responding (hides `down` rows). "
+                       "Cached devices we've never reached this session are hidden too.")
     @click.option("--no-color", is_flag=True, help="Disable ANSI color output.")
     @click.option("--json", "json_out", is_flag=True,
                   help="Emit one JSON snapshot to stdout and exit (with --once).")
-    def top(interval, once, rediscover, scan_timeout, sort_key, no_color, json_out):
+    def top(interval, once, rediscover, scan_timeout, sort_key, active_only,
+            no_color, json_out):
         """
         Realtime dashboard of every Pixelblaze on the network.
 
@@ -535,6 +554,7 @@ def register(cli_group):
             pb top --once                 # One snapshot, exit
             pb top --once --json          # Machine-readable snapshot
             pb top -r 10                  # Rediscover every 10s (default 30)
+            pb top --active               # Hide `down` rows (only live devices)
         """
         color = sys.stdout.isatty() and not no_color
 
@@ -556,9 +576,15 @@ def register(cli_group):
                 time.sleep(0.1)
             snap = monitor.snapshot()
             monitor.stop()
+            if active_only:
+                # Match the render-side filter so --once --json --active
+                # emits only the responding devices.
+                _now = time.monotonic()
+                snap = [r for r in snap if _health(r, _now)[1] != "down"]
             if json_out:
                 click.echo(json.dumps([_row_to_dict(r) for r in snap], separators=(",", ":")))
             else:
+                # active filter is already applied above; don't re-filter in _render.
                 click.echo(_render(snap, color=color, sort_key=sort_key))
             return
 
@@ -594,7 +620,8 @@ def register(cli_group):
 
         try:
             while not stop_flag["stop"]:
-                frame = _render(monitor.snapshot(), color=color, sort_key=sort_key)
+                frame = _render(monitor.snapshot(), color=color, sort_key=sort_key,
+                                active_only=active_only)
                 sys.stdout.write(CLEAR_HOME + frame)
                 sys.stdout.flush()
                 time.sleep(interval)
