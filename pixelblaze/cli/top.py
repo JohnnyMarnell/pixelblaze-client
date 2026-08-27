@@ -383,14 +383,29 @@ def _fit_columns(term_width: int) -> list[tuple[str, int, bool]]:
 def _render(rows: list[Row], color: bool, sort_key: str) -> str:
     now = time.monotonic()
 
+    # Health rank: ok=0, stale=1, down=2. Used to pin live devices to the
+    # top of the table, both as the default sort and as a secondary key on
+    # every other sort — a dead row shouldn't leapfrog a live one just
+    # because its name happens to be alphabetically earlier.
+    health_rank = {"ok": 0, "stale": 1, "down": 2}
+    def _health_key(r: Row) -> int:
+        return health_rank[_health(r, now)[1]]
+
+    def _name_key(r: Row) -> str:
+        return (r.name or "~").lower()
+
     def sort_val(r: Row):
         if sort_key == "fps":
-            return -(r.fps or 0)  # descending
+            return (_health_key(r), -(r.fps or 0), _name_key(r))
         if sort_key == "ip":
-            return tuple(int(p) if p.isdigit() else 0 for p in r.ip.split("."))
+            octets = tuple(int(p) if p.isdigit() else 0 for p in r.ip.split("."))
+            return (_health_key(r), octets)
         if sort_key == "pattern":
-            return (r.active_pattern_name or "~").lower()
-        return (r.name or "~").lower()  # default: name
+            return (_health_key(r), (r.active_pattern_name or "~").lower(), _name_key(r))
+        if sort_key == "name":
+            return (_health_key(r), _name_key(r))
+        # Default "active": actives at the top, then alphabetical by name.
+        return (_health_key(r), _name_key(r))
 
     rows = sorted(rows, key=sort_val)
 
@@ -484,8 +499,11 @@ def register(cli_group):
                   help="Re-run beacon discovery every N seconds to pick up new devices.")
     @click.option("--scan-timeout", type=int, default=2000, show_default=True,
                   help="Beacon listen timeout for each discovery round (ms).")
-    @click.option("--sort", "sort_key", type=click.Choice(["name", "ip", "fps", "pattern"]),
-                  default="name", show_default=True, help="Sort rows by this column.")
+    @click.option("--sort", "sort_key",
+                  type=click.Choice(["active", "name", "ip", "fps", "pattern"]),
+                  default="active", show_default=True,
+                  help="Sort rows. Every option pins active devices above stale/down; "
+                       "`active` (default) then breaks ties by name.")
     @click.option("--no-color", is_flag=True, help="Disable ANSI color output.")
     @click.option("--json", "json_out", is_flag=True,
                   help="Emit one JSON snapshot to stdout and exit (with --once).")
