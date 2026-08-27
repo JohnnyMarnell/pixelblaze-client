@@ -86,7 +86,7 @@ class Row:
     mem: Optional[int] = None
     storage_used: Optional[int] = None
     storage_size: Optional[int] = None
-    uptime: Optional[int] = None
+    uptime_ms: Optional[int] = None  # raw Pixelblaze `uptime` — milliseconds
     last_seen: float = 0.0
     connected: bool = False
     error: str = ""
@@ -196,7 +196,7 @@ class TopMonitor:
                             mem=stats.get("mem"),
                             storage_used=stats.get("storageUsed"),
                             storage_size=stats.get("storageSize"),
-                            uptime=stats.get("uptime"),
+                            uptime_ms=stats.get("uptime"),
                             last_seen=now,
                             connected=True,
                             error="",
@@ -300,17 +300,23 @@ def _fmt_storage(row: Row) -> str:
     return f"{used}/{total}"
 
 
-def _fmt_uptime(secs: Optional[int]) -> str:
-    if secs is None:
+def _fmt_uptime(ms: Optional[int]) -> str:
+    # Pixelblaze reports uptime in MILLISECONDS in its stats frames — the
+    # raw value ticks up ~1000 per second. Treating it as seconds inflates
+    # every reading 1000× (a 35-minute-old device would read as ~24 days).
+    if ms is None:
         return "-"
-    m, _ = divmod(int(secs), 60)
+    secs = int(ms) // 1000
+    m, _ = divmod(secs, 60)
     h, m = divmod(m, 60)
     d, h = divmod(h, 24)
     if d:
         return f"{d}d{h:02d}h"
     if h:
         return f"{h}h{m:02d}m"
-    return f"{m}m"
+    if m:
+        return f"{m}m"
+    return f"{secs}s"
 
 
 def _fmt_seen(row: Row, now: float) -> str:
@@ -449,7 +455,7 @@ def _render(rows: list[Row], color: bool, sort_key: str) -> str:
         pattern = row.active_pattern_name or (row.active_pattern_id[:10] if row.active_pattern_id else "-")
         pixels = str(row.pixel_count) if row.pixel_count is not None else "-"
         bright = f"{int(row.brightness * 100)}%" if row.brightness is not None else "-"
-        uptime = _fmt_uptime(row.uptime)
+        uptime = _fmt_uptime(row.uptime_ms)
         seen = _fmt_seen(row, now)
         cells = [
             status,
@@ -614,7 +620,7 @@ def _row_to_dict(r: Row) -> dict:
         "mem": r.mem,
         "storageUsed": r.storage_used,
         "storageSize": r.storage_size,
-        "uptime": r.uptime,
+        "uptimeMs": r.uptime_ms,
         "lastSeenMonotonic": r.last_seen,
         "connected": r.connected,
         "error": r.error,
