@@ -30,6 +30,7 @@ from pixelblaze.cli.cli_utils import cli, log, no_save_option, input_arg, read_i
                                      get_cache_dir, check, parse_vars, get_pixelblaze, discover_pixelblaze, \
                                      enumerate_pixelblazes, cache_ip, _read_cache, _write_cache, \
                                      _fetch_device_config, update_device_cache, lookup_cached_device
+from pixelblaze.cli.top import register as _register_top
 
 @click.group()
 @click.option(
@@ -2145,6 +2146,10 @@ def cache_refresh(query, all_devices, conn_timeout):
         log(f"Refreshed {len(refreshed)}/{len(targets)} device(s).")
     else:
         raise click.ClickException("Could not refresh any devices.")
+
+
+# `pb top` lives in a sibling module for size; register it onto the group here.
+_register_top(pixelblaze)
 
 
 def main():
