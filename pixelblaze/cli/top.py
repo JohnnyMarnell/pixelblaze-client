@@ -164,18 +164,47 @@ class TopMonitor:
         device stops responding — its inner wsReceive returns None on
         timeout, then getStatistics just tries again. Instead we drive
         wsReceive ourselves so we can bail on staleness."""
+        is_first_connect = True
         while not self._stop.is_set():
             pb: Optional[Pixelblaze] = None
             try:
                 pb = Pixelblaze(ip)
-                self._set(ip, connected=True, error="")
+                # Row visibility fast-path: a successful WS handshake IS a
+                # "we heard from this device just now" signal, so seed
+                # last_seen too. Without this the row shows as red `down`
+                # until the first stats frame lands (up to ~3s later),
+                # even though the cached name/pattern are on-screen.
+                # The stale-reconnect check uses last_stats_at, not
+                # last_seen, so this doesn't affect reconnect timing.
+                self._set(ip, connected=True, error="", last_seen=time.monotonic())
                 # Pixelblaze streams `{"fps":...}` stats frames on its own
                 # every ~1s over an open socket — no explicit sendUpdates
                 # request needed (and calling setSendPreviewFrames(True)
                 # here would also start binary preview frames, which we'd
                 # only throw away and which cost real bandwidth per device).
-                self._refresh_config(pb, ip)
-                last_config_refresh = time.monotonic()
+
+                # First-connect fast path: if the row was seeded from cache
+                # (has a name), skip the initial config fetch entirely — the
+                # cached name/pattern/etc are already on-screen, and stats
+                # will stream in ~1s. Otherwise do just getConfigSettings
+                # (the cheap one) to populate the name; skip the heavier
+                # getPatternList until the periodic refresh. The periodic
+                # refresh timer is set so a full refresh happens ~2s later.
+                if is_first_connect:
+                    with self._lock:
+                        seeded = bool(self._rows.get(ip) and self._rows[ip].name)
+                    if not seeded:
+                        # No cache seed for this row — fetch just the cheap
+                        # settings RPC so the name shows up; defer the heavy
+                        # getPatternList to the periodic refresh below.
+                        self._prime_name(pb, ip)
+                    # Force the first periodic refresh soon (~2s) so we
+                    # pick up any drift without paying the cost up-front.
+                    last_config_refresh = time.monotonic() - (CONFIG_REFRESH_SECONDS - 2.0)
+                    is_first_connect = False
+                else:
+                    self._refresh_config(pb, ip)
+                    last_config_refresh = time.monotonic()
                 last_stats_at = time.monotonic()
 
                 while not self._stop.is_set():
@@ -224,6 +253,22 @@ class TopMonitor:
             if self._stop.wait(RECONNECT_BACKOFF_SECONDS):
                 return
 
+    def _prime_name(self, pb: Pixelblaze, ip: str):
+        """Fast first-connect populate: just the cheap RPC to get the name.
+        Skips getConfigSequencer and getPatternList; the periodic refresh
+        will pick those up shortly."""
+        try:
+            settings = pb.getConfigSettings()
+            self._set(
+                ip,
+                name=settings.get("name") or "",
+                ver=str(settings.get("ver") or ""),
+                pixel_count=settings.get("pixelCount"),
+                brightness=settings.get("brightness"),
+            )
+        except Exception:
+            pass
+
     def _refresh_config(self, pb: Pixelblaze, ip: str):
         try:
             info = _fetch_device_config(pb, ip=ip, include_patterns=True)
@@ -253,30 +298,32 @@ class TopMonitor:
         rejoined the network at a new IP or came online after startup.
 
         Runs one sweep immediately (so `pb top` doesn't start with an empty
-        table when there's nothing cached) and then on a fixed interval."""
+        table when there's nothing cached) and then on a fixed interval.
+
+        Workers are spawned via `on_ip` the instant each beacon lands —
+        we don't wait for the sweep to finish. That drops first-row
+        latency for a cold cache from ~sweep-duration (ad-hoc probe +
+        full beacon timeout + serial peer enrichment) to ~one-beacon-
+        interval (usually <1s)."""
         while not self._stop.is_set():
             try:
                 # Suppress the enumerate_pixelblazes log spam by swapping
                 # stderr briefly — the main loop owns the terminal now.
-                new_devices = _quiet_enumerate(timeout_ms)
+                _quiet_enumerate(timeout_ms, on_ip=self._ensure_worker)
             except Exception:
-                new_devices = []
-            for dev in new_devices:
-                ip = dev.get("ip")
-                if ip:
-                    self._ensure_worker(ip)
+                pass
             if self._stop.wait(self._rediscover_seconds):
                 return
 
 
-def _quiet_enumerate(timeout_ms: int) -> list[dict]:
+def _quiet_enumerate(timeout_ms: int, on_ip=None) -> list[dict]:
     """Run enumerate_pixelblazes with stderr silenced (top owns the screen)."""
     import io
     import contextlib
 
     buf = io.StringIO()
     with contextlib.redirect_stderr(buf):
-        return enumerate_pixelblazes(timeout=timeout_ms, slow=False)
+        return enumerate_pixelblazes(timeout=timeout_ms, slow=False, on_ip=on_ip)
 
 
 # ── Rendering ───────────────────────────────────────────────────────────────

@@ -243,7 +243,10 @@ def lookup_cached_device(query: str) -> tuple[str, dict]:
     raise click.ClickException(f"No cached device matches '{query}'.")
 
 
-def _discover_ips(timeout: int = 2000) -> list[str]:
+def _discover_ips(
+    timeout: int = 2000,
+    on_ip: Optional[Callable[[str], None]] = None,
+) -> list[str]:
     """
     Discover Pixelblaze IP addresses via ad-hoc check and UDP beacons.
 
@@ -251,12 +254,25 @@ def _discover_ips(timeout: int = 2000) -> list[str]:
 
     Args:
         timeout: Beacon listen timeout in milliseconds.
+        on_ip: Optional callback invoked with each newly-discovered IP the
+            instant it's found — before the sweep completes. Lets callers
+            (e.g. `pb top`) fire workers against a device as soon as its
+            beacon arrives, instead of waiting for the full timeout + peer
+            enrichment. Callback exceptions are logged and swallowed.
 
     Returns:
         list[str]: List of discovered IP addresses.
     """
     ips = []
     seen = set()
+
+    def _report(ip: str):
+        if on_ip is None:
+            return
+        try:
+            on_ip(ip)
+        except Exception as e:
+            log(f"  on_ip callback failed for {ip}: {e}")
 
     # Check ad-hoc mode first
     adhoc_ip = "192.168.4.1"
@@ -265,6 +281,7 @@ def _discover_ips(timeout: int = 2000) -> list[str]:
         ips.append(adhoc_ip)
         seen.add(adhoc_ip)
         log(f"  Found @ {adhoc_ip} (ad-hoc)")
+        _report(adhoc_ip)
 
     # Beacon enumeration
     log(f"Listening for beacons ({timeout}ms)...")
@@ -274,6 +291,7 @@ def _discover_ips(timeout: int = 2000) -> list[str]:
                 seen.add(found_ip)
                 ips.append(found_ip)
                 log(f"  Found @ {found_ip}")
+                _report(found_ip)
     except Exception as e:
         log(f"Enumeration error: {e}")
 
@@ -289,13 +307,18 @@ def _discover_ips(timeout: int = 2000) -> list[str]:
                         seen.add(peer_ip)
                         ips.append(peer_ip)
                         log(f"  Found @ {peer_ip} (via {ip} sync group)")
+                        _report(peer_ip)
         except Exception as e:
             log(f"  Peer query failed on {ip}: {e}")
 
     return ips
 
 
-def enumerate_pixelblazes(timeout: int = 3000, slow: bool = False) -> list[dict]:
+def enumerate_pixelblazes(
+    timeout: int = 3000,
+    slow: bool = False,
+    on_ip: Optional[Callable[[str], None]] = None,
+) -> list[dict]:
     """
     Discover all Pixelblazes on the network.
 
@@ -306,12 +329,14 @@ def enumerate_pixelblazes(timeout: int = 3000, slow: bool = False) -> list[dict]
     Args:
         timeout: Beacon listen timeout in milliseconds.
         slow: If True, connect to each device to fetch full config info.
+        on_ip: Optional per-IP callback fired the instant each device is
+            found (before the sweep returns). See `_discover_ips`.
 
     Returns:
         list[dict]: Device info dicts. Fast mode: {'ip': ...} only.
                     Slow mode adds: name, pixelCount, brightness, ver, brandName, hostIp.
     """
-    ips = _discover_ips(timeout=timeout)
+    ips = _discover_ips(timeout=timeout, on_ip=on_ip)
 
     if not ips:
         return []
