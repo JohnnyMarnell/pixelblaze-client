@@ -20,6 +20,8 @@ flexible discovery, pattern rendering, and configuration management.
 #   ╚═╝└─┘┴ ┴┴ ┴┴ ┴┘└┘─┴┘  ╚═╝┴┘└┘└─┘  ╩┘└┘ ┴ └─┘┴└─└  ┴ ┴└─┘└─┘
 #
 
+import csv as csvlib
+import io
 import json as jsonlib
 import time
 import re
@@ -247,9 +249,25 @@ def off(pb: Pixelblaze, pause_sequencer, no_save):
     log(f"Pixelblaze {action}")
 
 
+def _parse_csv_coordinates(content: str) -> list:
+    """Parse CSV text with x/y/z columns (case-insensitive) into [[x,y,z], ...]."""
+    reader = csvlib.DictReader(io.StringIO(content))
+    fields = {(f or "").strip().lower(): f for f in (reader.fieldnames or [])}
+    check('x' in fields, "CSV must contain an 'x' column (case-insensitive)")
+    dims = [d for d in ('x', 'y', 'z') if d in fields]
+    coords = []
+    for i, row in enumerate(reader, start=1):
+        try:
+            coords.append([float(row[fields[d]]) for d in dims])
+        except (TypeError, ValueError) as e:
+            raise click.ClickException(f"CSV row {i}: could not parse coordinate: {e}")
+    check(len(coords) > 0, "CSV contained no data rows")
+    return coords
+
+
 @cli(pixelblaze)
 @input_arg
-@click.option('--csv', is_flag=True, help='Output as csv instead of Pixelblaze 3-arrays')
+@click.option('--csv', is_flag=True, help='CSV mode: output map as CSV when reading, or parse input CSV (x,y,z columns) when setting')
 @click.option('--clear', is_flag=True, help='Clear/remove the current pixel map from the device')
 def map(pb: Pixelblaze, input, csv, clear):
     """
@@ -264,6 +282,7 @@ def map(pb: Pixelblaze, input, csv, clear):
         pb map                       # Get current map coordinates (normalized 0-1)
         pb map map.js                # Set map from file
         pb map < map.js              # Set map from stdin
+        pb map --csv < coords.csv    # Set map from CSV with x,y,z columns
         pb map --clear               # Remove the current pixel map
     """
     check(not (clear and csv), "Cannot use --clear and --csv together")
@@ -279,7 +298,11 @@ def map(pb: Pixelblaze, input, csv, clear):
     setting = content is not None
 
     if setting:
-        if "function" in content:
+        if csv:
+            coords = _parse_csv_coordinates(content)
+            log(f"Setting map coordinates from CSV ({len(coords)} pixels, {len(coords[0])}D)...")
+            pb.setMapCoordinates(coords)
+        elif "function" in content:
             log(f"Setting map function...")
             pb.setMapFunction(content)
         else:
@@ -1619,6 +1642,9 @@ def var(pb: Pixelblaze, args, no_save):
     pb.setActiveVariables(variables)
     pb.setActiveControls(variables, saveToFlash=not no_save)
     log("Set successfully")
+
+
+pixelblaze.add_command(var, name='vars')
 
 
 @click.option(
