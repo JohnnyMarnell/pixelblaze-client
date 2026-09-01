@@ -1572,22 +1572,23 @@ def ws(pb: Pixelblaze, json, expect):
             click.echo(response)
 
 
-@click.argument('args', nargs=-1, required=True)
-@click.option(
-    '--control',
-    is_flag=True,
-    help='Set as UI controls (sliders) instead of variables'
-)
+@click.argument('args', nargs=-1, required=False)
 @no_save_option
 @cli(pixelblaze)
-def var(pb: Pixelblaze, args, control, no_save):
+def var(pb: Pixelblaze, args, no_save):
     """
-    Set variables or UI controls on the active pattern.
+    Read or set variables / UI controls on the active pattern.
 
-    Variables are pattern exports (export var myVar), while controls are
-    UI sliders (export function sliderMyControl(v)).
+    With NO args, prints {"vars":..., "controls":...} as JSON to stdout —
+    pipe into jq. Vars are pattern exports (export var myVar); controls are
+    UI sliders (export function sliderMyControl(v)). Patterns often have
+    only one or the other; this shows both so you never get an empty answer.
 
-    Supports multiple input formats that can be mixed:
+    With args, sets them. Each pair is sent to BOTH setVars and setControls,
+    and the device ignores names that don't exist on either side — you don't
+    have to know whether a name is a var or a slider.
+
+    Input formats can be mixed:
     - key value pairs: pb var foo bar
     - colon-separated: pb var foo:bar
     - JSON5 objects: pb var '{a:1, b:2}'
@@ -1595,26 +1596,29 @@ def var(pb: Pixelblaze, args, control, no_save):
 
     \b
     Examples:
+        pb var                             # Print {"vars":..., "controls":...}
+        pb var | jq .controls.sliderArms   # Read one control via jq
         pb var globalSpeed .3              # Set variable to number
-        pb var foo bar                     # Set variable to string
-        pb var foo 1                       # Set variable to number 1
+        pb var sliderArms 3                # Nudge a UI slider
         pb var 'foo:bar baz'               # Set foo to "bar baz" (colon format)
         pb var '{a:1, b:2}'                # Set multiple from JSON5 object
         pb var foo 2 bar:3 '{baz:true}'    # Mix all formats
-        pb var --control hue 0.33          # Set UI control
         pb var foo bar --no-save           # Don't save to flash
     """
+    if not args:
+        jsons({
+            "vars": pb.getActiveVariables() or {},
+            "controls": pb.getActiveControls() or {},
+        })
+        return
+
     variables = parse_vars(args)
     check(variables, "No variables specified")
 
-    if control:
-        log(f"Setting controls: {variables}")
-        pb.setActiveControls(variables, saveToFlash=not no_save)
-    else:
-        log(f"Setting variables: {variables}")
-        pb.setActiveVariables(variables)
-
-    log("Variables set successfully")
+    log(f"Setting: {variables}")
+    pb.setActiveVariables(variables)
+    pb.setActiveControls(variables, saveToFlash=not no_save)
+    log("Set successfully")
 
 
 @click.option(
