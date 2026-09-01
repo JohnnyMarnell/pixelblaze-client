@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 import click
 
@@ -91,6 +91,37 @@ class Row:
     connected: bool = False
     error: str = ""
 
+    # Extended fields (populated by _refresh_config from getConfigSettings +
+    # getConfigSequencer). Rendered only for opt-in columns.
+    brand: str = ""
+    led_type: Optional[int] = None
+    data_speed: Optional[int] = None
+    color_order: str = ""
+    max_brightness: Optional[int] = None    # settings.maxBrightness (0-100)
+    cpu_speed: str = ""                     # settings.cpuSpeed (str: "80"/"160"/"240")
+    power_save: Optional[bool] = None       # settings.networkPowerSave
+    discovery: Optional[bool] = None        # settings.discoveryEnable
+    timezone: str = ""                      # settings.timezone
+    auto_off_enable: Optional[bool] = None  # settings.autoOffEnable
+    auto_off_start: str = ""                # settings.autoOffStart ("HH:MM")
+    auto_off_end: str = ""                  # settings.autoOffEnd
+    simple_ui: Optional[bool] = None        # settings.simpleUiMode
+    learning_ui: Optional[bool] = None      # settings.learningUiMode
+    sensor_input: Optional[int] = None      # settings.sensorInputSource (0=mic,1=exp)
+
+    # Sequencer / playlist
+    seq_mode: Optional[int] = None          # 0=Off, 1=ShuffleAll, 2=Playlist
+    seq_state: Optional[bool] = None        # runSequencer
+    seq_shuffle_ms: Optional[int] = None    # sequencer.ms — default per-item duration
+    plist_index: Optional[int] = None       # active item index (Playlist mode)
+    plist_size: Optional[int] = None        # total items in playlist
+
+    # Local tracking so we can show "time left in this pattern".
+    # Set the moment we observe active_pattern_id change (best-effort — if a
+    # pattern was already running when pb top started we can only estimate
+    # from first-observation, not true start).
+    pattern_started_at: float = 0.0         # monotonic seconds
+
 
 class TopMonitor:
     """Owns the shared rows dict, one worker thread per device, and the
@@ -131,6 +162,41 @@ class TopMonitor:
                     or dev.get("activePatternName")
                     or row.active_pattern_name
                 )
+            # Extended fields — `pb find` (slow mode) persists `settings` /
+            # `sequencer` sub-dicts into the cache; hydrate whatever we can
+            # so custom columns aren't blank until the first live refresh.
+            settings = dev.get("settings") or {}
+            row.brand = dev.get("brandName") or settings.get("brandName") or row.brand
+            row.led_type = settings.get("ledType", row.led_type)
+            row.data_speed = settings.get("dataSpeed", row.data_speed)
+            row.color_order = str(settings.get("colorOrder") or row.color_order)
+            row.max_brightness = settings.get("maxBrightness", row.max_brightness)
+            row.cpu_speed = str(settings.get("cpuSpeed") or row.cpu_speed)
+            if "networkPowerSave" in settings:
+                row.power_save = settings["networkPowerSave"]
+            if "discoveryEnable" in settings:
+                row.discovery = settings["discoveryEnable"]
+            row.timezone = str(settings.get("timezone") or row.timezone)
+            if "autoOffEnable" in settings:
+                row.auto_off_enable = settings["autoOffEnable"]
+            row.auto_off_start = str(settings.get("autoOffStart") or row.auto_off_start)
+            row.auto_off_end = str(settings.get("autoOffEnd") or row.auto_off_end)
+            if "simpleUiMode" in settings:
+                row.simple_ui = settings["simpleUiMode"]
+            if "learningUiMode" in settings:
+                row.learning_ui = settings["learningUiMode"]
+            if "sensorInputSource" in settings:
+                row.sensor_input = settings["sensorInputSource"]
+            sequencer = dev.get("sequencer") or {}
+            if "sequencerMode" in sequencer:
+                row.seq_mode = sequencer["sequencerMode"]
+            if "runSequencer" in sequencer:
+                row.seq_state = sequencer["runSequencer"]
+            if "ms" in sequencer:
+                row.seq_shuffle_ms = sequencer["ms"]
+            playlist_items = ((sequencer.get("playlist") or {}).get("items")) or []
+            if playlist_items:
+                row.plist_size = len(playlist_items)
 
     def stop(self):
         self._stop.set()
@@ -277,6 +343,23 @@ class TopMonitor:
         active_id = info.get("activePatternId", "") or ""
         patterns = info.get("patterns") or {}
         active_name = patterns.get(active_id, "") or info.get("activePatternName", "") or ""
+
+        settings = info.get("settings") or {}
+        sequencer = info.get("sequencer") or {}
+        playlist = sequencer.get("playlist") or {}
+        playlist_items = playlist.get("items") or []
+        plist_size = len(playlist_items) if playlist_items else None
+        plist_position = playlist.get("position")
+        plist_index = int(plist_position) if isinstance(plist_position, int) else None
+
+        # Detect pattern change so we can track "time left" for playlist mode.
+        with self._lock:
+            row = self._rows.get(ip)
+            prev_id = row.active_pattern_id if row else ""
+        pattern_change_kwargs = {}
+        if active_id and active_id != prev_id:
+            pattern_change_kwargs["pattern_started_at"] = time.monotonic()
+
         self._set(
             ip,
             name=info.get("name") or "",
@@ -285,6 +368,27 @@ class TopMonitor:
             brightness=info.get("brightness"),
             active_pattern_id=active_id,
             active_pattern_name=active_name,
+            brand=settings.get("brandName") or "",
+            led_type=settings.get("ledType"),
+            data_speed=settings.get("dataSpeed"),
+            color_order=str(settings.get("colorOrder") or ""),
+            max_brightness=settings.get("maxBrightness"),
+            cpu_speed=str(settings.get("cpuSpeed") or ""),
+            power_save=settings.get("networkPowerSave"),
+            discovery=settings.get("discoveryEnable"),
+            timezone=str(settings.get("timezone") or ""),
+            auto_off_enable=settings.get("autoOffEnable"),
+            auto_off_start=str(settings.get("autoOffStart") or ""),
+            auto_off_end=str(settings.get("autoOffEnd") or ""),
+            simple_ui=settings.get("simpleUiMode"),
+            learning_ui=settings.get("learningUiMode"),
+            sensor_input=settings.get("sensorInputSource"),
+            seq_mode=sequencer.get("sequencerMode"),
+            seq_state=sequencer.get("runSequencer"),
+            seq_shuffle_ms=sequencer.get("ms"),
+            plist_index=plist_index,
+            plist_size=plist_size,
+            **pattern_change_kwargs,
         )
         # Also push the fresh info into the shared JSON cache so `pb find`
         # and friends immediately benefit.
@@ -390,22 +494,299 @@ def _health(row: Row, now: float) -> tuple[str, str, str]:
     return "○", "down", "red"
 
 
-COLUMNS = [
-    # (header, width, right_align) — ordered most-important-first, since
-    # terminals narrower than the total drop trailing columns.
-    ("STATUS", 7, False),
-    ("NAME", 15, False),
-    ("IP", 15, False),
-    ("FPS", 5, True),
-    ("PATTERN", 20, False),
-    ("PIXELS", 6, True),
-    ("BRIGHT", 6, True),
-    ("STORAGE", 12, False),
-    ("MEM", 5, True),
-    ("UPTIME", 7, True),
-    ("VER", 4, True),
-    ("SEEN", 6, True),
+# ── Column registry ─────────────────────────────────────────────────────────
+# A column is a tuple of (header, width, right-aligned?, getter, description).
+# The getter receives (row, now_monotonic) and returns the raw string to render.
+# `--list-columns` prints the registry with descriptions; `--columns` picks a
+# subset by key; `--all` selects everything in registry insertion order.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class ColumnSpec:
+    key: str
+    header: str
+    width: int
+    right: bool
+    get: Callable[["Row", float], str]
+    desc: str
+    group: str = "core"
+
+
+# ── Cell formatters ─────────────────────────────────────────────────────────
+
+
+LED_TYPE_NAMES = {
+    0: "none", 1: "APA102", 2: "WS2812", 3: "WS2801", 4: "buf2812", 5: "OutExp",
+}
+
+
+def _fmt_bool(v: Optional[bool], t: str = "yes", f: str = "no") -> str:
+    if v is None:
+        return "-"
+    return t if v else f
+
+
+def _fmt_int(v: Optional[int]) -> str:
+    return "-" if v is None else str(v)
+
+
+def _fmt_hz(v: Optional[int]) -> str:
+    if v is None:
+        return "-"
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"{v / 1_000:.0f}k"
+    return str(v)
+
+
+SEQ_MODE_NAMES = {0: "off", 1: "shuffle", 2: "playlist"}
+
+
+def _fmt_seq_mode(row: "Row", _now: float) -> str:
+    if row.seq_mode is None:
+        return "-"
+    return SEQ_MODE_NAMES.get(row.seq_mode, str(row.seq_mode))
+
+
+def _fmt_seq_state(row: "Row", _now: float) -> str:
+    if row.seq_state is None:
+        return "-"
+    return "play" if row.seq_state else "pause"
+
+
+def _fmt_playlist_pos(row: "Row", _now: float) -> str:
+    if row.plist_size is None:
+        return "-"
+    idx = row.plist_index if row.plist_index is not None else 0
+    return f"{idx + 1}/{row.plist_size}"
+
+
+def _fmt_shuffle(row: "Row", _now: float) -> str:
+    if row.seq_shuffle_ms is None:
+        return "-"
+    ms = int(row.seq_shuffle_ms)
+    if ms >= 60_000:
+        return f"{ms // 60_000}m{(ms % 60_000) // 1000:02d}s"
+    if ms >= 1000:
+        return f"{ms / 1000:.1f}s"
+    return f"{ms}ms"
+
+
+def _fmt_playlist_left(row: "Row", now: float) -> str:
+    # Only meaningful if sequencer is running with a known per-item duration
+    # and we've seen the pattern start (either via pattern_started_at or the
+    # first observation).
+    if not row.seq_state or row.seq_shuffle_ms is None or not row.pattern_started_at:
+        return "-"
+    total = row.seq_shuffle_ms / 1000.0
+    elapsed = now - row.pattern_started_at
+    remaining = max(0.0, total - elapsed)
+    if remaining >= 60:
+        m, s = divmod(int(remaining), 60)
+        return f"{m}m{s:02d}s"
+    if remaining >= 10:
+        return f"{remaining:.0f}s"
+    return f"{remaining:.1f}s"
+
+
+def _fmt_auto_off(row: "Row", _now: float) -> str:
+    if row.auto_off_enable is None:
+        return "-"
+    if not row.auto_off_enable:
+        return "off"
+    s = row.auto_off_start or "??:??"
+    e = row.auto_off_end or "??:??"
+    return f"{s}-{e}"
+
+
+def _fmt_sensor(row: "Row", _now: float) -> str:
+    if row.sensor_input is None:
+        return "-"
+    return "expansion" if row.sensor_input else "mic"
+
+
+def _fmt_pattern(row: "Row", _now: float) -> str:
+    return row.active_pattern_name or (row.active_pattern_id[:12] if row.active_pattern_id else "-")
+
+
+def _fmt_bright(row: "Row", _now: float) -> str:
+    return f"{int(row.brightness * 100)}%" if row.brightness is not None else "-"
+
+
+def _fmt_maxbright(row: "Row", _now: float) -> str:
+    return f"{row.max_brightness}%" if row.max_brightness is not None else "-"
+
+
+def _fmt_led_type(row: "Row", _now: float) -> str:
+    if row.led_type is None:
+        return "-"
+    return LED_TYPE_NAMES.get(row.led_type, f"t{row.led_type}")
+
+
+def _fmt_status(row: "Row", now: float) -> str:
+    glyph, label, _ = _health(row, now)
+    return f"{glyph} {label}"
+
+
+def _register_columns() -> "dict[str, ColumnSpec]":
+    specs: list[ColumnSpec] = [
+        # ── Core (default set — matches the pre-registry table) ────────────
+        ColumnSpec("status",   "STATUS",   7, False, _fmt_status,
+                   "Health glyph + label", "core"),
+        ColumnSpec("name",     "NAME",    15, False, lambda r, _: r.name or "-",
+                   "Device name", "core"),
+        ColumnSpec("ip",       "IP",      15, False, lambda r, _: r.ip,
+                   "IP address", "core"),
+        ColumnSpec("fps",      "FPS",      5, True,
+                   lambda r, _: f"{r.fps:.1f}" if r.fps is not None else "-",
+                   "Frames per second (from live stats stream)", "core"),
+        ColumnSpec("pattern",  "PATTERN", 20, False, _fmt_pattern,
+                   "Active pattern name (falls back to id prefix)", "core"),
+        ColumnSpec("pixels",   "PIXELS",   6, True,
+                   lambda r, _: _fmt_int(r.pixel_count),
+                   "Configured pixel count", "core"),
+        ColumnSpec("bright",   "BRIGHT",   6, True, _fmt_bright,
+                   "Brightness slider position (0-100%)", "core"),
+        ColumnSpec("storage",  "STORAGE", 12, False, lambda r, _: _fmt_storage(r),
+                   "Flash storage used/total", "core"),
+        ColumnSpec("mem",      "MEM",      5, True, lambda r, _: _fmt_bytes(r.mem),
+                   "Free memory", "core"),
+        ColumnSpec("uptime",   "UPTIME",   7, True, lambda r, _: _fmt_uptime(r.uptime_ms),
+                   "Uptime since boot", "core"),
+        ColumnSpec("ver",      "VER",      4, True, lambda r, _: r.ver or "-",
+                   "Firmware version", "core"),
+        ColumnSpec("seen",     "SEEN",     6, True, lambda r, now: _fmt_seen(r, now),
+                   "Age of the most recent successful poll", "core"),
+
+        # ── Configuration ─────────────────────────────────────────────────
+        ColumnSpec("brand",     "BRAND",     10, False, lambda r, _: r.brand or "-",
+                   "Brand name (for OEM-rebranded firmware)", "config"),
+        ColumnSpec("patternid", "PATTERN-ID", 22, False,
+                   lambda r, _: r.active_pattern_id or "-",
+                   "Full pattern id (useful for scripting)", "config"),
+        ColumnSpec("ledtype",   "LEDTYPE",    8, False, _fmt_led_type,
+                   "LED type (WS2812, APA102, OutExp, …)", "config"),
+        ColumnSpec("dataspeed", "DATASPEED",  9, True,
+                   lambda r, _: _fmt_hz(r.data_speed),
+                   "LED data rate (Hz)", "config"),
+        ColumnSpec("colororder", "COLORORDER", 10, False, lambda r, _: r.color_order or "-",
+                   "Color order (RGB, GRB, RGBW, …)", "config"),
+        ColumnSpec("maxbright", "MAXBRIGHT",  9, True, _fmt_maxbright,
+                   "Hard brightness ceiling (0-100%)", "config"),
+        ColumnSpec("cpu",       "CPU",        4, True, lambda r, _: r.cpu_speed or "-",
+                   "CPU clock (MHz, v3-only)", "config"),
+        ColumnSpec("powersave", "PWRSAVE",    7, False,
+                   lambda r, _: _fmt_bool(r.power_save, "on", "off"),
+                   "Wi-Fi power-save mode", "config"),
+        ColumnSpec("discovery", "DISCOVERY",  9, False,
+                   lambda r, _: _fmt_bool(r.discovery, "on", "off"),
+                   "Electromage discovery + time sync", "config"),
+        ColumnSpec("timezone",  "TZ",        18, False, lambda r, _: r.timezone or "-",
+                   "Configured timezone", "config"),
+        ColumnSpec("autooff",   "AUTOOFF",   13, False, _fmt_auto_off,
+                   "Auto-off window (or 'off')", "config"),
+        ColumnSpec("simpleui",  "SIMPLEUI",   8, False,
+                   lambda r, _: _fmt_bool(r.simple_ui, "on", "off"),
+                   "Simple UI mode", "config"),
+        ColumnSpec("learning",  "LEARNING",   8, False,
+                   lambda r, _: _fmt_bool(r.learning_ui, "on", "off"),
+                   "Learning UI mode", "config"),
+        ColumnSpec("sensor",    "SENSOR",     9, False, _fmt_sensor,
+                   "Sensor input source (mic/expansion)", "config"),
+
+        # ── Sequencer / playlist ─────────────────────────────────────────
+        ColumnSpec("seqmode",   "SEQMODE",    8, False, _fmt_seq_mode,
+                   "off / shuffle / playlist", "sequencer"),
+        ColumnSpec("seqstate",  "SEQSTATE",   8, False, _fmt_seq_state,
+                   "Sequencer play/pause", "sequencer"),
+        ColumnSpec("shuffle",   "SHUFFLE",    8, True, _fmt_shuffle,
+                   "Per-item shuffle duration", "sequencer"),
+        ColumnSpec("plpos",     "PL#",        7, True, _fmt_playlist_pos,
+                   "Playlist index/total (playlist mode)", "sequencer"),
+        ColumnSpec("plleft",    "PLLEFT",     8, True, _fmt_playlist_left,
+                   "Approx time left in current pattern (playing sequencer)", "sequencer"),
+    ]
+    return {s.key: s for s in specs}
+
+
+COLUMN_SPECS: "dict[str, ColumnSpec]" = _register_columns()
+DEFAULT_COLUMN_KEYS: list[str] = [
+    "status", "name", "ip", "fps", "pattern", "pixels", "bright",
+    "storage", "mem", "uptime", "ver", "seen",
 ]
+
+# Ordered most-likely-to-change-first, so `pb top --all` puts the busy stuff
+# at the left of the table where it's easiest to scan. Identity anchors
+# (status/name/ip) come first only because you need them to read any row;
+# after that, columns cascade from "updates every stats frame" down through
+# "changes when user reconfigures" and finally "essentially static".
+ALL_COLUMN_KEYS: list[str] = [
+    # Anchors — needed to read each row
+    "status", "name", "ip",
+    # Live stats — refreshed on every {"fps":...} frame the PB pushes
+    "fps", "seen", "uptime", "mem",
+    # Pattern / sequencer runtime state — flips on shuffle / playlist / UI
+    "pattern", "plleft", "bright", "plpos", "seqstate", "seqmode", "shuffle",
+    # Slowly-growing / semi-static
+    "storage", "patternid",
+    # LED hardware config (basically only when you reconfigure)
+    "pixels", "ledtype", "colororder", "dataspeed", "maxbright", "cpu",
+    # Firmware / branding
+    "ver", "brand",
+    # Input source + power / UI / scheduling (least dynamic)
+    "sensor", "powersave", "discovery", "autooff", "timezone",
+    "simpleui", "learning",
+]
+# Sanity check at import: any registered column missing from --all is a bug.
+assert set(ALL_COLUMN_KEYS) == set(COLUMN_SPECS), (
+    f"ALL_COLUMN_KEYS out of sync with registry: "
+    f"missing={set(COLUMN_SPECS) - set(ALL_COLUMN_KEYS)}, "
+    f"extra={set(ALL_COLUMN_KEYS) - set(COLUMN_SPECS)}"
+)
+
+
+def _resolve_columns(all_flag: bool, columns_csv: Optional[str]) -> list[ColumnSpec]:
+    """Turn the CLI flags into an ordered list of ColumnSpec.
+    Precedence: --columns > --all > default. Unknown keys raise ClickException."""
+    if columns_csv:
+        keys = [k.strip().lower() for k in columns_csv.split(",") if k.strip()]
+        unknown = [k for k in keys if k not in COLUMN_SPECS]
+        if unknown:
+            raise click.ClickException(
+                f"Unknown column(s): {', '.join(unknown)}. "
+                f"Run `pb top --list-columns` to see available columns."
+            )
+        return [COLUMN_SPECS[k] for k in keys]
+    if all_flag:
+        return [COLUMN_SPECS[k] for k in ALL_COLUMN_KEYS]
+    return [COLUMN_SPECS[k] for k in DEFAULT_COLUMN_KEYS]
+
+
+def _print_column_registry():
+    """Print the column registry to stdout, grouped by section."""
+    groups: "dict[str, list[ColumnSpec]]" = {}
+    for spec in COLUMN_SPECS.values():
+        groups.setdefault(spec.group, []).append(spec)
+    order = ["core", "config", "sequencer"]
+    click.echo("Available columns (use with --columns c1,c2,...  or  --all):")
+    for group in order:
+        specs = groups.get(group, [])
+        if not specs:
+            continue
+        click.echo(f"\n  {group.title()}:")
+        for s in specs:
+            marker = "*" if s.key in DEFAULT_COLUMN_KEYS else " "
+            click.echo(f"    {marker} {s.key:<12} {s.desc}")
+    click.echo("\n  (* = shown by default)")
+    click.echo(
+        "\nNot yet available: preview-frame metrics (e.g. count of lit pixels,"
+        "\n  average color) — would require enabling binary preview frames, which"
+        "\n  adds ~30 KB/s per device to keep those frames streaming. Similarly,"
+        "\n  per-pattern sensor readings (audio bins, accelerometer) live inside"
+        "\n  pattern-exported variables and require an extra RPC per refresh."
+    )
 
 
 def _pad(s: str, width: int, right: bool) -> str:
@@ -414,27 +795,37 @@ def _pad(s: str, width: int, right: bool) -> str:
     return s.rjust(width) if right else s.ljust(width)
 
 
-def _fit_columns(term_width: int) -> list[tuple[str, int, bool]]:
-    """Return the prefix of COLUMNS whose full-width layout fits in
+def _fit_columns(term_width: int, columns: list[ColumnSpec]) -> list[ColumnSpec]:
+    """Return the prefix of `columns` whose full-width layout fits in
     `term_width`. Guarantees we never truncate mid-column, so we never
     show half a value like `1` for a SEEN of `1.2s`."""
     sep_width = 2  # matches "  ".join(...) in _render
-    picked: list[tuple[str, int, bool]] = []
+    picked: list[ColumnSpec] = []
     used = 0
-    for col in COLUMNS:
-        _, w, _ = col
-        add = w + (sep_width if picked else 0)
+    for spec in columns:
+        add = spec.width + (sep_width if picked else 0)
         if used + add > term_width:
             break
-        picked.append(col)
+        picked.append(spec)
         used += add
     # If even the first column can't fit (weirdly narrow terminal), still
     # show something rather than nothing.
-    return picked or [COLUMNS[0]]
+    return picked or [columns[0]]
 
 
 def _render(rows: list[Row], color: bool, sort_key: str,
-            active_only: bool = False) -> str:
+            active_only: bool = False,
+            columns: Optional[list[ColumnSpec]] = None,
+            truncate_to_terminal: bool = True) -> str:
+    """Render rows to a string frame.
+
+    truncate_to_terminal=True (live-tty mode): drop trailing columns that don't
+    fit the current terminal width, so the table never wraps.
+    truncate_to_terminal=False (piped / --once mode): render the full column
+    set at its natural width — `pb top --all | less -S` should show everything.
+    """
+    if columns is None:
+        columns = [COLUMN_SPECS[k] for k in DEFAULT_COLUMN_KEYS]
     now = time.monotonic()
 
     # Health rank: ok=0, stale=1, down=2. Used to pin live devices to the
@@ -470,7 +861,8 @@ def _render(rows: list[Row], color: bool, sort_key: str,
     rows = sorted(rows, key=sort_val)
 
     term_width = shutil.get_terminal_size((120, 40)).columns
-    columns = _fit_columns(term_width)
+    if truncate_to_terminal:
+        columns = _fit_columns(term_width, columns)
     lines = []
     if not rows:
         empty_msg = (
@@ -504,36 +896,15 @@ def _render(rows: list[Row], color: bool, sort_key: str,
     lines.append("")
 
     # Column headers.
-    header = "  ".join(_pad(h, w, r) for h, w, r in columns)
+    header = "  ".join(_pad(spec.header, spec.width, spec.right) for spec in columns)
     lines.append(_c(header, "grey", color))
     lines.append(_c("─" * len(header), "grey", color))
 
     for row in rows:
-        glyph, label, color_name = _health(row, now)
-        status = f"{glyph} {label}"
-        fps = f"{row.fps:.1f}" if row.fps is not None else "-"
-        mem = _fmt_bytes(row.mem)
-        storage = _fmt_storage(row)
-        pattern = row.active_pattern_name or (row.active_pattern_id[:10] if row.active_pattern_id else "-")
-        pixels = str(row.pixel_count) if row.pixel_count is not None else "-"
-        bright = f"{int(row.brightness * 100)}%" if row.brightness is not None else "-"
-        uptime = _fmt_uptime(row.uptime_ms)
-        seen = _fmt_seen(row, now)
-        cells = [
-            status,
-            row.name or "-",
-            row.ip,
-            fps,
-            pattern,
-            pixels,
-            bright,
-            storage,
-            mem,
-            uptime,
-            row.ver or "-",
-            seen,
-        ]
-        line = "  ".join(_pad(c, w, r) for c, (_, w, r) in zip(cells, columns))
+        _, label, color_name = _health(row, now)
+        line = "  ".join(
+            _pad(spec.get(row, now), spec.width, spec.right) for spec in columns
+        )
         # Color the whole row by status color (down = red, stale = yellow, ok = default).
         row_color = None if label == "ok" else color_name
         lines.append(_c(line, row_color, color) + CLEAR_LINE_END)
@@ -577,9 +948,24 @@ def register(cli_group):
                        "Cached devices we've never reached this session are hidden too.")
     @click.option("--no-color", is_flag=True, help="Disable ANSI color output.")
     @click.option("--json", "json_out", is_flag=True,
-                  help="Emit one JSON snapshot to stdout and exit (with --once).")
+                  help="Emit JSON to stdout instead of the terminal table. "
+                       "Without --once, streams one JSON array-of-rows per "
+                       "--interval tick (ndjson-style, ideal for `| jq -c`). "
+                       "With --once, emits a single snapshot and exits. "
+                       "JSON always includes every field, regardless of "
+                       "--columns / --all (those only affect the text table).")
+    @click.option("--all", "all_columns", is_flag=True,
+                  help="Show every registered column, ordered by how dynamic "
+                       "each field is (busy stuff on the left). Overridden by "
+                       "--columns if that is also given.")
+    @click.option("--columns", "columns_csv", type=str, default=None,
+                  help="Comma-separated column keys to render, in order "
+                       "(e.g. `--columns name,ip,fps,seqmode,plleft`). "
+                       "Run `pb top --list-columns` to see all keys.")
+    @click.option("--list-columns", "list_columns", is_flag=True,
+                  help="Print available columns and exit.")
     def top(interval, once, rediscover, scan_timeout, sort_key, active_only,
-            no_color, json_out):
+            no_color, json_out, all_columns, columns_csv, list_columns):
         """
         Realtime dashboard of every Pixelblaze on the network.
 
@@ -595,57 +981,80 @@ def register(cli_group):
 
         \b
         Examples:
-            pb top                        # Live dashboard, redraws every 1s
-            pb top -n 0.5                 # Faster redraw
-            pb top --sort fps             # Sort by frames-per-second
-            pb top --once                 # One snapshot, exit
-            pb top --once --json          # Machine-readable snapshot
-            pb top -r 10                  # Rediscover every 10s (default 30)
-            pb top --active               # Hide `down` rows (only live devices)
+            pb top                                    # Live dashboard, 1s redraw
+            pb top -n 0.5                             # Faster redraw
+            pb top --sort fps                         # Sort by frames-per-second
+            pb top --once                             # One snapshot, exit
+            pb top --once --json                      # One JSON snapshot, exit
+            pb top --json | jq -c '.[] | .name'       # Stream JSON per tick
+            pb top --json -n 5                        # Stream JSON every 5s
+            pb top -r 10                              # Rediscover every 10s
+            pb top --active                           # Hide `down` rows
+            pb top --all                              # Every column, busy first
+            pb top --all | less -S                    # Wide dump, one screen
+            pb top --columns name,ip,fps,seqmode,plleft
+            pb top --list-columns                     # Show the column registry
         """
-        color = sys.stdout.isatty() and not no_color
+        if list_columns:
+            _print_column_registry()
+            return
+
+        columns = _resolve_columns(all_columns, columns_csv)
+        is_tty = sys.stdout.isatty()
+        color = is_tty and not no_color
+
+        # UX guard: `pb top --all | less` should give ONE full-width dump and
+        # exit, not a stream of CLEAR_HOME frames that less can't scroll. When
+        # stdout isn't a terminal and the user didn't already ask for --json
+        # or --once, treat it as a one-shot snapshot.
+        if not is_tty and not json_out and not once:
+            once = True
+
+        def _wait_for_first_stats(monitor: TopMonitor, budget_s: float):
+            """Block up to `budget_s` for every seeded row to produce a stats
+            frame. Uses fps-is-not-None (real stats push) as the settle signal
+            — not `last_seen`, because that's now set on WS-connect too and
+            would return immediately with an empty stats block."""
+            deadline = time.monotonic() + budget_s
+            while time.monotonic() < deadline:
+                snap = monitor.snapshot()
+                if snap and all(r.fps is not None for r in snap):
+                    return
+                time.sleep(0.1)
+
+        def _filter_active(snap: list[Row]) -> list[Row]:
+            if not active_only:
+                return snap
+            _now = time.monotonic()
+            return [r for r in snap if _health(r, _now)[1] != "down"]
 
         if once:
-            # One-shot mode: run a blocking discovery so the exit snapshot
-            # actually reflects the current LAN, not just whatever we cached.
+            # One-shot: blocking discovery so the exit snapshot reflects the
+            # current LAN, not just cached IPs.
             log("Discovering Pixelblazes…")
             initial = enumerate_pixelblazes(timeout=scan_timeout, slow=False)
             if not initial:
                 raise click.ClickException("No Pixelblazes found on the network.")
             monitor = TopMonitor(initial, rediscover_seconds=rediscover)
-
-            # Config fetch takes a beat, then stats stream at ~1 Hz — give
-            # every worker enough headroom to publish at least one frame.
-            deadline = time.monotonic() + 6.0
-            while time.monotonic() < deadline:
-                if all(r.last_seen for r in monitor.snapshot()):
-                    break
-                time.sleep(0.1)
-            snap = monitor.snapshot()
+            _wait_for_first_stats(monitor, budget_s=6.0)
+            snap = _filter_active(monitor.snapshot())
             monitor.stop()
-            if active_only:
-                # Match the render-side filter so --once --json --active
-                # emits only the responding devices.
-                _now = time.monotonic()
-                snap = [r for r in snap if _health(r, _now)[1] != "down"]
             if json_out:
                 click.echo(json.dumps([_row_to_dict(r) for r in snap], separators=(",", ":")))
             else:
-                # active filter is already applied above; don't re-filter in _render.
-                click.echo(_render(snap, color=color, sort_key=sort_key))
+                # No column truncation when piped / one-shot — the user
+                # explicitly asked for what they asked for.
+                click.echo(_render(snap, color=color, sort_key=sort_key,
+                                    columns=columns, truncate_to_terminal=is_tty))
             return
 
-        # Live mode: don't block on discovery. Seed from the on-disk device
-        # cache so the table draws instantly with whatever we last knew,
-        # then let the rediscovery thread find/update everything else in
-        # the background. New devices appear as rows the moment their
-        # worker connects; devices that have moved IPs light up on the
-        # next rediscovery cycle.
+        # Live mode: seed from on-disk cache so the table (or JSON) draws
+        # instantly, then let the rediscovery thread find/update everything
+        # else in the background.
         cached = _read_cache().get("devices", {}) or {}
         seed = list(cached.values())
         monitor = TopMonitor(seed, rediscover_seconds=rediscover)
 
-        # Rediscovery thread — runs its first sweep immediately.
         threading.Thread(
             target=monitor.rediscover_loop, args=(scan_timeout,),
             daemon=True, name="pb-top-rediscover",
@@ -661,6 +1070,22 @@ def register(cli_group):
         signal.signal(signal.SIGINT, handle_signal)
         signal.signal(signal.SIGTERM, handle_signal)
 
+        if json_out:
+            # Streaming JSON: one array-per-tick, ndjson-style. No terminal
+            # escape codes, no cursor hiding — this stream is meant to be
+            # consumed by `jq`, not eyeballed.
+            try:
+                while not stop_flag["stop"]:
+                    snap = _filter_active(monitor.snapshot())
+                    click.echo(json.dumps([_row_to_dict(r) for r in snap],
+                                          separators=(",", ":")))
+                    sys.stdout.flush()
+                    time.sleep(interval)
+            finally:
+                monitor.stop()
+            return
+
+        # Live TTY render loop.
         if color:
             sys.stdout.write(HIDE_CURSOR)
             sys.stdout.flush()
@@ -668,7 +1093,7 @@ def register(cli_group):
         try:
             while not stop_flag["stop"]:
                 frame = _render(monitor.snapshot(), color=color, sort_key=sort_key,
-                                active_only=active_only)
+                                active_only=active_only, columns=columns)
                 sys.stdout.write(CLEAR_HOME + frame)
                 sys.stdout.flush()
                 time.sleep(interval)
@@ -698,4 +1123,25 @@ def _row_to_dict(r: Row) -> dict:
         "lastSeenMonotonic": r.last_seen,
         "connected": r.connected,
         "error": r.error,
+        # Extended fields (populated once _refresh_config has run at least once).
+        "brandName": r.brand,
+        "ledType": r.led_type,
+        "dataSpeed": r.data_speed,
+        "colorOrder": r.color_order,
+        "maxBrightness": r.max_brightness,
+        "cpuSpeed": r.cpu_speed,
+        "networkPowerSave": r.power_save,
+        "discoveryEnable": r.discovery,
+        "timezone": r.timezone,
+        "autoOffEnable": r.auto_off_enable,
+        "autoOffStart": r.auto_off_start,
+        "autoOffEnd": r.auto_off_end,
+        "simpleUiMode": r.simple_ui,
+        "learningUiMode": r.learning_ui,
+        "sensorInputSource": r.sensor_input,
+        "sequencerMode": r.seq_mode,
+        "sequencerState": r.seq_state,
+        "sequencerShuffleMs": r.seq_shuffle_ms,
+        "playlistIndex": r.plist_index,
+        "playlistSize": r.plist_size,
     }
