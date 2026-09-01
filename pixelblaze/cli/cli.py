@@ -2152,6 +2152,147 @@ def cache_refresh(query, all_devices, conn_timeout):
 _register_top(pixelblaze)
 
 
+## ─── Sensor (virtual sensor board sources) ────────────────────────────────────
+
+@pixelblaze.group()
+def sensor():
+    """
+    Push sensor data into pattern globals from host-side sources.
+
+    Feeds the same variables a physical Pixelblaze Sensor Expansion Board
+    would emit (frequencyData, energyAverage, maxFrequency, ...), so
+    sound-reactive patterns work with no SB attached.
+    """
+    pass
+
+
+_SENSOR_PREF_MAP = {'remote': 0, 'local': 1}
+_SENSOR_PREF_NAMES = {0: 'Prefer Remote', 1: 'Prefer Local'}
+
+@cli(sensor, name='sources')
+@click.option('--prefer', 'preference',
+              type=click.Choice(['remote', 'local'], case_sensitive=False),
+              help='Set source preference (remote = OTA/bridge, local = onboard/SB)')
+@click.option('--type', 'sensor_type', multiple=True,
+              type=click.Choice(['accel', 'light', 'sound', 'analog'], case_sensitive=False),
+              help='Sensor type(s) to set (default: all four). Can be repeated.')
+@no_save_option
+def sensor_sources(pb: Pixelblaze, preference, sensor_type, no_save):
+    """
+    View or set sensor input source preferences (accelSrc/lightSrc/soundSrc/analogSrc).
+
+    Two values: 0 = "Prefer Remote" (OTA/bridge data), 1 = "Prefer Local"
+    (onboard mic or Sensor Expansion Board). The firmware falls back to the
+    other source if the preferred one isn't reporting.
+
+    \b
+    Examples:
+        pb sensor sources                                # Show all preferences
+        pb sensor sources --prefer remote                # Set ALL to prefer remote
+        pb sensor sources --prefer local --type sound    # Only audio → local
+        pb sensor sources --prefer remote --type accel --type light
+    """
+    if preference is None:
+        s = pb.getSensorSources()
+        log("Sensor source preferences:")
+        for k, label in [('accel', 'Accelerometer'), ('light', 'Light        '),
+                         ('sound', 'Audio/Sound  '), ('analog', 'Analog       ')]:
+            log(f"  {label}: {_SENSOR_PREF_NAMES.get(s[k], '?')} ({s[k]})")
+        return
+
+    value = _SENSOR_PREF_MAP[preference.lower()]
+    types = [t.lower() for t in sensor_type] if sensor_type else ['accel', 'light', 'sound', 'analog']
+    pb.setSensorSources(**{t: value for t in types}, saveToFlash=not no_save)
+
+    action = "saved" if not no_save else "set (temporary)"
+    log(f"✓ {', '.join(types)} → prefer {preference} ({action})")
+
+
+@cli(sensor)
+@click.option('--device', '-d', default='blackhole',
+              help='Audio input device name substring (default: blackhole)')
+@click.option('--fps', type=int, default=30,
+              help='How often to push data to PB (default: 30)')
+@click.option('--sample-rate', '-r', type=int, default=None,
+              help='Sample rate in Hz (default: device native)')
+@click.option('--block-size', '-b', type=int, default=1024,
+              help='FFT block size in samples (default: 1024)')
+@click.option('--gain', '-g', type=float, default=1.0,
+              help='Linear gain multiplier for spectrum (default: 1.0)')
+@click.option('--noise-gate', type=float, default=0.0,
+              help='Zero out spectrum values below this threshold (default: 0, off)')
+@click.option('--log', 'log_scale', is_flag=True,
+              help='Apply log scaling to compress dynamic range')
+@click.option('--agc', is_flag=True,
+              help='Auto-gain control: adapts gain so peaks stay consistent')
+@click.option('--list-devices', '-l', is_flag=True,
+              help='List available audio input devices and exit')
+def sound(pb: Pixelblaze, device, fps, sample_rate, block_size,
+          gain, noise_gate, log_scale, agc, list_devices):
+    """
+    Stream audio FFT to the Pixelblaze as sensor-board-shaped vars.
+
+    Captures audio from a system device (mic, loopback, etc.), computes
+    32 frequency bins matching the PB Sensor Board format, and pushes
+    frequencyData, energyAverage, maxFrequency, maxFrequencyMagnitude
+    as pattern variables via setVars.
+
+    Requires `sounddevice` and `numpy` on the host. On macOS you'll typically
+    also want BlackHole (https://existential.audio/blackhole/) to loopback
+    system audio into an input device.
+
+    \b
+    Scaling options:
+        --gain 10           Boost quiet sources (mic, quiet music)
+        --gain 0.1          Tame hot sources (direct line-in)
+        --log               Compress dynamic range (loud/quiet more even)
+        --agc               Auto-adjusts gain to keep peaks consistent
+        --noise-gate 0.001  Kill low-level noise floor
+
+    \b
+    Examples:
+        pb sensor sound                          # Stream from BlackHole
+        pb sensor sound -d "MacBook"             # Stream from built-in mic
+        pb sensor sound --agc                    # Auto-gain (adapts to volume)
+        pb sensor sound -g 20 --log              # Boost + compress for mic
+        pb sensor sound --fps 60                 # Push at 60Hz
+        pb sensor sound -l                       # List input devices
+    """
+    from pixelblaze.cli.sensor_bridge import find_device, SoundBridge
+
+    if list_devices:
+        import sounddevice as sd
+        for i, dev in enumerate(sd.query_devices()):
+            if dev['max_input_channels'] > 0:
+                marker = " ←" if device.lower() in dev['name'].lower() else ""
+                log(f"  [{i}] {dev['name']} "
+                    f"(ch={dev['max_input_channels']}, "
+                    f"rate={int(dev['default_samplerate'])}){marker}")
+        return
+
+    log(f"Looking for audio device matching '{device}'...")
+    dev_idx, dev_info = find_device(device)
+    sr = sample_rate or int(dev_info['default_samplerate'])
+
+    scaling = []
+    if gain != 1.0: scaling.append(f"gain={gain}x")
+    if noise_gate > 0: scaling.append(f"gate={noise_gate}")
+    if log_scale: scaling.append("log")
+    if agc: scaling.append("agc")
+
+    log(f"Device: {dev_info['name']}")
+    log(f"  Sample rate: {sr} Hz, Block: {block_size}, FPS: {fps}")
+    if scaling:
+        log(f"  Scaling: {', '.join(scaling)}")
+    log(f"  Press Ctrl+C to stop\n")
+
+    bridge = SoundBridge(pb, dev_idx, sr, block_size, fps,
+                         gain=gain, noise_gate=noise_gate,
+                         log_scale=log_scale, agc=agc)
+    bridge.run()
+    log("\nStopped. Sensor sentinels reset.")
+
+
 def main():
     """Entry point for the CLI."""
     pixelblaze(obj={})
