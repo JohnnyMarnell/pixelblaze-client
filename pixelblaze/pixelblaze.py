@@ -1758,8 +1758,13 @@ class Pixelblaze:
         if mapData is None: mapData = self.getMapData()
 
         # If no map has been defined, generate and return a 1D map with the pixels spaced at regular intervals.
+        def _synthetic_1d():
+            if pixelCount <= 1:
+                return [[0.0] * pixelCount]
+            return [list(pixel / (pixelCount - 1) for pixel in range(pixelCount))]
+
         if mapData is None:
-            return [list((pixel / (pixelCount - 1)) for pixel in range(pixelCount))]
+            return _synthetic_1d()
 
         # Parse the mapData to build the worldMap.
         headerSize = 3 * 4  # first 3 longwords are the header.
@@ -1767,6 +1772,9 @@ class Pixelblaze:
         fileVersion = offsets[0]
         numDimensions = offsets[1]
         dataSize = offsets[2]
+        # A cleared map has numDimensions=0/dataSize=0 — treat as no map.
+        if numDimensions == 0 or dataSize == 0:
+            return _synthetic_1d()
         wordSize = fileVersion * 1  # v1 uses uint8, v2 uses uint16
         numElements = dataSize // wordSize // numDimensions
         # If the number of elements in the worldMap doesn't match the pixelCount, it's stale and needs to be refreshed.

@@ -292,15 +292,18 @@ def map(pb: Pixelblaze, input, csv, clear):
         # Confirmed working via ack + renderType telemetry:
         #   1. putPixelMap with a zero-dim header ([formatVersion, 0, 0]
         #      and no payload) — device acks, RAM map dropped.
-        #   2. savePixelMap:true — persists that empty header to
-        #      /pixelmap.dat so a reboot boots mapless.
-        #   3. deleteFile /pixelmap.txt so `pb map` reports fn: null.
+        #   2. savePixelMap:true — flushes the empty state so no
+        #      pending save can re-materialize the old map.
+        #   3. deleteFile /pixelmap.txt AND /pixelmap.dat so a future
+        #      reboot boots genuinely mapless (not with a 12-byte
+        #      empty-header stub) and `pb map` reports fn: null.
         # After this, status.renderType flips to 1 (device dispatches
         # to render(), not render2D/render3D).
         log("Clearing pixel map...")
         format_version = pb.getVersionMajor() - 1  # v3 -> 2, v2 -> 1
         pb.setMapData(struct.pack('<III', format_version, 0, 0), saveToFlash=True)
         pb.deleteFile('/pixelmap.txt')
+        pb.deleteFile('/pixelmap.dat')
         try:
             stats = pb.getStatistics()
             log(f"Pixel map cleared (renderType={stats.get('renderType')}, "
