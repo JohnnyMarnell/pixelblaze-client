@@ -2,22 +2,6 @@
 # pb — Pixelblaze CLI cookbook: every subcommand, the powerful stuff first.
 # A file to copy from, not to run. More: `pb <cmd> --help`, pixelblaze/cli/{cli,test_cli}.py
 
-# ─── targeting a device ───────────────────────────────────────────────────────
-pb pixels                                    # no --ip: auto (192.168.4.1 ad-hoc, then LAN scan)
-pb --ip 192.168.1.100 pixels                 # exact IP (fastest)
-pb --ip http://192.168.1.100/ pixels         # URL pasted straight from the browser
-pb --ip 100 pixels                           # bare host octet → .100 on this subnet
-pb --ip kitch pixels                         # cached device-name fragment (3+ chars)
-
-# ─── top: realtime fleet dashboard ────────────────────────────────────────────
-pb top                                       # live table of every PB on the LAN; down rows go red
-pb top --sort fps -n 0.25                    # sort by FPS, redraw 4×/sec
-pb top --active -r 10                        # hide down rows, rediscover every 10s
-pb top --all | less -S                       # every column, busiest first
-pb top --columns name,ip,fps,seqmode,plleft  # hand-picked columns (--list-columns for keys)
-pb top --once --json | jq .                  # one snapshot, exit — cron / dashboards
-pb top --json -n 5 | jq -c '.[].name'        # stream a JSON array every 5s
-
 # ─── pattern: live-code the LEDs ──────────────────────────────────────────────
 pb pattern "hsv(0.5, 1, 1)"                  # inline code renders immediately (nothing saved)
 pb pattern "hsv(index / pixelCount + time(0.1), 1, 1)"   # rainbow wave one-liner
@@ -32,6 +16,18 @@ pb pattern "Bad Pattern" --rm                # delete it
 pb cat                                       # active pattern's source (comments stripped)
 pb cat sparkle --one                         # first pattern matching "sparkle"
 pb cat "glitch bank" --exact --full          # exact name, raw unstripped source
+
+# ─── top + ws: fleet dashboard & raw websocket ────────────────────────────────
+pb top                                       # live table of every PB on the LAN; down rows go red
+pb top --sort fps -n 0.25                    # sort by FPS, redraw 4×/sec
+pb top --active -r 10                        # hide down rows, rediscover every 10s
+pb top --all | less -S                       # every column, busiest first
+pb top --columns name,ip,fps,seqmode,plleft  # hand-picked columns (--list-columns for keys)
+pb top --once --json | jq .                  # one snapshot, exit — cron / dashboards
+pb top --json -n 5 | jq -c '.[].name'        # stream a JSON array every 5s
+pb ws '{getConfig: true}'                    # arbitrary JSON, loose JSON5 keys fine
+pb ws '{brightness: 0.1}' --expect stats     # wait for a specific response key
+pb ws '{sendUpdates: false, listPrograms: true, getPeers: 1}' | jq .
 
 # ─── sensor: sound-reactive with no hardware ──────────────────────────────────
 pb sensor sound                              # stream host audio FFT as sensor-board vars
@@ -67,6 +63,13 @@ pb restore backup.pbb --keep-config          # patterns + playlists only
 pb update ~/Downloads/v3.70.pb32.stfu        # flash firmware: chunked upload, live progress
 pb --ip 192.168.4.1 update fw.stfu --no-monitor   # SoftAP recovery, fire and wait
 
+# ─── targeting a device ───────────────────────────────────────────────────────
+pb pixels                                    # no --ip: auto (192.168.4.1 ad-hoc, then LAN scan)
+pb --ip 192.168.1.100 pixels                 # exact IP (fastest)
+pb --ip http://192.168.1.100/ pixels         # URL pasted straight from the browser
+pb --ip 100 pixels                           # bare host octet → .100 on this subnet
+pb --ip kitch pixels                         # cached device-name fragment (3+ chars)
+
 # ─── discovery, latency, cache ────────────────────────────────────────────────
 pb find                                      # fast: beacon IPs as JSONL (first hit → cached)
 pb find --full                               # connect to each: names, versions, pixel counts
@@ -82,6 +85,7 @@ pb on                                        # full brightness (saved to flash)
 pb on 0.5 --no-save                          # 50%, temporary
 pb on --play-sequencer                       # …and start the sequencer
 pb off --pause-sequencer                     # dark + halt pattern changes
+pb reboot --wait                             # bounce it, block until it's back
 pb pixels                                    # read pixel count
 pb pixels 300 --no-save                      # set it (drop --no-save to persist)
 pb cfg                                       # full config JSON (| yq -P for color)
@@ -102,8 +106,12 @@ pb map --clear                               # remove the map
 pb ls                                        # everything on the flash FS
 pb ls | jq '.[]' -crM | grep '\.c$'          # just pattern-control files
 pb cat /config.json                          # print any file (also /pixelmap.txt etc.)
+pb cp /config.json                           # download → ./config.json
+pb cp /config.json backup_config.json        # download to an explicit local path
+pb cp /p/abc123 patterns/                    # download a pattern into a directory
 pb cp /index.html.gz bak.index.html.gz       # download (stock web UI backup!)
 pb cp config.json --write                    # upload as /config.json
+pb cp mymap.txt --write /pixelmap.txt        # upload to an explicit device path
 cat custom.html | gzip | pb cp /index.html.gz --write   # pipe binary via stdin
 pb rm /data.json abc123456789012             # files and/or patterns (bare ID → /p/<id>)
 
@@ -114,9 +122,3 @@ pb wifi join -s "MyNet" -p "secret"          # become a client
 pb wifi ap -s "MyPB" -p "secret"             # become an access point
 pb wifi setup                                # back to Pixelblaze_* setup mode
 pb wifi peers                                # sync group incl. self (*) — followers don't beacon
-
-# ─── raw websocket, reboot ────────────────────────────────────────────────────
-pb ws '{getConfig: true}'                    # arbitrary JSON, loose JSON5 keys fine
-pb ws '{brightness: 0.1}' --expect stats     # wait for a specific response key
-pb ws '{sendUpdates: false, listPrograms: true, getPeers: 1}' | jq .
-pb reboot --wait                             # bounce it, block until it's back
