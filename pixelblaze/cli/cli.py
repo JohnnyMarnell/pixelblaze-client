@@ -23,6 +23,7 @@ flexible discovery, pattern rendering, and configuration management.
 import csv as csvlib
 import io
 import json as jsonlib
+import struct
 import time
 import re
 import click
@@ -288,10 +289,24 @@ def map(pb: Pixelblaze, input, csv, clear):
     check(not (clear and csv), "Cannot use --clear and --csv together")
 
     if clear:
+        # Confirmed working via ack + renderType telemetry:
+        #   1. putPixelMap with a zero-dim header ([formatVersion, 0, 0]
+        #      and no payload) — device acks, RAM map dropped.
+        #   2. savePixelMap:true — persists that empty header to
+        #      /pixelmap.dat so a reboot boots mapless.
+        #   3. deleteFile /pixelmap.txt so `pb map` reports fn: null.
+        # After this, status.renderType flips to 1 (device dispatches
+        # to render(), not render2D/render3D).
         log("Clearing pixel map...")
+        format_version = pb.getVersionMajor() - 1  # v3 -> 2, v2 -> 1
+        pb.setMapData(struct.pack('<III', format_version, 0, 0), saveToFlash=True)
         pb.deleteFile('/pixelmap.txt')
-        pb.deleteFile('/pixelmap.dat')
-        log("Pixel map cleared")
+        try:
+            stats = pb.getStatistics()
+            log(f"Pixel map cleared (renderType={stats.get('renderType')}, "
+                f"1=render/1D, 2=render2D, 3=render3D)")
+        except Exception:
+            log("Pixel map cleared")
         return
 
     content, _ = read_input(input, "map", required=False)
@@ -312,9 +327,12 @@ def map(pb: Pixelblaze, input, csv, clear):
     elif csv:
         log(f"Fetching map coordinates as CSV...")
         coords = pb.getMapCoordinates()
-        click.echo("index,x,y,z")
-        for i in range(0, len(coords[0])):
-            click.echo(f"{i},{coords[0][i]},{coords[1][i]},{coords[2][i]}")
+        num_dims = len(coords)
+        num_pixels = len(coords[0]) if num_dims else 0
+        dim_names = ['x', 'y', 'z'][:num_dims]
+        click.echo("index," + ",".join(dim_names))
+        for i in range(num_pixels):
+            click.echo(f"{i}," + ",".join(str(coords[d][i]) for d in range(num_dims)))
     else:
         log(f"Fetching map config...")
         jsons({'coordinates': pb.getMapCoordinates(), 'fn': pb.getMapFunction()})
