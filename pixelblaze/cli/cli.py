@@ -40,7 +40,10 @@ from pixelblaze.cli.top import register as _register_top
 @click.option(
     '--ip',
     default='auto',
-    help='IP address of Pixelblaze (default: auto discover mode, checks 192.168.4.1 first for Ad Hoc, then network scan)',
+    help='Pixelblaze address. Accepts a plain IP (192.168.1.230), a URL pasted from '
+         'a browser (http://192.168.1.230/), a bare host number on this subnet (230), '
+         'or a cached device name fragment of 3+ chars (kitch). Default "auto" '
+         'discovers: checks 192.168.4.1 for Ad Hoc, then scans the network.',
     show_default=True
 )
 @click.option(
@@ -63,6 +66,13 @@ def pixelblaze(ctx, ip, timeout, retries):
     Pixelblaze LED Controller CLI
 
     Control Pixelblaze devices from the command line.
+
+    \b
+    --ip is flexible:
+        pb --ip 192.168.1.230 pixels      # exact address (fastest)
+        pb --ip http://192.168.1.230/ ... # pasted from the browser
+        pb --ip 230 pixels                # .230 on this machine's subnet
+        pb --ip kitch pixels              # cached device name fragment
     """
     ctx.ensure_object(dict)
     ctx.obj['ip'] = ip

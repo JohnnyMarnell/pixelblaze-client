@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 import socket
@@ -35,6 +36,20 @@ def get_cache_dir():
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
+
+
+# A dotted quad, shape-checked here and range-checked in is_ipv4().
+_IPV4_RE = re.compile(r'^(?:\d{1,3}\.){3}\d{1,3}$')
+
+# Host portion of a URL pasted out of a browser's address bar.
+_URL_HOST_RE = re.compile(r'^https?://([^/?#]*)', re.IGNORECASE)
+
+
+def is_ipv4(value: str) -> bool:
+    """True if value is a well-formed dotted-quad IPv4 address."""
+    if not value or not _IPV4_RE.match(value):
+        return False
+    return all(int(octet) <= 255 for octet in value.split('.'))
 
 
 def get_host_ip() -> str:
@@ -371,25 +386,147 @@ def enumerate_pixelblazes(
     return devices
 
 
+# Shortest name fragment accepted by resolve_ip_spec() — below this a query is
+# too likely to sweep in unrelated devices.
+MIN_NAME_QUERY_LEN = 3
+
+
+def _resolve_subnet_octet(octet: int) -> str:
+    """Expand a bare host octet into a full address on the local /24 subnet."""
+    host_ip = get_host_ip()
+    if not is_ipv4(host_ip):
+        raise click.ClickException(
+            f"Cannot expand --ip '{octet}': failed to determine this machine's subnet. "
+            f"Pass the full address instead."
+        )
+    return '.'.join(host_ip.split('.')[:3] + [str(octet)])
+
+
+def _resolve_cached_name(query: str) -> Optional[str]:
+    """Find a cached device IP by case-insensitive name match.
+
+    An exact (case-insensitive) name wins outright; otherwise the query must
+    hit exactly one device as a substring. Returns None when nothing matches,
+    so callers can report why the whole --ip value failed to resolve.
+    """
+    devices = _read_cache().get('devices', {})
+    q = query.lower()
+
+    def _fail_ambiguous(matches):
+        names = ', '.join(f"{e.get('name', '?')} ({ip})" for ip, e in matches)
+        raise click.ClickException(
+            f"Ambiguous --ip '{query}': matches {names}. Use a longer fragment or the IP."
+        )
+
+    exact = [(ip, e) for ip, e in devices.items() if (e.get('name') or '').lower() == q]
+    if len(exact) == 1:
+        return exact[0][0]
+    if len(exact) > 1:
+        _fail_ambiguous(exact)
+
+    matches = [(ip, e) for ip, e in devices.items() if q in (e.get('name') or '').lower()]
+    if len(matches) == 1:
+        return matches[0][0]
+    if len(matches) > 1:
+        _fail_ambiguous(matches)
+    return None
+
+
+def resolve_ip_spec(spec: Optional[str]) -> Optional[str]:
+    """Resolve a flexible --ip value into a concrete address.
+
+    Accepted forms, tried in this order:
+
+        (none) / '' / 'auto'      -> None; the caller falls back to discovery
+        '192.168.1.230'           -> used as-is (fast path, no cache or network)
+        'http://192.168.1.230/'   -> the host from a URL pasted out of a browser
+        '230'                     -> that host octet on this machine's /24 subnet
+        'kitch'                   -> case-insensitive name fragment (>= 3 chars)
+                                     looked up against cached devices
+
+    Args:
+        spec: The raw --ip value.
+
+    Returns:
+        Optional[str]: A concrete address, or None to mean "auto discover".
+
+    Raises:
+        click.ClickException: If the value looks like one of the supported
+            forms but cannot be resolved (unknown name, ambiguous fragment,
+            undeterminable subnet, etc).
+    """
+    if spec is None:
+        return None
+    spec = spec.strip()
+    if not spec or spec.lower() == 'auto':
+        return None
+
+    # Exact IP — the common case, resolved without touching the cache.
+    if is_ipv4(spec):
+        return spec
+    if _IPV4_RE.match(spec):
+        raise click.ClickException(f"--ip '{spec}' is not a valid IP: each octet must be 0-255.")
+
+    # A URL copied from a browser: http(s)://[user@]host[:port]/path?query
+    url_match = _URL_HOST_RE.match(spec)
+    if url_match:
+        host = url_match.group(1).rsplit('@', 1)[-1].split(':', 1)[0]
+        if not host:
+            raise click.ClickException(f"No host found in --ip URL '{spec}'.")
+        log(f"--ip '{spec}' -> {host} (from URL)")
+        return host
+
+    # A bare host number: fill in this machine's subnet around it.
+    if spec.isdigit():
+        if int(spec) > 255:
+            raise click.ClickException(
+                f"--ip '{spec}' is out of range: a bare host number must be 0-255."
+            )
+        resolved = _resolve_subnet_octet(int(spec))
+        log(f"--ip '{spec}' -> {resolved} (local subnet)")
+        return resolved
+
+    # Otherwise treat it as a device name fragment and consult the cache.
+    if len(spec) < MIN_NAME_QUERY_LEN:
+        raise click.ClickException(
+            f"--ip '{spec}' is not an IP, and name matching needs at least "
+            f"{MIN_NAME_QUERY_LEN} characters."
+        )
+
+    resolved = _resolve_cached_name(spec)
+    if resolved:
+        name = _read_cache().get('devices', {}).get(resolved, {}).get('name', '')
+        log(f"--ip '{spec}' -> {resolved}" + (f" ({name})" if name else "") + " (cached name)")
+        return resolved
+
+    raise click.ClickException(
+        f"Could not resolve --ip '{spec}': not an IP address, and no cached device "
+        f"name matches it. Run `pb find --full` to refresh the cache, or `pb cache ls` "
+        f"to see what is known."
+    )
+
+
 def discover_pixelblaze(ctx: click.Context) -> str:
     """
     Discovers a Pixelblaze IP address using the specified strategy.
 
-    Uses cached IP, ad-hoc check, then beacon enumeration. Returns the
-    first reachable IP and caches it.
+    An explicit --ip is resolved through resolve_ip_spec(), so it may be a
+    plain address, a browser URL, a bare host octet, or a cached device name
+    fragment. Otherwise falls back to cached IP, ad-hoc check, then beacon
+    enumeration, returning the first reachable IP and caching it.
 
     Args:
-        ctx: Click context containing IP address in ctx.obj['ip']
+        ctx: Click context containing the --ip value in ctx.obj['ip']
 
     Returns:
         str: The discovered or specified IP address
 
     Raises:
-        click.ClickException: If no Pixelblaze can be found
+        click.ClickException: If --ip cannot be resolved or no Pixelblaze is found
     """
-    ip_address = ctx.obj.get('ip', 'auto')
+    ip_address = resolve_ip_spec(ctx.obj.get('ip', 'auto'))
 
-    if ip_address and ip_address != "auto":
+    if ip_address:
         cache_ip(ip_address)  # Cache explicitly provided IP
         return ip_address
 

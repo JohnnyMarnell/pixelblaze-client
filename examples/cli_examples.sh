@@ -16,6 +16,11 @@ pb pixels
 # Use specific IP address
 pb --ip 192.168.1.100 pixels
 
+# --ip is flexible — these all reach the same device
+pb --ip http://192.168.1.100/       pixels   # pasted from a browser address bar
+pb --ip 100                         pixels   # bare host number on this machine's subnet
+pb --ip kitch                       pixels   # 3+ char name fragment, resolved from cache
+
 # Check connection latency
 pb ping
 
