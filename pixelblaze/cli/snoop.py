@@ -57,11 +57,24 @@ _INSTALL_HINTS = {
         'jq': ("sudo apt install jq                 # Debian/Ubuntu",
                "sudo dnf install jq                 # Fedora/RHEL"),
     },
+    'win32': {
+        'tshark': ("choco install wireshark             # Chocolatey",
+                   "winget install WiresharkFoundation.Wireshark",
+                   "scoop install wireshark",
+                   "",
+                   "The installer may not put tshark on PATH; it lives in",
+                   r"C:\Program Files\Wireshark\tshark.exe"),
+        'jq': ("choco install jq                    # Chocolatey",
+               "winget install jqlang.jq",
+               "scoop install jq"),
+    },
 }
 
 
 def _platform_key() -> str:
-    return 'darwin' if sys.platform == 'darwin' else 'linux'
+    if sys.platform == 'darwin':
+        return 'darwin'
+    return 'win32' if sys.platform == 'win32' else 'linux'
 
 
 def _require(tool: str) -> str:
@@ -102,6 +115,11 @@ _PERMISSION_FIX = {
         "sudo usermod -aG wireshark $USER         # then log out and back in",
         "sudo setcap cap_net_raw,cap_net_admin+eip $(which dumpcap)",
         "pb snoop --sudo                          # or just run tshark under sudo",
+    ),
+    'win32': (
+        "Install Npcap (bundled with Wireshark): choco install wireshark",
+        "If Npcap was installed with 'Restrict to Administrators', re-run",
+        "  pb snoop from an elevated terminal (--sudo does nothing on Windows).",
     ),
 }
 
@@ -365,6 +383,11 @@ def _restore_sigpipe():
     """
     if hasattr(signal, 'SIGPIPE'):
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+
+# subprocess rejects preexec_fn outright on Windows, and there is no SIGPIPE
+# there to restore anyway, so the hook has to be dropped rather than no-opped.
+_POPEN_HOOK = {} if sys.platform == 'win32' else {'preexec_fn': _restore_sigpipe}
 
 
 def _stop(proc: subprocess.Popen, grace: float = 3.0):
@@ -639,13 +662,12 @@ def register(cli_group):
 
         try:
             capture = subprocess.Popen(tshark_cmd, stdout=subprocess.PIPE,
-                                       preexec_fn=_restore_sigpipe)
+                                       **_POPEN_HOOK)
         except OSError as e:
             raise click.ClickException(f"Could not start tshark: {e}")
 
         try:
-            render = subprocess.Popen(jq_cmd, stdin=capture.stdout,
-                                      preexec_fn=_restore_sigpipe)
+            render = subprocess.Popen(jq_cmd, stdin=capture.stdout, **_POPEN_HOOK)
         except OSError as e:
             capture.kill()
             raise click.ClickException(f"Could not start jq: {e}")

@@ -75,12 +75,57 @@
 > - **ARP / DHCP / mDNS** — catch a Pixelblaze joining the network or changing
 >   IP, which is the usual reason a cached address goes stale.
 >
-> ### 4. Housekeeping
+> ### 4. Windows — partly done, needs a real machine to finish
+>
+> Windows used to fall through to the Linux branch, so a Windows user missing
+> `tshark` was told to run `sudo apt install`. **Fixed in this branch**, along
+> with a guaranteed crash: `subprocess` rejects `preexec_fn` outright on
+> Windows (`ValueError`), and we passed it unconditionally, so `pb snoop` died
+> on the first call. Now dropped on `win32` — there is no SIGPIPE there anyway.
+>
+> Install hints now emitted (`choco` first, matching the ask):
+>
+> ```
+> choco install wireshark jq
+> winget install WiresharkFoundation.Wireshark ; winget install jqlang.jq
+> scoop install wireshark jq
+> ```
+>
+> **Still unverified — no Windows box to test on:**
+>
+> - **`tshark` is often not on PATH.** The installer drops it at
+>   `C:\Program Files\Wireshark\tshark.exe`. `shutil.which('tshark')` then
+>   fails even though Wireshark is installed, and we tell the user to install
+>   something they already have. Should we probe the default install dir before
+>   giving up? (Docs mention the path; the code does not look there.)
+> - **Capture permissions are Npcap, not BPF.** `_can_capture()` returns `True`
+>   for everything non-darwin, so there is no preflight at all on Windows. If
+>   Npcap was installed with *Restrict to Administrators*, the user just gets
+>   tshark's raw error. Is there a cheap way to detect that?
+> - **`--sudo` is meaningless on Windows.** The permission text says so, but the
+>   flag is still accepted and silently prepends a `sudo` that does not exist.
+>   Hide it, or error, or map it to a UAC re-launch? (Note Windows 11 24H2 does
+>   ship a real `sudo` — so maybe keep it and version-detect.)
+> - **Interface auto-detection has no Windows path.** `route -n get` is macOS,
+>   `ip route get` is Linux; Windows hits the `tshark -D` fallback, whose names
+>   look like `\Device\NPF_{GUID}`. The `lo0`/`lo` loopback skip does not match
+>   `\Device\NPF_Loopback`. tshark also accepts the interface *number*, which
+>   may be the easier answer.
+> - **`--dry-run` quoting is POSIX.** `shlex.join` produces single-quoted output
+>   that cmd.exe and PowerShell will not take, so the copy-paste escape hatch is
+>   broken on Windows exactly where people most need it.
+>
+> ### 5. Housekeeping
 >
 > - Live capture against real hardware is **untested** — no Pixelblaze was
 >   reachable and sudo needed a password. The test suite substitutes a FIFO as
 >   the capture interface, which covers `-i`, `-f`, `-w` and the process
 >   plumbing but not an actual BPF device.
+> - Power-user material is now written up in **`docs/snooping.md`** (added to
+>   the mkdocs nav). The rest of the CLI — `pb top`, `pb find`, `pb pattern`,
+>   everything from cli-2/cli-3 — still has **no page under `docs/`** at all,
+>   only `examples/cli_examples.sh` and `--help`. That gap predates this branch
+>   and is worth its own pass.
 
 # pixelblaze-client
 A Python library that presents a simple, synchronous interface for communicating with and
