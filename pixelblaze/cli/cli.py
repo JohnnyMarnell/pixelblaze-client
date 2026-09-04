@@ -35,6 +35,7 @@ from pixelblaze.cli.cli_utils import cli, log, no_save_option, input_arg, read_i
                                      enumerate_pixelblazes, cache_ip, _read_cache, _write_cache, \
                                      _fetch_device_config, update_device_cache, lookup_cached_device
 from pixelblaze.cli.top import register as _register_top
+from pixelblaze.cli.snoop import register as _register_snoop
 
 @click.group()
 @click.option(
@@ -2210,8 +2211,9 @@ def cache_refresh(query, all_devices, conn_timeout):
         raise click.ClickException("Could not refresh any devices.")
 
 
-# `pb top` lives in a sibling module for size; register it onto the group here.
+# `pb top` and `pb snoop` live in sibling modules for size; register them here.
 _register_top(pixelblaze)
+_register_snoop(pixelblaze)
 
 
 ## ─── Sensor (virtual sensor board sources) ────────────────────────────────────

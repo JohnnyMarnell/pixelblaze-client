@@ -29,6 +29,26 @@ pb ws '{getConfig: true}'                    # arbitrary JSON, loose JSON5 keys 
 pb ws '{brightness: 0.1}' --expect stats     # wait for a specific response key
 pb ws '{sendUpdates: false, listPrograms: true, getPeers: 1}' | jq .
 
+# ─── snoop: watch the websocket protocol on the wire ──────────────────────────
+# Needs tshark + jq (brew install wireshark jq) and permission to capture
+# (brew install --cask wireshark-chmodbpf, or use --sudo).
+pb snoop                                     # every frame to/from the resolved device
+pb snoop --responses                         # only what the Pixelblaze says back
+pb snoop --requests --time                   # only what we send, with a clock
+pb --ip kitchen snoop                        # target by cached name, like any command
+pb snoop --others 231,bike2                  # several devices in one capture
+pb snoop --any                               # every websocket on the wire, no IP resolve
+pb snoop --host me                           # ignore the phone app and other clients
+pb snoop -v '"fps"'                          # drop the once-a-second status spam
+pb snoop -g setVars                          # only variable writes
+pb snoop --jq 'select(.msg.activeProgram)'   # arbitrary jq over the decoded stream
+pb snoop --bare > session.jsonl              # clean protocol log, no envelope
+pb snoop --midstream                         # attach to a connection already open
+pb snoop -w cap.pcapng                       # stream AND save raw packets
+pb snoop --read cap.pcapng                   # replay a saved capture (no perms needed)
+pb snoop --dry-run                           # print the tshark|jq pipeline, run it yourself
+pb snoop --requests & pb var speed 0.8       # snoop in the background, then watch a command
+
 # ─── sensor: sound-reactive with no hardware ──────────────────────────────────
 pb sensor sound                              # stream host audio FFT as sensor-board vars
 pb sensor sound -d "MacBook" -g 20 --log     # built-in mic: boost gain + compress range
