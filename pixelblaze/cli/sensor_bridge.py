@@ -20,9 +20,10 @@ Future sources can share the same var-push contract:
     "light": 0,   # sentinel that a real sensor source is active
   }
 
-Arrays must be sent whole. Verified on firmware 3.51 (2026-09-08):
-`{"setVars": {"frequencyData": [..32..]}}` lands in the pattern, while the
-indexed form `{"setVars": {"frequencyData[3]": v}}` is silently dropped —
+Arrays must be sent whole. Verified on firmware 3.51 and 3.70 (the same
+device, before and after upgrading, 2026-09-08): `{"setVars":
+{"frequencyData": [..32..]}}` lands in the pattern, while the indexed form
+`{"setVars": {"frequencyData[3]": v}}` is silently dropped on both —
 `light` flips to 0, the bins never move, and the pattern's last simulated
 frame sits there frozen. (`getVars` returns arrays whole too.) The bridge
 sent the indexed form until this note was written.
