@@ -13,12 +13,19 @@ via `setActiveVariables` at a configurable frame rate.
 
 Future sources can share the same var-push contract:
   variables = {
-    "frequencyData[0..31]": floats,
+    "frequencyData": [32 floats],   # the WHOLE array — see below
     "energyAverage": float,
     "maxFrequency": Hz,
     "maxFrequencyMagnitude": float,
     "light": 0,   # sentinel that a real sensor source is active
   }
+
+Arrays must be sent whole. Verified on firmware 3.51 (2026-09-08):
+`{"setVars": {"frequencyData": [..32..]}}` lands in the pattern, while the
+indexed form `{"setVars": {"frequencyData[3]": v}}` is silently dropped —
+`light` flips to 0, the bins never move, and the pattern's last simulated
+frame sits there frozen. (`getVars` returns arrays whole too.) The bridge
+sent the indexed form until this note was written.
 """
 
 import threading
@@ -222,15 +229,18 @@ class SoundBridge:
         if data is None:
             return
 
-        # Build setVars payload
+        # Build setVars payload. frequencyData goes as one array: firmware
+        # applies whole arrays and silently ignores "frequencyData[i]" keys
+        # (see module docstring). Round to 6 decimals — finer than the
+        # device's 16.16 fixed point, a third the JSON of a full double at
+        # `fps` frames per second.
         variables = {
-            "energyAverage": data["energyAverage"],
-            "maxFrequency": data["maxFrequency"],
-            "maxFrequencyMagnitude": data["maxFrequencyMagnitude"],
+            "frequencyData": [round(v, 6) for v in data["frequencyData"]],
+            "energyAverage": round(data["energyAverage"], 6),
+            "maxFrequency": round(data["maxFrequency"], 6),
+            "maxFrequencyMagnitude": round(data["maxFrequencyMagnitude"], 6),
             "light": 0,
         }
-        for i, val in enumerate(data["frequencyData"]):
-            variables[f"frequencyData[{i}]"] = val
 
         self.pb.setActiveVariables(variables)
 
