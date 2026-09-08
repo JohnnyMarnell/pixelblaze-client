@@ -19,6 +19,19 @@ The pipeline it builds looks like:
 `-T fields` aggregates those into one comma-joined cell — `{"fps":41},{"a":1}`
 — which is not valid JSON. `-T ek` keeps them as a real array, so the jq
 program can explode them into one output record each.
+
+`--udp` (alias `--beacons`) keeps the same shape but captures the UDP:1889
+discovery traffic instead — the beacon every Pixelblaze broadcasts about once
+a second, and the timeSync packets Firestorm (or `PixelblazeEnumerator`)
+answers with:
+
+    tshark -i en0 -l -n -q -f "udp port 1889" -Y "udp.port == 1889" \
+           -T ek -e ip.src -e ip.dst -e udp.srcport -e udp.dstport \
+                 -e frame.time_epoch -e data.data
+      | jq -c --unbuffered '<program>'
+
+tshark has no dissector for these packets, so the payload arrives as a hex
+string and the jq program carries a small little-endian decoder for it.
 """
 
 from __future__ import annotations
@@ -234,15 +247,18 @@ def _resolve_host(spec: str) -> str | None:
 
 # ── Filter construction ─────────────────────────────────────────────────────
 
-def _capture_filter(devices: list[str], host: str | None, ports: list[int]) -> str:
+def _capture_filter(devices: list[str], host: str | None, ports: list[int],
+                    proto: str = 'tcp') -> str:
     """BPF capture filter — cheap kernel-level narrowing before dissection.
 
     Deliberately NOT direction-aware. Filtering one direction out here would
     drop the server's `101 Switching Protocols` response, which is what primes
     tshark's websocket dissector; direction is applied in the display filter
-    instead, after dissection has already happened.
+    instead, after dissection has already happened. (`--udp` has no such
+    handshake, but keeps the split anyway: direction there means beacon vs
+    timeSync, which is only knowable after decoding.)
     """
-    clauses = [' or '.join(f"tcp port {p}" for p in ports)]
+    clauses = [' or '.join(f"{proto} port {p}" for p in ports)]
     if len(ports) > 1:
         clauses = [f"({clauses[0]})"]
     if devices:
@@ -288,7 +304,27 @@ def _display_filter(devices: list[str], host: str | None, ports: list[int],
     return ' and '.join(terms)
 
 
+def _udp_display_filter(devices: list[str], host: str | None, ports: list[int]) -> str:
+    """Display filter for `--udp`: port and endpoints only.
+
+    Direction is decided by packet type (beacon vs timeSync), which lives in
+    the payload, so it is applied by jq after decoding rather than here.
+    """
+    port_term = ' or '.join(f"udp.port == {p}" for p in ports)
+    terms = [f"({port_term})" if len(ports) > 1 else port_term]
+    if devices:
+        device_term = ' or '.join(f"ip.src == {ip} or ip.dst == {ip}" for ip in devices)
+        terms.append(f"({device_term})")
+    if host:
+        terms.append(f"(ip.src == {host} or ip.dst == {host})")
+    return ' and '.join(terms)
+
+
 # ── jq program ──────────────────────────────────────────────────────────────
+
+# Local wall clock with milliseconds, from the epoch float bound to `$ts`.
+_JQ_CLOCK = ('(($ts | strflocaltime("%H:%M:%S")) + "."'
+             ' + (("00" + (($ts - ($ts | floor)) * 1000 | floor | tostring)) | .[-3:]))')
 
 def _jq_program(show_time: bool, show_dir: bool, show_peer: bool, show_endpoints: bool,
                 bare: bool, grep: str | None, exclude: str | None,
@@ -352,10 +388,7 @@ def _jq_program(show_time: bool, show_dir: bool, show_peer: bool, show_endpoints
 
     fields = []
     if show_time:
-        lines.append(
-            '| (($ts | strflocaltime("%H:%M:%S")) + "."'
-            ' + (("00" + (($ts - ($ts | floor)) * 1000 | floor | tostring)) | .[-3:]))'
-            ' as $clock')
+        lines.append(f'| {_JQ_CLOCK} as $clock')
         fields.append('ts: $clock')
     if show_dir:
         fields.append('dir: (if $out then "\\u2192" else "\\u2190" end)')
@@ -367,6 +400,93 @@ def _jq_program(show_time: bool, show_dir: bool, show_peer: bool, show_endpoints
     fields.append('msg: $msg')
 
     lines.append('| {' + ', '.join(fields) + '}')
+    if extra:
+        lines.append(f'| {extra}')
+    return '\n'.join(lines)
+
+
+# tshark has no dissector for the Pixelblaze discovery packets, so `-T ek`
+# hands their payload over as one bare lowercase hex string under `data_data`.
+# These helpers pull little-endian 32-bit words and dotted quads out of it.
+_JQ_LE_HELPERS = '''\
+def hexval: if . >= 97 then . - 87 elif . >= 65 then . - 55 else . - 48 end;
+def hex2int: explode | map(hexval) | reduce .[] as $d (0; . * 16 + $d);
+def word($i): .[($i * 8):($i * 8 + 8)];
+def le32($i): word($i) as $w | ($w[6:8] + $w[4:6] + $w[2:4] + $w[0:2]) | hex2int;
+def ip4($i): word($i) as $w | [$w[0:2], $w[2:4], $w[4:6], $w[6:8]] | map(hex2int | tostring) | join(".");
+def wrap32: (. % 4294967296) | (if . < 0 then . + 4294967296 else . end)
+  | (if . >= 2147483648 then . - 4294967296 else . end);'''
+
+# Wire format, from docs/pixelblazeProtocol.md and PixelblazeEnumerator: every
+# word is a little-endian uint32.
+#   beacon   (type 42, 12 bytes): 42, senderId, senderTimeMs
+#   timeSync (type 43, 20 bytes): 43, syncId, nowMs, senderId, senderTimeMs
+# senderId is the Pixelblaze's own IPv4 address in byte order, so it is shown
+# both raw (what the library keys devices by and echoes in timeSync) and dotted.
+# senderTimeMs is the low 32 bits of the device's unix clock in milliseconds.
+_JQ_UDP_DECODE = [
+    'select(.layers) | .layers as $L',
+    '| ($L["ip_src"][0] // "") as $src',
+    '| ($L["ip_dst"][0] // "") as $dst',
+    '| (($L["frame_time_epoch"][0] // "0") | tonumber) as $ts',
+    '| ($L["udp_srcport"][0] // "") as $sport',
+    '| ($L["udp_dstport"][0] // "") as $dport',
+    '| (($L["data_data"] // [""])[0] | ascii_downcase) as $hex',
+    '| ($hex | length / 2) as $len',
+    '| (if $len >= 4 then ($hex | le32(0)) else null end) as $type',
+    # A beacon carries the sender's clock; against the capture time that is the
+    # skew timeSync exists to correct, so it is worth showing on every line.
+    '| (($ts * 1000 | floor) % 4294967296) as $now32',
+    '| (if $type == 42 and $len >= 12 then',
+    '     {kind: "beacon", src: $src, sender_id: ($hex | le32(1)), sender_ip: ($hex | ip4(1)),',
+    '      sender_ms: ($hex | le32(2))}',
+    '     | .skew_ms = ((.sender_ms - $now32) | wrap32)',
+    '   elif $type == 43 and $len >= 20 then',
+    '     {kind: "timeSync", src: $src, dst: $dst, sync_id: ($hex | le32(1)), time_ms: ($hex | le32(2)),',
+    '      sender_id: ($hex | le32(3)), sender_ip: ($hex | ip4(3)), sender_ms: ($hex | le32(4))}',
+    '   else {kind: "unknown", type: $type, src: $src, dst: $dst, len: $len, hex: $hex} end) as $rec',
+]
+
+
+def _jq_udp_program(show_time: bool, show_endpoints: bool, bare: bool,
+                    grep: str | None, exclude: str | None, extra: str | None,
+                    direction: str | None = None) -> str:
+    """Assemble the jq filter for `--udp`.
+
+    Every datagram is one record, decoded by packet type. "Requests" are
+    timeSync packets (sent TO a Pixelblaze), "responses" are beacons (sent BY
+    one), so the direction flags keep their meaning from websocket mode.
+    """
+    lines = [_JQ_LE_HELPERS] + list(_JQ_UDP_DECODE)
+
+    if direction == 'requests':
+        lines.append('| select($rec.kind == "timeSync")')
+    elif direction == 'responses':
+        lines.append('| select($rec.kind == "beacon")')
+
+    # There is no raw text to match against, so grep/exclude see the decoded
+    # record as JSON — `-g 1.86`-style matches on the dotted address work.
+    if grep:
+        lines.append('| select(($rec | tojson) | test($grep))')
+    if exclude:
+        lines.append('| select(($rec | tojson) | test($exclude) | not)')
+
+    if bare:
+        lines.append('| $rec')
+    else:
+        leading, trailing = [], []
+        if show_time:
+            lines.append(f'| {_JQ_CLOCK} as $clock')
+            leading.append('ts: $clock')
+        if show_endpoints:
+            trailing += ['dst: $dst', 'sport: $sport', 'dport: $dport']
+        record = '$rec'
+        if leading:
+            record = '{' + ', '.join(leading) + '} + ' + record
+        if trailing:
+            record += ' + {' + ', '.join(trailing) + '}'
+        lines.append(f'| {record}')
+
     if extra:
         lines.append(f'| {extra}')
     return '\n'.join(lines)
@@ -409,6 +529,11 @@ def _stop(proc: subprocess.Popen, grace: float = 3.0):
 
 _TSHARK_FIELDS = ('ip.src', 'ip.dst', 'tcp.srcport', 'tcp.dstport',
                   'frame.time_epoch', 'websocket.payload.text')
+_TSHARK_UDP_FIELDS = ('ip.src', 'ip.dst', 'udp.srcport', 'udp.dstport',
+                      'frame.time_epoch', 'data.data')
+
+_WS_PORT = 81        # Pixelblaze websocket API
+_BEACON_PORT = 1889  # discovery beacons and timeSync
 
 
 def register(cli_group):
@@ -418,6 +543,12 @@ def register(cli_group):
     """
 
     @cli_group.command()
+    @click.option('-u', '--udp', '--beacons', 'udp_mode', is_flag=True,
+                  help='Capture the UDP:1889 discovery traffic instead of websocket frames: '
+                       'the beacon every Pixelblaze broadcasts about once a second, and the '
+                       'timeSync packets Firestorm answers with. Broadcast, so this sees '
+                       'every device on the LAN, not only ones this machine talks to. '
+                       'Shows all devices unless --ip or --others narrows it.')
     @click.option('-a', '--any', 'any_device', is_flag=True,
                   help='Do not filter by device at all, and skip IP resolution entirely. '
                        'Shows every websocket conversation on the interface.')
@@ -436,9 +567,10 @@ def register(cli_group):
     @click.option('-i', '--iface', default=None, metavar='NAME',
                   help='Capture interface. Default: whichever one the kernel routes to '
                        'the target (so AP mode and Ethernet just work).')
-    @click.option('-p', '--port', 'ports_csv', default='81', show_default=True, metavar='CSV',
-                  help='Websocket port(s) to decode, comma-separated. 81 is the Pixelblaze '
-                       'websocket API; add 80 to also catch the HTTP file endpoints.')
+    @click.option('-p', '--port', 'ports_csv', default=None, metavar='CSV',
+                  help='Port(s) to capture, comma-separated. Default 81, the Pixelblaze '
+                       'websocket API (add 80 to also catch the HTTP file endpoints); '
+                       'with --udp, default 1889.')
     @click.option('-m', '--midstream', is_flag=True,
                   help='Decode port traffic as websocket directly instead of waiting for an '
                        'HTTP upgrade handshake. Needed when the connection you want to watch '
@@ -483,16 +615,17 @@ def register(cli_group):
     @click.option('--sudo', 'use_sudo', is_flag=True,
                   help='Run tshark under sudo, for when the capture device is root-only.')
     @click.pass_context
-    def snoop(ctx, any_device, others, host_spec, requests, responses, iface, ports_csv,
-              midstream, grep, exclude, jq_prog, show_time, bare, full, count, duration,
-              read_file, write_file, color_mode, no_color, dry_run, use_sudo):
+    def snoop(ctx, udp_mode, any_device, others, host_spec, requests, responses, iface,
+              ports_csv, midstream, grep, exclude, jq_prog, show_time, bare, full, count,
+              duration, read_file, write_file, color_mode, no_color, dry_run, use_sudo):
         """
-        Watch Pixelblaze websocket traffic live, decoded to JSON.
+        Watch Pixelblaze traffic live, decoded to JSON. Alias: pb watch.
 
         Wraps `tshark` (capture + dissection) piped into `jq` (filtering +
         pretty-printing); both must be installed. Every websocket text frame
         to or from the device is printed as one JSON line as it happens —
-        the exact protocol chatter the web UI and this CLI generate.
+        the exact protocol chatter the web UI and this CLI generate. With
+        --udp it is the discovery beacons on UDP:1889 instead.
 
         \b
         Requests vs responses:
@@ -514,6 +647,16 @@ def register(cli_group):
             already open (a browser tab you left running), pass --midstream.
 
         \b
+        Discovery beacons (--udp, alias --beacons):
+            Every Pixelblaze that is not a sync-group follower broadcasts a
+            beacon on UDP:1889 about once a second, and Firestorm answers
+            each with a timeSync. --udp decodes both instead of websocket
+            frames. Being broadcast, they are visible from anywhere on the
+            LAN, which makes this the way to check what `pb find` can hear.
+            --requests keeps only timeSync packets, --responses only beacons.
+            Each beacon line carries skew_ms, the sender's clock minus ours.
+
+        \b
         Examples:
             pb snoop                             # both directions, resolved device
             pb snoop --responses                 # only what the Pixelblaze says
@@ -528,6 +671,10 @@ def register(cli_group):
             pb snoop --bare > session.jsonl      # clean protocol log
             pb snoop --midstream                 # attach to an open connection
             pb snoop --dry-run                   # show the pipeline, run it yourself
+            pb snoop --udp                       # every discovery beacon on the LAN
+            pb snoop --beacons -t                # ...timestamped, with clock skew
+            pb --ip bike2 snoop --udp            # one device's beacons and timeSyncs
+            pb watch --udp --requests            # only timeSync packets
         """
         tshark_bin = _require('tshark')
         jq_bin = _require('jq')
@@ -536,6 +683,8 @@ def register(cli_group):
         if not live and (write_file or count or duration):
             log("Note: --write/--count/--duration apply to live capture; ignored with --read.")
 
+        if ports_csv is None:
+            ports_csv = str(_BEACON_PORT if udp_mode else _WS_PORT)
         try:
             ports = [int(p.strip()) for p in ports_csv.split(',') if p.strip()]
         except ValueError:
@@ -543,12 +692,26 @@ def register(cli_group):
         if not ports:
             raise click.ClickException("--port needs at least one port.")
 
+        if udp_mode and midstream:
+            log("Note: --midstream only affects websocket decoding; ignored with --udp.")
+
         # ── Work out who we're watching ──────────────────────────────────
         devices: list[str] = []
         if any_device:
             if others:
                 raise click.ClickException("--any and --others are mutually exclusive: "
                                            "--any already captures every device.")
+        elif udp_mode:
+            # Beacons are broadcast, so "every device" is the natural default —
+            # and running discovery to pick one would be circular when the point
+            # is usually to see whether any beacons exist at all. Only an
+            # explicit --ip (or --others) narrows the capture.
+            explicit = resolve_ip_spec(ctx.obj.get('ip', 'auto'))
+            if explicit:
+                devices.append(explicit)
+            for ip in _resolve_others(others):
+                if ip not in devices:
+                    devices.append(ip)
         else:
             # Import here so `--any` never pays for (or fails on) discovery.
             from pixelblaze.cli.cli_utils import discover_pixelblaze
@@ -559,7 +722,10 @@ def register(cli_group):
 
         host = _resolve_host(host_spec)
 
-        capture_filter = _capture_filter(devices, host, ports) if live else ''
+        capture_filter = ''
+        if live:
+            capture_filter = _capture_filter(devices, host, ports,
+                                             proto='udp' if udp_mode else 'tcp')
 
         # `tshark -w` and `-Y` are mutually exclusive on a live capture, so when
         # saving we narrow with the BPF capture filter alone and let jq do the
@@ -567,11 +733,17 @@ def register(cli_group):
         # stream including the HTTP upgrade, so `--read` can replay it without
         # needing --midstream.
         saving_live = bool(live and write_file)
-        display_filter = None if saving_live else _display_filter(
-            devices, host, ports, requests, responses)
-        jq_direction = None
-        if saving_live and requests != responses:
-            jq_direction = 'requests' if requests else 'responses'
+        wants_direction = requests != responses
+        if udp_mode:
+            # Direction is a packet-type question here, so jq always owns it.
+            display_filter = None if saving_live else _udp_display_filter(devices, host, ports)
+            jq_direction = ('requests' if requests else 'responses') if wants_direction else None
+        else:
+            display_filter = None if saving_live else _display_filter(
+                devices, host, ports, requests, responses)
+            jq_direction = None
+            if saving_live and wants_direction:
+                jq_direction = 'requests' if requests else 'responses'
 
         if iface is None and live:
             iface = _default_iface(devices[0] if devices else None)
@@ -584,14 +756,15 @@ def register(cli_group):
         else:
             tshark_cmd += ['-r', read_file]
         tshark_cmd += ['-l', '-n', '-q']
-        for port in ports:
-            tshark_cmd += ['-d', f'tcp.port=={port},{decode_proto}']
+        if not udp_mode:
+            for port in ports:
+                tshark_cmd += ['-d', f'tcp.port=={port},{decode_proto}']
         if live and capture_filter:
             tshark_cmd += ['-f', capture_filter]
         if display_filter is not None:
             tshark_cmd += ['-Y', display_filter]
         tshark_cmd += ['-T', 'ek']
-        for field in _TSHARK_FIELDS:
+        for field in (_TSHARK_UDP_FIELDS if udp_mode else _TSHARK_FIELDS):
             tshark_cmd += ['-e', field]
         if live and write_file:
             tshark_cmd += ['-w', write_file]
@@ -605,15 +778,24 @@ def register(cli_group):
         # ── Build the jq side ────────────────────────────────────────────
         both_directions = requests == responses  # neither flag, or both
         multi_peer = any_device or len(devices) > 1
-        program = _jq_program(
-            show_time=show_time or full,
-            show_dir=full or both_directions,
-            show_peer=full or multi_peer,
-            show_endpoints=full or any_device,
-            bare=bare,
-            grep=grep, exclude=exclude, extra=jq_prog,
-            direction=jq_direction,
-        )
+        if udp_mode:
+            program = _jq_udp_program(
+                show_time=show_time or full,
+                show_endpoints=full,
+                bare=bare,
+                grep=grep, exclude=exclude, extra=jq_prog,
+                direction=jq_direction,
+            )
+        else:
+            program = _jq_program(
+                show_time=show_time or full,
+                show_dir=full or both_directions,
+                show_peer=full or multi_peer,
+                show_endpoints=full or any_device,
+                bare=bare,
+                grep=grep, exclude=exclude, extra=jq_prog,
+                direction=jq_direction,
+            )
 
         if no_color:
             color_mode = 'never'
@@ -645,17 +827,25 @@ def register(cli_group):
             if not use_sudo and not os.path.exists(iface):
                 _check_capture_permission()
             target = ', '.join(_label(ip) for ip in devices) if devices else 'any device'
-            direction = ('requests only (-> device)' if requests and not responses else
-                         'responses only (<- device)' if responses and not requests else
-                         'both directions')
-            log(f"snoop: iface {iface}, port {','.join(str(p) for p in ports)}, "
-                f"{target}, {direction}")
+            port_list = ','.join(str(p) for p in ports)
+            if udp_mode:
+                direction = ('timeSync only (-> device)' if requests and not responses else
+                             'beacons only (<- device)' if responses and not requests else
+                             'beacons + timeSync')
+                log(f"snoop: iface {iface}, udp port {port_list}, {target}, {direction}")
+                log("       every Pixelblaze that is not a sync-group follower beacons "
+                    "about once a second")
+            else:
+                direction = ('requests only (-> device)' if requests and not responses else
+                             'responses only (<- device)' if responses and not requests else
+                             'both directions')
+                log(f"snoop: iface {iface}, port {port_list}, {target}, {direction}")
             if host:
                 log(f"       other end restricted to {_label(host)}")
             if saving_live:
                 log(f"       saving raw packets to {write_file} (filtering moves to jq, "
                     f"since tshark won't take a display filter while saving)")
-            if not midstream:
+            if not midstream and not udp_mode:
                 log("       decoding via the HTTP upgrade handshake — pass --midstream "
                     "to attach to an already-open connection")
             log("       Ctrl+C to stop\n")
@@ -697,3 +887,7 @@ def register(cli_group):
                 f"tshark exited {capture.returncode}. Re-run with --dry-run to see the "
                 f"exact command, or --sudo if this is a permissions problem."
             )
+
+    # `pb watch` is the same command under a friendlier name.
+    cli_group.add_command(snoop, name='watch')
+    return snoop

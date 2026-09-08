@@ -15,6 +15,7 @@ Two layers:
 absence fails the run rather than skipping it.
 """
 
+import json
 import os
 import shutil
 import struct
@@ -27,7 +28,10 @@ import pathlib
 import click
 
 from pixelblaze.cli import cli_utils, snoop
-from pixelblaze.cli.snoop import _capture_filter, _display_filter, _jq_program, _resolve_others
+from pixelblaze.cli.snoop import (
+    _capture_filter, _display_filter, _jq_program, _jq_udp_program, _resolve_others,
+    _udp_display_filter,
+)
 
 HOST = '192.168.1.67'
 DEV = '192.168.1.230'
@@ -137,6 +141,51 @@ def _write_fixture(path: pathlib.Path, handshake: bool = True):
     path.write_bytes(bytes(blob))
 
 
+def _udp_packet(src, dst, sport, dport, payload) -> bytes:
+    ip_of = lambda s: bytes(int(o) for o in s.split('.'))
+    udp = struct.pack('!HHHH', sport, dport, 8 + len(payload), 0) + payload
+    ip = (struct.pack('!BBHHHBBH', 0x45, 0, 20 + len(udp), 0x1234, 0, 64, 17, 0)
+          + ip_of(src) + ip_of(dst))
+    ip = ip[:10] + struct.pack('!H', _cksum(ip)) + ip[12:]
+    eth = b'\xff\xff\xff\xff\xff\xff\xaa\xbb\xcc\xdd\xee\x02\x08\x00'
+    return eth + ip + udp
+
+
+# The discovery packets the UDP fixture carries, in order. senderId is the
+# device's IPv4 in byte order; times are the low 32 bits of unix milliseconds.
+UDP_EXPECTED = [
+    {'kind': 'beacon', 'src': DEV2, 'sender_ip': DEV2, 'sender_ms': 0x21D28F98},
+    {'kind': 'timeSync', 'src': HOST, 'dst': DEV2, 'sync_id': 890,
+     'time_ms': 0x21D29000, 'sender_ip': DEV2, 'sender_ms': 0x21D28F98},
+    {'kind': 'beacon', 'src': DEV, 'sender_ip': DEV, 'sender_ms': 0x21D29123},
+]
+
+
+def _write_udp_fixture(path: pathlib.Path):
+    """A pcap of two beacons and one timeSync on UDP:1889.
+
+    Wire format per docs/pixelblazeProtocol.md: little-endian uint32 words,
+    beacon = (42, senderId, senderTimeMs), timeSync = (43, syncId, nowMs,
+    senderId, senderTimeMs). One beacon goes to the subnet broadcast and one
+    to 255.255.255.255, since firmware has been seen doing either.
+    """
+    ip_of = lambda s: bytes(int(o) for o in s.split('.'))
+    base = 1700000000
+    beacon = struct.pack('<L', 42) + ip_of(DEV2) + struct.pack('<L', 0x21D28F98)
+    sync = (struct.pack('<LLL', 43, 890, 0x21D29000) + ip_of(DEV2)
+            + struct.pack('<L', 0x21D28F98))
+    beacon2 = struct.pack('<L', 42) + ip_of(DEV) + struct.pack('<L', 0x21D29123)
+    packets = [
+        (base, 0, _udp_packet(DEV2, '192.168.1.255', 1889, 1889, beacon)),
+        (base, 10000, _udp_packet(HOST, DEV2, 54321, 1889, sync)),
+        (base, 500000, _udp_packet(DEV, '255.255.255.255', 1889, 1889, beacon2)),
+    ]
+    blob = bytearray(struct.pack('!IHHiIII', 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
+    for when, usec, raw in packets:
+        blob += struct.pack('!IIII', when, usec, len(raw), len(raw)) + raw
+    path.write_bytes(bytes(blob))
+
+
 # ── Filter construction ─────────────────────────────────────────────────────
 
 def test_capture_filter():
@@ -241,6 +290,46 @@ def test_resolve_others():
     print("✓ --others resolution")
 
 
+def test_udp_filters():
+    """--udp swaps the protocol in the BPF filter and never filters direction."""
+    assert _capture_filter([], None, [1889], proto='udp') == 'udp port 1889'
+    assert _capture_filter([DEV2], HOST, [1889], proto='udp') == \
+        'udp port 1889 and host 192.168.1.86 and host 192.168.1.67'
+
+    assert _udp_display_filter([], None, [1889]) == 'udp.port == 1889'
+    assert _udp_display_filter([], None, [1889, 1890]) == '(udp.port == 1889 or udp.port == 1890)'
+    assert _udp_display_filter([DEV2], None, [1889]) == \
+        'udp.port == 1889 and (ip.src == 192.168.1.86 or ip.dst == 192.168.1.86)'
+    assert _udp_display_filter([DEV], HOST, [1889]).endswith(
+        'and (ip.src == 192.168.1.67 or ip.dst == 192.168.1.67)')
+    print("✓ udp filters")
+
+
+def test_udp_jq_program():
+    """Direction is a packet-type select; the envelope adapts like ws mode."""
+    plain = _jq_udp_program(False, False, False, None, None, None)
+    assert plain.rstrip().endswith('| $rec')
+    assert 'select($rec.kind' not in plain
+    assert 'def le32' in plain and 'def wrap32' in plain
+
+    assert '| select($rec.kind == "timeSync")' in \
+        _jq_udp_program(False, False, False, None, None, None, direction='requests')
+    assert '| select($rec.kind == "beacon")' in \
+        _jq_udp_program(False, False, False, None, None, None, direction='responses')
+
+    full = _jq_udp_program(True, True, False, None, None, None)
+    assert full.rstrip().endswith('| {ts: $clock} + $rec + {dst: $dst, sport: $sport, dport: $dport}')
+
+    bare = _jq_udp_program(True, True, True, None, None, 'select(.kind == "beacon")')
+    assert '$clock' not in bare
+    assert bare.rstrip().endswith('| $rec\n| select(.kind == "beacon")')
+
+    filtered = _jq_udp_program(False, False, False, 'bike', 'sync', None)
+    assert 'select(($rec | tojson) | test($grep))' in filtered
+    assert 'select(($rec | tojson) | test($exclude) | not)' in filtered
+    print("✓ udp jq program")
+
+
 # ── Real pipeline round trip ────────────────────────────────────────────────
 
 def _run_pipeline(pcap, devices, host, ports, requests, responses,
@@ -311,6 +400,74 @@ def test_pipeline_round_trip():
         assert _run_pipeline(pcap, [DEV], None, [81], False, False,
                              bare=True)[0] == '{"getConfig":true}'
     print("✓ pipeline round trip")
+
+
+def _run_udp_pipeline(pcap, devices, host, requests=False, responses=False, **program_kwargs):
+    """Run the tshark|jq pair `--udp` builds, over a saved capture."""
+    tshark = shutil.which('tshark')
+    jq = shutil.which('jq')
+    assert tshark, "tshark is required by `pb snoop` and by this test; install it"
+    assert jq, "jq is required by `pb snoop` and by this test; install it"
+
+    cmd = [tshark, '-r', str(pcap), '-l', '-n', '-q',
+           '-Y', _udp_display_filter(devices, host, [1889]), '-T', 'ek']
+    for field in snoop._TSHARK_UDP_FIELDS:
+        cmd += ['-e', field]
+
+    kwargs = dict(show_time=False, show_endpoints=False, bare=False,
+                  grep=None, exclude=None, extra=None)
+    kwargs.update(program_kwargs)
+    if requests != responses:
+        kwargs['direction'] = 'requests' if requests else 'responses'
+
+    jq_cmd = [jq, '-c', '-M']
+    if kwargs['grep']:
+        jq_cmd += ['--arg', 'grep', kwargs['grep']]
+    if kwargs['exclude']:
+        jq_cmd += ['--arg', 'exclude', kwargs['exclude']]
+    jq_cmd += [_jq_udp_program(**kwargs)]
+
+    captured = subprocess.run(cmd, capture_output=True, timeout=30)
+    assert captured.returncode == 0, captured.stderr.decode()
+    rendered = subprocess.run(jq_cmd, input=captured.stdout, capture_output=True, timeout=30)
+    assert rendered.returncode == 0, rendered.stderr.decode()
+    return [json.loads(line) for line in rendered.stdout.decode().splitlines() if line.strip()]
+
+
+def test_udp_pipeline_round_trip():
+    """Decode a real beacon capture: the jq little-endian decoder against tshark's hex."""
+    with tempfile.TemporaryDirectory() as tmp:
+        pcap = pathlib.Path(tmp) / 'beacons.pcap'
+        _write_udp_fixture(pcap)
+
+        records = _run_udp_pipeline(pcap, [], None)
+        assert len(records) == len(UDP_EXPECTED), records
+        for got, want in zip(records, UDP_EXPECTED):
+            for key, value in want.items():
+                assert got.get(key) == value, f"{key}: {got}"
+        # senderId is the same four bytes as the dotted address, little-endian.
+        assert records[0]['sender_id'] == struct.unpack('<L', bytes([192, 168, 1, 86]))[0]
+        assert records[1]['sender_id'] == records[0]['sender_id']
+        # Skew is a signed 32-bit difference, so it never comes out as 4e9.
+        assert all(-2**31 <= r['skew_ms'] < 2**31 for r in records if r['kind'] == 'beacon')
+        assert 'skew_ms' not in records[1]
+
+        # Direction: requests are timeSyncs, responses are beacons.
+        assert [r['kind'] for r in _run_udp_pipeline(pcap, [], None, requests=True)] == ['timeSync']
+        assert [r['kind'] for r in _run_udp_pipeline(pcap, [], None, responses=True)] == ['beacon', 'beacon']
+
+        # A named device keeps its beacon and the timeSync sent to it, not others'.
+        assert [r['src'] for r in _run_udp_pipeline(pcap, [DEV2], None)] == [DEV2, HOST]
+        assert [r['src'] for r in _run_udp_pipeline(pcap, [DEV], None)] == [DEV]
+
+        # grep / exclude / full / bare.
+        assert [r['src'] for r in _run_udp_pipeline(pcap, [], None, grep='1\\.230')] == [DEV]
+        assert len(_run_udp_pipeline(pcap, [], None, exclude='timeSync')) == 2
+        full = _run_udp_pipeline(pcap, [], None, show_time=True, show_endpoints=True)[0]
+        assert full['dst'] == '192.168.1.255' and full['dport'] == '1889' and 'ts' in full
+        assert list(full)[0] == 'ts'
+        assert 'dport' not in _run_udp_pipeline(pcap, [], None, bare=True)[0]
+    print("✓ udp pipeline round trip")
 
 
 def test_midstream_decode():
@@ -413,14 +570,65 @@ def test_live_capture_path():
     print("✓ live capture path")
 
 
+def test_udp_live_capture_path():
+    """--udp through a FIFO interface, saving, replaying, and the `watch` alias."""
+    assert shutil.which('tshark'), "tshark is required by `pb snoop` and by this test"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = pathlib.Path(tmp)
+        pcap = tmpdir / 'beacons.pcap'
+        _write_udp_fixture(pcap)
+        blob = pcap.read_bytes()
+
+        # No --ip: must not attempt discovery, must see every device.
+        fifo = tmpdir / 'fifo'
+        os.mkfifo(fifo)
+        _feed_fifo(fifo, blob)
+        plain = _run_cli(['watch', '--udp', '-i', str(fifo)])
+        assert plain.returncode == 0, plain.stderr.decode()
+        kinds = [json.loads(line)['kind'] for line in plain.stdout.decode().splitlines()]
+        assert kinds == ['beacon', 'timeSync', 'beacon'], plain.stdout
+        assert b'Listening for beacons' not in plain.stderr, plain.stderr
+
+        # --write plus a direction, with the narrowing done by jq.
+        fifo2 = tmpdir / 'fifo2'
+        saved = tmpdir / 'saved.pcapng'
+        os.mkfifo(fifo2)
+        _feed_fifo(fifo2, blob)
+        written = _run_cli(['snoop', '--beacons', '-i', str(fifo2), '-w', str(saved), '--responses'])
+        assert written.returncode == 0, written.stderr.decode()
+        assert b"aren't supported when capturing" not in written.stderr, written.stderr
+        lines = written.stdout.decode().splitlines()
+        assert [json.loads(line)['kind'] for line in lines] == ['beacon', 'beacon'], lines
+
+        assert saved.exists() and saved.stat().st_size > 0
+        replayed = _run_cli(['snoop', '--udp', '--read', str(saved)])
+        assert replayed.returncode == 0, replayed.stderr.decode()
+        assert len(replayed.stdout.decode().splitlines()) == 3, replayed.stdout
+
+        # An explicit --ip narrows to that device without discovery.
+        fifo3 = tmpdir / 'fifo3'
+        os.mkfifo(fifo3)
+        _feed_fifo(fifo3, blob)
+        narrowed = _run_cli(['--ip', DEV, 'watch', '--udp', '-i', str(fifo3)])
+        assert narrowed.returncode == 0, narrowed.stderr.decode()
+        srcs = [json.loads(line)['src'] for line in narrowed.stdout.decode().splitlines()]
+        assert srcs == [DEV], srcs
+    print("✓ udp live capture path")
+
+
 def main():
     test_capture_filter()
     test_display_filter()
     test_jq_envelope_adapts()
     test_resolve_others()
+    test_udp_filters()
+    test_udp_jq_program()
     test_pipeline_round_trip()
+    test_udp_pipeline_round_trip()
     test_midstream_decode()
     test_live_capture_path()
+    test_udp_live_capture_path()
     print("\nAll snoop tests passed.")
 
 

@@ -1,8 +1,9 @@
 # Snooping the wire
 
-`pb snoop` decodes live Pixelblaze websocket traffic to JSON. It shells out to
-`tshark` for capture and dissection and pipes the result through `jq`, so
-everything below composes with the rest of your shell.
+`pb snoop` (alias `pb watch`) decodes live Pixelblaze websocket traffic to
+JSON. It shells out to `tshark` for capture and dissection and pipes the result
+through `jq`, so everything below composes with the rest of your shell. With
+`--udp` it decodes the [discovery beacons](#discovery-beacons-udp) instead.
 
 ```console
 $ pb snoop
@@ -72,7 +73,7 @@ these applies. `--read` needs no permissions at all.
 |---|---|
 | this machine ↔ a Pixelblaze | :material-check: yes |
 | this machine ↔ an emulator on localhost | :material-check: yes (auto-selects `lo0`) |
-| anyone's broadcast/multicast (UDP:1889 beacons) | :material-check: yes |
+| anyone's broadcast/multicast (UDP:1889 beacons, see [`--udp`](#discovery-beacons-udp)) | :material-check: yes |
 | Pixelblaze ↔ Pixelblaze unicast (sync-group leader/follower) | :material-close: **no** |
 
 To see traffic between two other devices you need WiFi monitor mode with WPA2
@@ -148,6 +149,55 @@ pb snoop --full                   # always ts, dir, peer, src, dst
 pb snoop --time                   # add a local clock timestamp
 ```
 
+## Discovery beacons (`--udp`)
+
+Every Pixelblaze that is not a sync-group *follower* broadcasts a small beacon
+on UDP:1889 about once a second. It is what `pb find` listens for, and what
+Firestorm answers with a `timeSync` packet to keep clocks aligned. Because it
+is broadcast, it is visible from anywhere on the LAN — the one kind of
+Pixelblaze traffic you can watch without being a party to it.
+
+`--udp` (alias `--beacons`) captures and decodes both packet types instead of
+websocket frames:
+
+```console
+$ pb snoop --udp -t
+{"ts":"11:08:45.104","kind":"beacon","src":"192.168.1.230","sender_id":3858868416,"sender_ip":"192.168.1.230","sender_ms":567447843,"skew_ms":-12}
+{"ts":"11:08:45.106","kind":"timeSync","src":"192.168.1.67","dst":"192.168.1.230","sync_id":890,"time_ms":567447855,"sender_id":3858868416,"sender_ip":"192.168.1.230","sender_ms":567447843}
+```
+
+| Field | Meaning |
+|---|---|
+| `kind` | `beacon` (device → broadcast), `timeSync` (Firestorm → device), or `unknown` with the raw `hex` |
+| `sender_id` / `sender_ip` | The same four bytes: the Pixelblaze's IPv4 address, raw as the library keys devices by it, and dotted |
+| `sender_ms` | The device's clock — the low 32 bits of unix time in milliseconds |
+| `skew_ms` | Beacons only: `sender_ms` minus the capture time, i.e. how far the device's clock is from this machine's. What `timeSync` exists to correct |
+| `sync_id`, `time_ms` | timeSync only: the sender's id and authoritative clock |
+
+No `--ip` means every device; the usual forms narrow it. `--requests` keeps
+only `timeSync` packets (sent *to* a device), `--responses` only beacons (sent
+*by* one). The rest of the options apply as-is:
+
+```bash
+pb snoop --udp                        # every beacon on the LAN
+pb --ip bike2 snoop --udp             # one device's beacons and its timeSyncs
+pb watch --udp --responses -g 1.230   # beacons from .230 only
+pb snoop --udp -w beacons.pcapng      # save, then --read later
+pb snoop --udp --jq '.skew_ms'        # just the clock drift
+```
+
+!!! tip "When `pb find` comes up empty"
+
+    `pb snoop --udp` is the quickest way to tell whether beacons are on the
+    wire at all. Two common reasons they are not: the device is a sync-group
+    follower (followers stop beaconing — ask a leader for its peers instead),
+    or another process already holds UDP:1889 on this machine.
+
+The wire format is three or five little-endian 32-bit words; see the
+[protocol notes](pixelblazeProtocol.md#network-discovery). tshark has no
+dissector for it, so the pipeline pulls the raw bytes with `-e data.data` and
+the jq program decodes them itself — `--dry-run` shows the helper functions.
+
 ## Saving and replaying
 
 ```bash
@@ -169,7 +219,7 @@ replays without `--midstream`.
 
 ```bash
 pb snoop -i en0                   # pick the interface (default: routed to target)
-pb snoop -p 81,80                 # extra ports to decode as websocket
+pb snoop -p 81,80                 # extra ports to decode as websocket (--udp: default 1889)
 pb snoop -c 200                   # stop after 200 packets (not frames)
 pb snoop -d 30                    # stop after 30 seconds
 pb snoop --color never            # or --no-color; honors NO_COLOR
@@ -206,6 +256,6 @@ Two details in there are worth knowing if you write your own:
 
 ## Not yet covered
 
-Binary websocket frames (preview pixels, pattern uploads), plain HTTP on port
-80, and the UDP:1889 discovery beacons are not decoded today. See the roadmap
-notes on the `cli-snoop` branch.
+Binary websocket frames (preview pixels, pattern uploads) and plain HTTP on
+port 80 are not decoded today. See the roadmap notes on the `cli-snoop`
+branch.

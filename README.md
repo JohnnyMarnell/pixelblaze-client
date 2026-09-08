@@ -38,24 +38,28 @@
 > *filter* does not widen what the *interface can see*. Possibly add
 > `--monitor`. Decide whether leader/follower snooping is in scope at all.
 >
-> ### 2. UDP beacons — look into snooping these!
+> ### 2. UDP beacons — ✅ done: `pb snoop --udp` (alias `--beacons`)
 >
 > These are **broadcast**, so unlike the above they are visible from anywhere on
 > the LAN, including beacons from Pixelblazes we have never talked to. Great fit.
 >
-> - `PixelblazeEnumerator`, `pixelblaze/pixelblaze.py` — `PORT = 1889`,
->   `BEACON_PACKET = 42`, `TIMESYNC_PACKET = 43`.
-> - Payload is 12 bytes, `struct.unpack("<LLL")` → `(packetType, senderId/chipId, senderTimeMs)`.
-> - Filter would be `udp port 1889`, nothing like the current websocket path.
-> - **Open design question:** tshark has no dissector for this, so we would get
->   raw hex via `-e data.data`, and jq cannot byte-swap little-endian hex
->   without something grim. Options: (a) a jq hex-decode helper, (b) let
->   Python decode this one case and break the "everything goes through jq"
->   rule, (c) write a tiny Wireshark Lua dissector and ship it with `-X lua_script:`.
->   (c) is the most fun and gives real named fields.
-> - Would surface: devices appearing/disappearing, chipIds, and clock skew /
->   jitter between leader and followers via the timesync packets (43) —
->   genuinely useful for debugging out-of-sync patterns.
+> - Went with option (a): a jq little-endian helper (`le32`, `ip4`, `wrap32`)
+>   over `-e data.data`. ~6 lines of jq, no Lua to ship, everything still goes
+>   through the one pipeline. `--dry-run` shows it.
+> - `senderId` is **not a chipId** — it is the device's own IPv4 in byte order
+>   (protocol doc example agrees; `PixelblazeEnumerator` just treats it as
+>   opaque and echoes it in the timeSync). Emitted both raw and dotted.
+> - Beacon lines carry `skew_ms` (device clock − capture clock, signed 32-bit),
+>   which is the leader/follower drift signal. Sync jitter between devices is
+>   readable straight off consecutive lines.
+> - `--requests` = timeSync only, `--responses` = beacons only; `-w`/`--read`,
+>   `-g`/`-v`, `-t`/`--full`/`--bare`, `--jq` all work unchanged.
+> - **Discovered while building it:** sync-group *followers* do not beacon at
+>   all (bike2 following an offline bike1 → zero packets on the LAN, `pb find`
+>   empty while the web UI works fine). `pb find` needs a non-beacon fallback;
+>   that work is on `cli-top`.
+> - Still unverified against live hardware from this machine (BPF is root-only
+>   here); the FIFO tests cover the pipeline end to end on synthetic packets.
 >
 > ### 3. Other power-user snooping to try
 >
