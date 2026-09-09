@@ -1237,6 +1237,21 @@ class Pixelblaze:
                                                                 "setActivePattern(id)/setActivePatternByName(name")
         self.wsSendJson({"activeProgramId": patternId, "save": saveToFlash}, expectedResponse="activeProgram")
 
+    def reloadActivePattern(self):
+        """Restarts the pattern that is already running.
+
+        The firmware decides where a pattern's sensor globals (`frequencyData`,
+        `energyAverage`, `light`, ...) come from when the pattern loads. A
+        pattern that started before remote sensor data began arriving keeps
+        using its own simulated values until it is reloaded, so a host
+        streaming sensor data with [`SensorSender`](#class-sensorsender) should
+        call this once the frames are flowing. Verified on firmware 3.70.
+
+        Does nothing if no pattern is active.
+        """
+        patternId = self.getActivePattern()
+        if patternId: self.setActivePattern(patternId)
+
     def getPatternAsEpe(self, patternId: str) -> str:
         """Convert a stored pattern into an exportable, portable JSON format (which then needs to be saved by the caller).
 
@@ -3779,6 +3794,13 @@ class SensorPacket:
     `accelerometer` is bipolar and is sent as `value * 32768` as an int16.
     `maxFrequency` is not scaled at all -- it is a frequency in Hz.
 
+    Measured on firmware 3.70 by sending known values and reading the pattern's
+    globals back with `getVars`: `light` 8192 -> 0.125, `frequencyData[8]` 8192
+    -> 0.125, `frequencyData[16]` 16384 -> 0.25, `energyAverage` 16384 -> 0.25,
+    `maxFrequency` 1170 -> 1170. So the same reading sent as a datagram or with
+    [`setActiveVariables()`](#method-setactivevariables) reaches the pattern as
+    the same number.
+
     **CREATION**
     - [`pack()`](#method-pack)
 
@@ -3929,6 +3951,22 @@ class SensorSender:
     [`setSensorSources()`](#method-setsensorsources). The preference is a
     preference, though, not a switch: a Pixelblaze with no local sensor board
     falls back to remote data regardless.
+
+    **The pattern has to be (re)loaded after the frames start arriving.** The
+    firmware binds a pattern's sensor globals to their source when the pattern
+    loads, so a pattern that was already running when streaming began keeps
+    using its own simulated values -- the frames arrive and are ignored, which
+    looks exactly like the packets being malformed. Send a few frames, then
+    call [`reloadActivePattern()`](#method-reloadactivepattern) once.
+
+    Nothing else is required: unicast and broadcast both work, `senderTime` can
+    be anything, the source port doesn't matter, and no sync-group or leader
+    relationship is needed. Once bound, a pattern keeps the last frame it was
+    sent -- on 3.70 it was still showing it 100 seconds after the stream
+    stopped, and reloading the pattern doesn't restore simulation -- so a
+    sender that is shutting down should send a frame of zeroes rather than just
+    stopping, or the pattern freezes on whatever was playing. Verified against
+    firmware 3.70.
 
     See [`SensorPacket`](#class-sensorpacket) for the datagram itself.
     """

@@ -19,6 +19,15 @@ feeds every Pixelblaze on the network at once. Suggested by the library's
 maintainer (zranger1) on PR #30, after his Java testbed for the same
 protocol, https://github.com/zranger1/SoundServerFX.
 
+The one catch, verified on firmware 3.70: the firmware binds a pattern's
+sensor globals to their source when the *pattern* loads. A pattern that was
+already running when the frames start arriving keeps simulating and ignores
+them, which looks exactly like the packets being malformed. So the bridge
+reloads the active pattern once the frames are flowing (`on_flowing`), which
+is what SoundServerFX's README is getting at when it says to switch to the
+audio-reactive pattern last. Nothing else is required — unicast or
+broadcast, any `senderTime`, any source port, no sync group.
+
 `VarsSink` sends the readings as pattern variables over the websocket with
 `setActiveVariables`. It reaches a Pixelblaze whose sensor sources are
 pinned to local, and it works on any pattern that exports the variables by
@@ -110,7 +119,15 @@ def fft_to_pb_bins(samples: np.ndarray, sample_rate: int,
     if noise_gate > 0:
         spectrum[spectrum < noise_gate] = 0
 
-    # Bin into 32 PB bins
+    # Bin into 32 PB bins.
+    #
+    # The low bands are narrower than the FFT's resolution: at the default
+    # 1024 samples / 48kHz the bins are 46.9Hz apart, while band 0 spans
+    # 32.5-43.3Hz and band 2 spans 61.2-86.6Hz — neither contains an FFT bin
+    # at all, so both used to read a flat 0 forever and the bass end of every
+    # spectrum pattern was dead. Interpolate the spectrum at the band's center
+    # frequency when that happens. (The real sensor board solves this with a
+    # second, downsampled 400Hz FFT for its low six bands.)
     bins = np.zeros(32)
     for b in range(32):
         lo = PB_BIN_EDGES[b]
@@ -118,10 +135,16 @@ def fft_to_pb_bins(samples: np.ndarray, sample_rate: int,
         mask = (freqs >= lo) & (freqs < hi)
         if mask.any():
             bins[b] = spectrum[mask].mean()
+        else:
+            bins[b] = np.interp(PB_BIN_CENTERS[b], freqs, spectrum)
 
-    # Aggregate metrics
+    # Aggregate metrics. The peak search starts above the lowest band edge:
+    # DC and sub-audio rumble otherwise win it outright on most inputs (a mic
+    # with any DC offset pins maxFrequency to 0Hz), which is why the sensor
+    # board's own firmware starts its search at bin 1 rather than bin 0.
     energy_avg = float(spectrum.mean())
-    peak_idx = spectrum.argmax()
+    audible = freqs >= PB_BIN_EDGES[0]
+    peak_idx = int(np.argmax(np.where(audible, spectrum, 0.0)))
     max_freq = float(freqs[peak_idx])
     max_freq_mag = float(spectrum[peak_idx])
 
@@ -187,8 +210,11 @@ class UdpSink:
 
     A Pixelblaze only uses the readings if its source preference for them is
     "prefer remote" (`pb sensor sources --prefer remote`), or if it has no
-    local sensor board to prefer.
+    local sensor board to prefer — and if its pattern was loaded *after* the
+    frames started arriving, which is what `--rebind` takes care of.
     """
+
+    SILENCE_FRAMES = 3
 
     def __init__(self, targets):
         self.sender = SensorSender(targets)
@@ -208,8 +234,13 @@ class UdpSink:
         )
 
     def stop(self):
-        # No sentinels to reset: the firmware ages out remote sensor data on
-        # its own once the frames stop arriving.
+        # A pattern bound to remote sensor data keeps the last frame it was
+        # sent — on 3.70 it was still showing it 100s after the stream stopped,
+        # and reloading the pattern doesn't put it back to simulating either.
+        # So say "silence" on the way out instead of freezing mid-spectrum.
+        # Repeated because this is UDP and the last packet may not arrive.
+        for _ in range(self.SILENCE_FRAMES):
+            self.sender.send()
         self.sender.close()
 
 
@@ -218,8 +249,13 @@ class SoundBridge:
 
     def __init__(self, sink, device_idx: int, sample_rate: int, block_size: int,
                  fps: int, gain: float = 1.0, noise_gate: float = 0.0,
-                 log_scale: bool = False, agc: bool = False):
+                 log_scale: bool = False, agc: bool = False, on_flowing=None):
         self.sink = sink
+        # Called once, after a few frames have gone out. The UDP transport
+        # needs this: a Pixelblaze binds a pattern's sensor globals when the
+        # pattern loads, so the pattern has to be reloaded once data is
+        # actually arriving or it goes on simulating (see UdpSink).
+        self.on_flowing = on_flowing
         self.device_idx = device_idx
         self.sample_rate = sample_rate
         self.block_size = block_size
@@ -228,6 +264,10 @@ class SoundBridge:
         self.noise_gate = noise_gate
         self.log_scale = log_scale
         self.agc = agc
+
+        # Enough frames that the device has certainly seen some, but a small
+        # fraction of a second so the pattern reload isn't a visible pause.
+        self.flowing_after = max(1, fps // 4)
 
         self._latest = None
         self._lock = threading.Lock()
@@ -319,6 +359,10 @@ class SoundBridge:
             return
 
         self.sink.send(data)
+
+        if self.on_flowing is not None and self._frame_count >= self.flowing_after:
+            callback, self.on_flowing = self.on_flowing, None
+            callback()
 
         if data["energyAverage"] > self._peak_energy:
             self._peak_energy = data["energyAverage"]

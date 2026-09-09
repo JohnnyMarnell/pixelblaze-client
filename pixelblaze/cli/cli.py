@@ -2096,6 +2096,9 @@ def sensor_sources(pb: Pixelblaze, preference, sensor_type, no_save):
               help='UDP destination IP (repeatable). Defaults to the Pixelblaze this CLI connects to.')
 @click.option('--broadcast', is_flag=True,
               help='UDP broadcast to every Pixelblaze on the network at once')
+@click.option('--rebind/--no-rebind', default=True,
+              help='UDP: reload each target\'s active pattern once frames are flowing, '
+                   'so the firmware binds them to the stream (default: on)')
 @click.option('--device', '-d', default='blackhole',
               help='Audio input device name substring (default: blackhole)')
 @click.option('--fps', type=int, default=30,
@@ -2114,7 +2117,7 @@ def sensor_sources(pb: Pixelblaze, preference, sensor_type, no_save):
               help='Auto-gain control: adapts gain so peaks stay consistent')
 @click.option('--list-devices', '-l', is_flag=True,
               help='List available audio input devices and exit')
-def sound(ctx, transport, targets, broadcast, device, fps, sample_rate, block_size,
+def sound(ctx, transport, targets, broadcast, rebind, device, fps, sample_rate, block_size,
           gain, noise_gate, log_scale, agc, list_devices):
     """
     Stream audio FFT to Pixelblazes as sensor-board data.
@@ -2140,6 +2143,12 @@ def sound(ctx, transport, targets, broadcast, device, fps, sample_rate, block_si
     Over UDP a Pixelblaze uses these readings when its sound source preference
     is "prefer remote" (`pb sensor sources --prefer remote --type sound`), or
     when it has no local sensor board to prefer.
+
+    The firmware binds a pattern's sensor globals when the pattern loads, so a
+    pattern that was already running keeps simulating and ignores the stream.
+    This reloads the active pattern on each target once frames are flowing;
+    `--no-rebind` leaves it alone, and with `--broadcast` you re-select the
+    pattern yourself.
 
     Requires `sounddevice` and `numpy` on the host. On macOS you'll typically
     also want BlackHole (https://existential.audio/blackhole/) to loopback
@@ -2192,7 +2201,7 @@ def sound(ctx, transport, targets, broadcast, device, fps, sample_rate, block_si
     if log_scale: scaling.append("log")
     if agc: scaling.append("agc")
 
-    def stream(sink):
+    def stream(sink, on_flowing=None):
         log(f"Device: {dev_info['name']}")
         log(f"  Sample rate: {sr} Hz, Block: {block_size}, FPS: {fps}")
         log(f"  Sending: {sink.describe()}")
@@ -2200,7 +2209,8 @@ def sound(ctx, transport, targets, broadcast, device, fps, sample_rate, block_si
             log(f"  Scaling: {', '.join(scaling)}")
         log(f"  Press Ctrl+C to stop\n")
         SoundBridge(sink, dev_idx, sr, block_size, fps, gain=gain,
-                    noise_gate=noise_gate, log_scale=log_scale, agc=agc).run()
+                    noise_gate=noise_gate, log_scale=log_scale, agc=agc,
+                    on_flowing=on_flowing).run()
 
     if transport == 'vars':
         # The websocket has to stay open for the whole run.
@@ -2226,8 +2236,22 @@ def sound(ctx, transport, targets, broadcast, device, fps, sample_rate, block_si
     except OSError as e:
         raise click.ClickException(f"Can't send to {', '.join(targets)}: {e}")
 
-    stream(sink)
-    log("\nStopped.")
+    # Addresses we can actually open a websocket to, to reload their pattern.
+    reloadable = [t for t in targets if not t.endswith('.255')]
+
+    def bind_targets():
+        for address in reloadable:
+            try:
+                with Pixelblaze(address) as pb:
+                    pb.reloadActivePattern()
+                log(f"  Reloaded the active pattern on {address} so it reads the stream")
+            except Exception as e:
+                log(f"  Could not reload the pattern on {address}: {e}")
+        if len(reloadable) < len(targets):
+            log("  Broadcasting: re-select the pattern on each Pixelblaze so it reads the stream")
+
+    stream(sink, on_flowing=bind_targets if rebind else None)
+    log("\nStopped. Sent a frame of silence; patterns hold the last frame otherwise.")
 
 
 @pixelblaze.group()
