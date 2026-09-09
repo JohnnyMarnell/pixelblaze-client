@@ -415,12 +415,22 @@ def word($i): .[($i * 8):($i * 8 + 8)];
 def le32($i): word($i) as $w | ($w[6:8] + $w[4:6] + $w[2:4] + $w[0:2]) | hex2int;
 def ip4($i): word($i) as $w | [$w[0:2], $w[2:4], $w[4:6], $w[6:8]] | map(hex2int | tostring) | join(".");
 def wrap32: (. % 4294967296) | (if . < 0 then . + 4294967296 else . end)
-  | (if . >= 2147483648 then . - 4294967296 else . end);'''
+  | (if . >= 2147483648 then . - 4294967296 else . end);
+def byte($b): .[($b * 2):($b * 2 + 2)] | hex2int;
+def le16($b): .[($b * 2):($b * 2 + 4)] as $w | ($w[2:4] + $w[0:2]) | hex2int;
+def s16($b): le16($b) | (if . >= 32768 then . - 65536 else . end);
+def r4: . * 10000 | round | . / 10000;
+def spark: (if . > 1 then 1 elif . < 0 then 0 else . end)
+  | (. * 7.999 | floor) as $i | [9601 + $i] | implode;'''
 
 # Wire format, from docs/pixelblazeProtocol.md and PixelblazeEnumerator: every
 # word is a little-endian uint32.
 #   beacon   (type 42, 12 bytes): 42, senderId, senderTimeMs
 #   timeSync (type 43, 20 bytes): 43, syncId, nowMs, senderId, senderTimeMs
+#   sensor   (type 50, 104 bytes): 50, senderId, senderTimeMs, expansionType,
+#            3 pad, then the SB1.0 frame of 16-bit readings (see SensorPacket).
+# Sensor readings are uint16 at 65536 = 1.0, except maxFrequency which is Hz
+# and the accelerometer which is signed at 32768 = 1.0.
 # senderId is the Pixelblaze's own IPv4 address in byte order, so it is shown
 # both raw (what the library keys devices by and echoes in timeSync) and dotted.
 # senderTimeMs is the low 32 bits of the device's unix clock in milliseconds.
@@ -444,23 +454,42 @@ _JQ_UDP_DECODE = [
     '   elif $type == 43 and $len >= 20 then',
     '     {kind: "timeSync", src: $src, dst: $dst, sync_id: ($hex | le32(1)), time_ms: ($hex | le32(2)),',
     '      sender_id: ($hex | le32(3)), sender_ip: ($hex | ip4(3)), sender_ms: ($hex | le32(4))}',
+    '   elif $type == 50 and $len >= 104 then',
+    '     [range(0; 32) as $i | ($hex | le16(16 + $i * 2)) / 65536] as $bins',
+    '     | ($bins | max) as $peak',
+    '     | {kind: "sensor", src: $src, dst: $dst, sender_id: ($hex | le32(1)),',
+    '        sender_ms: ($hex | le32(2)), expansion: ($hex | byte(12)),',
+    '        energy: ($hex | le16(80) / 65536 | r4),',
+    '        max_mag: ($hex | le16(82) / 65536 | r4), max_hz: ($hex | le16(84)),',
+    '        accel: [range(0; 3) as $i | ($hex | s16(86 + $i * 2)) / 32768 | r4],',
+    '        light: ($hex | le16(92) / 65536 | r4),',
+    '        analog: [range(0; 5) as $i | ($hex | le16(94 + $i * 2)) / 65536 | r4],',
+    '        peak: ($peak | r4), bins: ($bins | map(r4)),',
+    # Shape at a glance: each band scaled against the loudest one in the frame,
+    # so a spectrum reads as a spectrum however quiet the source is.
+    '        spectrum: (if $peak > 0 then ($bins | map(. / $peak | spark) | join(""))',
+    '                   else "\u2581" * 32 end)}',
     '   else {kind: "unknown", type: $type, src: $src, dst: $dst, len: $len, hex: $hex} end) as $rec',
 ]
 
 
 def _jq_udp_program(show_time: bool, show_endpoints: bool, bare: bool,
                     grep: str | None, exclude: str | None, extra: str | None,
-                    direction: str | None = None) -> str:
+                    direction: str | None = None, sensor_only: bool = False) -> str:
     """Assemble the jq filter for `--udp`.
 
     Every datagram is one record, decoded by packet type. "Requests" are
-    timeSync packets (sent TO a Pixelblaze), "responses" are beacons (sent BY
-    one), so the direction flags keep their meaning from websocket mode.
+    packets sent TO a Pixelblaze (timeSync, and sensor board frames),
+    "responses" are beacons (sent BY one), so the direction flags keep their
+    meaning from websocket mode.
     """
     lines = [_JQ_LE_HELPERS] + list(_JQ_UDP_DECODE)
 
+    if sensor_only:
+        lines.append('| select($rec.kind == "sensor")')
+
     if direction == 'requests':
-        lines.append('| select($rec.kind == "timeSync")')
+        lines.append('| select($rec.kind == "timeSync" or $rec.kind == "sensor")')
     elif direction == 'responses':
         lines.append('| select($rec.kind == "beacon")')
 
@@ -480,7 +509,9 @@ def _jq_udp_program(show_time: bool, show_endpoints: bool, bare: bool,
             leading.append('ts: $clock')
         if show_endpoints:
             trailing += ['dst: $dst', 'sport: $sport', 'dport: $dport']
-        record = '$rec'
+        # 32 floats per frame, 40 frames a second, is not something anyone
+        # reads. The sparkline carries the shape; --bare keeps the numbers.
+        record = '($rec | del(.bins))'
         if leading:
             record = '{' + ', '.join(leading) + '} + ' + record
         if trailing:
@@ -549,6 +580,11 @@ def register(cli_group):
                        'timeSync packets Firestorm answers with. Broadcast, so this sees '
                        'every device on the LAN, not only ones this machine talks to. '
                        'Shows all devices unless --ip or --others narrows it.')
+    @click.option('-S', '--sensor', 'sensor_only', is_flag=True,
+                  help='Implies --udp and shows only sensor board frames: the UDP:1889 '
+                       'audio/accelerometer/light datagrams a sync group leader — or '
+                       '`pb sensor sound` — streams to Pixelblazes. Each line carries a '
+                       'sparkline of the 32 frequency bands; --bare adds the raw numbers.')
     @click.option('-a', '--any', 'any_device', is_flag=True,
                   help='Do not filter by device at all, and skip IP resolution entirely. '
                        'Shows every websocket conversation on the interface.')
@@ -615,7 +651,7 @@ def register(cli_group):
     @click.option('--sudo', 'use_sudo', is_flag=True,
                   help='Run tshark under sudo, for when the capture device is root-only.')
     @click.pass_context
-    def snoop(ctx, udp_mode, any_device, others, host_spec, requests, responses, iface,
+    def snoop(ctx, udp_mode, sensor_only, any_device, others, host_spec, requests, responses, iface,
               ports_csv, midstream, grep, exclude, jq_prog, show_time, bare, full, count,
               duration, read_file, write_file, color_mode, no_color, dry_run, use_sudo):
         """
@@ -678,6 +714,10 @@ def register(cli_group):
         """
         tshark_bin = _require('tshark')
         jq_bin = _require('jq')
+
+        # --sensor is --udp narrowed to one packet type; nothing else about
+        # the capture differs, so just turn udp mode on.
+        udp_mode = udp_mode or sensor_only
 
         live = read_file is None
         if not live and (write_file or count or duration):
@@ -784,7 +824,7 @@ def register(cli_group):
                 show_endpoints=full,
                 bare=bare,
                 grep=grep, exclude=exclude, extra=jq_prog,
-                direction=jq_direction,
+                direction=jq_direction, sensor_only=sensor_only,
             )
         else:
             program = _jq_program(
@@ -829,12 +869,17 @@ def register(cli_group):
             target = ', '.join(_label(ip) for ip in devices) if devices else 'any device'
             port_list = ','.join(str(p) for p in ports)
             if udp_mode:
-                direction = ('timeSync only (-> device)' if requests and not responses else
+                direction = ('sensor board frames only (-> device)' if sensor_only else
+                             'timeSync + sensor only (-> device)' if requests and not responses else
                              'beacons only (<- device)' if responses and not requests else
-                             'beacons + timeSync')
+                             'beacons + timeSync + sensor')
                 log(f"snoop: iface {iface}, udp port {port_list}, {target}, {direction}")
-                log("       every Pixelblaze that is not a sync-group follower beacons "
-                    "about once a second")
+                if sensor_only:
+                    log("       nothing shows until something streams sensor data — a sync "
+                        "group leader, or `pb sensor sound`")
+                else:
+                    log("       every Pixelblaze that is not a sync-group follower beacons "
+                        "about once a second")
             else:
                 direction = ('requests only (-> device)' if requests and not responses else
                              'responses only (<- device)' if responses and not requests else

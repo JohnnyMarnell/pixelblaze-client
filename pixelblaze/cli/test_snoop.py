@@ -158,7 +158,33 @@ UDP_EXPECTED = [
     {'kind': 'timeSync', 'src': HOST, 'dst': DEV2, 'sync_id': 890,
      'time_ms': 0x21D29000, 'sender_ip': DEV2, 'sender_ms': 0x21D28F98},
     {'kind': 'beacon', 'src': DEV, 'sender_ip': DEV, 'sender_ms': 0x21D29123},
+    {'kind': 'sensor', 'src': HOST, 'dst': DEV2, 'sender_id': 0x00D0CAFE,
+     'sender_ms': 0x21D29200, 'expansion': 1, 'energy': 0.25, 'max_mag': 0.5,
+     'max_hz': 1170, 'light': 0.125, 'accel': [0.5, -0.25, 0.0],
+     'analog': [0.75] * 5},
 ]
+
+
+# Bin i carries i/64, so the decoded spectrum is a clean ramp: any off-by-one
+# in the 16-bit offsets shows up as a shifted or scrambled band.
+SENSOR_BINS = [i / 64 for i in range(32)]
+
+
+def _sensor_frame() -> bytes:
+    """One sensor board datagram, built the way `pb sensor sound` builds it."""
+    header = struct.pack('<IIIB3x', 50, 0x00D0CAFE, 0x21D29200, 1)
+    body = struct.pack(
+        '<32HHHH3hH5H',
+        *[int(round(v * 65536)) for v in SENSOR_BINS],
+        16384,          # energyAverage -> 0.25
+        32768,          # maxFrequencyMagnitude -> 0.5
+        1170,           # maxFrequency, in Hz, not scaled
+        16384, -8192, 0,  # accelerometer -> 0.5, -0.25, 0
+        8192,           # light -> 0.125
+        *[49152] * 5,   # analogInputs -> 0.75
+    )
+    assert len(header + body) == 104
+    return header + body
 
 
 def _write_udp_fixture(path: pathlib.Path):
@@ -179,6 +205,7 @@ def _write_udp_fixture(path: pathlib.Path):
         (base, 0, _udp_packet(DEV2, '192.168.1.255', 1889, 1889, beacon)),
         (base, 10000, _udp_packet(HOST, DEV2, 54321, 1889, sync)),
         (base, 500000, _udp_packet(DEV, '255.255.255.255', 1889, 1889, beacon2)),
+        (base, 600000, _udp_packet(HOST, DEV2, 54321, 1889, _sensor_frame())),
     ]
     blob = bytearray(struct.pack('!IHHiIII', 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
     for when, usec, raw in packets:
@@ -307,18 +334,24 @@ def test_udp_filters():
 
 def test_udp_jq_program():
     """Direction is a packet-type select; the envelope adapts like ws mode."""
+    # The readable view drops the 32 raw bands a sensor frame carries; the
+    # sparkline in the same record is what a human reads.
     plain = _jq_udp_program(False, False, False, None, None, None)
-    assert plain.rstrip().endswith('| $rec')
+    assert plain.rstrip().endswith('| ($rec | del(.bins))')
     assert 'select($rec.kind' not in plain
     assert 'def le32' in plain and 'def wrap32' in plain
+    assert 'def le16' in plain and 'def spark' in plain
 
-    assert '| select($rec.kind == "timeSync")' in \
+    assert '| select($rec.kind == "timeSync" or $rec.kind == "sensor")' in \
         _jq_udp_program(False, False, False, None, None, None, direction='requests')
     assert '| select($rec.kind == "beacon")' in \
         _jq_udp_program(False, False, False, None, None, None, direction='responses')
+    assert '| select($rec.kind == "sensor")' in \
+        _jq_udp_program(False, False, False, None, None, None, sensor_only=True)
 
     full = _jq_udp_program(True, True, False, None, None, None)
-    assert full.rstrip().endswith('| {ts: $clock} + $rec + {dst: $dst, sport: $sport, dport: $dport}')
+    assert full.rstrip().endswith(
+        '| {ts: $clock} + ($rec | del(.bins)) + {dst: $dst, sport: $sport, dport: $dport}')
 
     bare = _jq_udp_program(True, True, True, None, None, 'select(.kind == "beacon")')
     assert '$clock' not in bare
@@ -415,7 +448,7 @@ def _run_udp_pipeline(pcap, devices, host, requests=False, responses=False, **pr
         cmd += ['-e', field]
 
     kwargs = dict(show_time=False, show_endpoints=False, bare=False,
-                  grep=None, exclude=None, extra=None)
+                  grep=None, exclude=None, extra=None, sensor_only=False)
     kwargs.update(program_kwargs)
     if requests != responses:
         kwargs['direction'] = 'requests' if requests else 'responses'
@@ -452,22 +485,62 @@ def test_udp_pipeline_round_trip():
         assert all(-2**31 <= r['skew_ms'] < 2**31 for r in records if r['kind'] == 'beacon')
         assert 'skew_ms' not in records[1]
 
-        # Direction: requests are timeSyncs, responses are beacons.
-        assert [r['kind'] for r in _run_udp_pipeline(pcap, [], None, requests=True)] == ['timeSync']
+        # Direction: requests go TO a Pixelblaze (timeSync and sensor frames),
+        # responses come FROM one (beacons).
+        assert [r['kind'] for r in _run_udp_pipeline(pcap, [], None, requests=True)] \
+            == ['timeSync', 'sensor']
         assert [r['kind'] for r in _run_udp_pipeline(pcap, [], None, responses=True)] == ['beacon', 'beacon']
 
-        # A named device keeps its beacon and the timeSync sent to it, not others'.
-        assert [r['src'] for r in _run_udp_pipeline(pcap, [DEV2], None)] == [DEV2, HOST]
+        # A named device keeps its beacon and everything sent to it, not others'.
+        assert [r['src'] for r in _run_udp_pipeline(pcap, [DEV2], None)] == [DEV2, HOST, HOST]
         assert [r['src'] for r in _run_udp_pipeline(pcap, [DEV], None)] == [DEV]
 
         # grep / exclude / full / bare.
         assert [r['src'] for r in _run_udp_pipeline(pcap, [], None, grep='1\\.230')] == [DEV]
-        assert len(_run_udp_pipeline(pcap, [], None, exclude='timeSync')) == 2
+        assert len(_run_udp_pipeline(pcap, [], None, exclude='timeSync')) == 3
         full = _run_udp_pipeline(pcap, [], None, show_time=True, show_endpoints=True)[0]
         assert full['dst'] == '192.168.1.255' and full['dport'] == '1889' and 'ts' in full
         assert list(full)[0] == 'ts'
         assert 'dport' not in _run_udp_pipeline(pcap, [], None, bare=True)[0]
     print("✓ udp pipeline round trip")
+
+
+def test_sensor_frame_decode():
+    """Decode a sensor board datagram: 16-bit offsets, scaling and the sparkline."""
+    with tempfile.TemporaryDirectory() as tmp:
+        pcap = pathlib.Path(tmp) / 'sensor.pcap'
+        _write_udp_fixture(pcap)
+
+        # --sensor drops the beacons and timeSyncs.
+        only = _run_udp_pipeline(pcap, [], None, sensor_only=True)
+        assert [r['kind'] for r in only] == ['sensor'], only
+        record = only[0]
+
+        # Scaling: uint16 at 65536 = 1.0, accelerometer signed at 32768 = 1.0,
+        # maxFrequency straight through in Hz. Measured against firmware 3.70.
+        assert record['energy'] == 0.25
+        assert record['max_mag'] == 0.5
+        assert record['max_hz'] == 1170
+        assert record['light'] == 0.125
+        assert record['accel'] == [0.5, -0.25, 0.0]
+        assert record['analog'] == [0.75] * 5
+        assert abs(record['peak'] - SENSOR_BINS[-1]) <= 1e-4
+
+        # --bare keeps the 32 bands; the readable view swaps them for a sparkline.
+        # Values are rounded to 4 decimals on the way out, so compare loosely.
+        bare = _run_udp_pipeline(pcap, [], None, sensor_only=True, bare=True)[0]
+        assert len(bare['bins']) == 32, bare['bins']
+        assert all(abs(got - want) <= 1e-4 for got, want in zip(bare['bins'], SENSOR_BINS)), \
+            bare['bins']
+        assert 'bins' not in record
+
+        # The ramp has to read as a ramp: bands are scaled against the loudest
+        # one in the frame, so band 31 is full height and band 0 is empty.
+        spectrum = record['spectrum']
+        assert len(spectrum) == 32, spectrum
+        assert spectrum[-1] == '\u2588' and spectrum[0] == '\u2581', spectrum
+        assert list(spectrum) == sorted(spectrum), spectrum
+    print("✓ sensor frame decode")
 
 
 def test_midstream_decode():
@@ -587,7 +660,7 @@ def test_udp_live_capture_path():
         plain = _run_cli(['watch', '--udp', '-i', str(fifo)])
         assert plain.returncode == 0, plain.stderr.decode()
         kinds = [json.loads(line)['kind'] for line in plain.stdout.decode().splitlines()]
-        assert kinds == ['beacon', 'timeSync', 'beacon'], plain.stdout
+        assert kinds == ['beacon', 'timeSync', 'beacon', 'sensor'], plain.stdout
         assert b'Listening for beacons' not in plain.stderr, plain.stderr
 
         # --write plus a direction, with the narrowing done by jq.
@@ -604,7 +677,17 @@ def test_udp_live_capture_path():
         assert saved.exists() and saved.stat().st_size > 0
         replayed = _run_cli(['snoop', '--udp', '--read', str(saved)])
         assert replayed.returncode == 0, replayed.stderr.decode()
-        assert len(replayed.stdout.decode().splitlines()) == 3, replayed.stdout
+        assert len(replayed.stdout.decode().splitlines()) == 4, replayed.stdout
+
+        # --sensor implies --udp and keeps only the sensor board frames.
+        fifo4 = tmpdir / 'fifo4'
+        os.mkfifo(fifo4)
+        _feed_fifo(fifo4, blob)
+        sensed = _run_cli(['snoop', '--sensor', '-i', str(fifo4)])
+        assert sensed.returncode == 0, sensed.stderr.decode()
+        records = [json.loads(line) for line in sensed.stdout.decode().splitlines()]
+        assert [r['kind'] for r in records] == ['sensor'], records
+        assert len(records[0]['spectrum']) == 32 and 'bins' not in records[0]
 
         # An explicit --ip narrows to that device without discovery.
         fifo3 = tmpdir / 'fifo3'
@@ -626,6 +709,7 @@ def main():
     test_udp_jq_program()
     test_pipeline_round_trip()
     test_udp_pipeline_round_trip()
+    test_sensor_frame_decode()
     test_midstream_decode()
     test_live_capture_path()
     test_udp_live_capture_path()

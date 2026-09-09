@@ -168,15 +168,15 @@ $ pb snoop --udp -t
 
 | Field | Meaning |
 |---|---|
-| `kind` | `beacon` (device → broadcast), `timeSync` (Firestorm → device), or `unknown` with the raw `hex` |
+| `kind` | `beacon` (device → broadcast), `timeSync` (Firestorm → device), `sensor` (see below), or `unknown` with the raw `hex` |
 | `sender_id` / `sender_ip` | The same four bytes: the Pixelblaze's IPv4 address, raw as the library keys devices by it, and dotted |
 | `sender_ms` | The device's clock — the low 32 bits of unix time in milliseconds |
 | `skew_ms` | Beacons only: `sender_ms` minus the capture time, i.e. how far the device's clock is from this machine's. What `timeSync` exists to correct |
 | `sync_id`, `time_ms` | timeSync only: the sender's id and authoritative clock |
 
 No `--ip` means every device; the usual forms narrow it. `--requests` keeps
-only `timeSync` packets (sent *to* a device), `--responses` only beacons (sent
-*by* one). The rest of the options apply as-is:
+what is sent *to* a device (`timeSync` and sensor frames), `--responses` only
+beacons (sent *by* one). The rest of the options apply as-is:
 
 ```bash
 pb snoop --udp                        # every beacon on the LAN
@@ -197,6 +197,49 @@ The wire format is three or five little-endian 32-bit words; see the
 [protocol notes](pixelblazeProtocol.md#network-discovery). tshark has no
 dissector for it, so the pipeline pulls the raw bytes with `-e data.data` and
 the jq program decodes them itself — `--dry-run` shows the helper functions.
+
+## Sensor board frames (`--sensor`)
+
+The same UDP port carries Sensor Expansion Board readings: a sync-group leader
+broadcasts its board to the group, and `pb sensor sound` streams a host's
+audio the same way. `--sensor` implies `--udp` and keeps only those frames:
+
+```console
+$ pb snoop --sensor
+{"kind":"sensor","src":"192.168.1.67","dst":"192.168.1.86","sender_id":13683454,"sender_ms":2275967545,"expansion":1,"energy":0.0625,"max_mag":0.3052,"max_hz":1170,"accel":[0,0,0],"light":0.125,"analog":[0,0,0,0,0],"peak":0.003,"spectrum":"▁▁▁▁▁▁▂▃▄▄▅▆▇██████▇▆▅▄▄▃▂▁▁▁▁▁▁"}
+```
+
+| Field | Meaning |
+|---|---|
+| `sender_id`, `sender_ms` | Who sent the frame and when, by their own clock. Neither has to mean anything to the receiver |
+| `expansion` | Expansion type; `1` is an SB1.0 sensor board, the only one defined |
+| `energy` | `energyAverage` — overall loudness, 0.0-1.0 |
+| `max_hz`, `max_mag` | `maxFrequency` in Hz, and its magnitude |
+| `light`, `accel`, `analog` | The board's other readings, as the pattern sees them |
+| `peak` | The loudest of the 32 bands, so the sparkline's scale is legible |
+| `spectrum` | The 32 bands drawn as blocks, each scaled against `peak` — spectrum *shape*, readable however quiet the source is |
+| `bins` | `--bare` only: the 32 bands as numbers |
+
+```bash
+pb snoop --sensor                      # is anything streaming, and what does it look like
+pb snoop --sensor --bare               # the 32 bands as numbers
+pb snoop --sensor --jq '.max_hz'       # just the dominant tone
+pb --ip bike2 snoop --sensor           # only frames aimed at one device
+```
+
+!!! tip "When a sound-reactive pattern isn't reacting"
+
+    `pb snoop --sensor` separates the two halves of the problem. Frames on the
+    wire with a moving `spectrum` means the sending side is fine and the
+    device is the issue — check that its sound source is *Prefer Remote*
+    (`pb sensor sources`), and that the pattern was loaded *after* the frames
+    started, because the firmware binds a pattern's sensor globals when the
+    pattern loads. No frames at all means look at the sender.
+
+The frame is 104 bytes: the 12-byte discovery header, an expansion type byte
+and three of padding, then 44 little-endian 16-bit readings. See the
+[protocol notes](pixelblazeProtocol.md#sensor-board-packet) for the layout and
+the scaling.
 
 ## Saving and replaying
 

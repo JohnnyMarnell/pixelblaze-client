@@ -58,8 +58,26 @@
 >   all (bike2 following an offline bike1 → zero packets on the LAN, `pb find`
 >   empty while the web UI works fine). `pb find` needs a non-beacon fallback;
 >   that work is on `cli-top`.
-> - Still unverified against live hardware from this machine (BPF is root-only
->   here); the FIFO tests cover the pipeline end to end on synthetic packets.
+> - ~~Still unverified against live hardware from this machine~~ — verified
+>   2026-09-09: real beacons and real sensor frames decode off `en0`.
+>   The FIFO tests still cover the pipeline end to end on synthetic packets.
+>
+> ### 2b. Sensor board frames — ✅ done: `pb snoop --sensor`
+>
+> Same UDP:1889, packet type 50: a sync-group leader broadcasting its Sensor
+> Expansion Board, or `pb sensor sound` (#30) streaming a host's audio.
+>
+> - `--sensor` implies `--udp` and filters to that one type. Frames are sent
+>   *to* a device, so they land in the `--requests` bucket with timeSync.
+> - Decoded with two more jq helpers, `le16`/`s16` — the body is 44 16-bit
+>   readings, not 32-bit words like the beacon.
+> - 32 floats a line at 40Hz is unreadable, so the default view carries a
+>   `spectrum` sparkline (each band scaled against the frame's own peak, so
+>   shape survives a quiet source) and `--bare` keeps the raw `bins`.
+> - **Discovered while building it** (on #30, the sensor bridge): the firmware
+>   binds a pattern's sensor globals when the *pattern* loads. Data arriving
+>   for an already-running pattern is ignored. That is the first thing to
+>   check when `--sensor` shows a healthy stream and the LEDs disagree.
 >
 > ### 3. Other power-user snooping to try
 >
