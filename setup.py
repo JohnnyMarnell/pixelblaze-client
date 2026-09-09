@@ -35,7 +35,9 @@ setuptools.setup(
       "lzstring",
       "tqdm",
     ],
-    packages=["pixelblaze"],
+    # `pixelblaze.cli` has to be listed too, or `pip install pixelblaze-client`
+    # ships a `pb` console script whose entry point isn't there to import.
+    packages=["pixelblaze", "pixelblaze.cli"],
     python_requires='>=3.9',
     entry_points={
         'console_scripts': [

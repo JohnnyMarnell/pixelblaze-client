@@ -2248,9 +2248,11 @@ def sensor():
     """
     Push sensor data into pattern globals from host-side sources.
 
-    Feeds the same variables a physical Pixelblaze Sensor Expansion Board
+    Feeds the same readings a physical Pixelblaze Sensor Expansion Board
     would emit (frequencyData, energyAverage, maxFrequency, ...), so
-    sound-reactive patterns work with no SB attached.
+    sound-reactive patterns work with no SB attached — by default over the
+    board's own UDP protocol, which costs the device no pattern framerate and
+    can feed every Pixelblaze on the network at once.
     """
     pass
 
@@ -2297,11 +2299,22 @@ def sensor_sources(pb: Pixelblaze, preference, sensor_type, no_save):
     log(f"✓ {', '.join(types)} → prefer {preference} ({action})")
 
 
-@cli(sensor)
+@cli(sensor, conn=False)
+@click.option('--transport', type=click.Choice(['udp', 'vars'], case_sensitive=False),
+              default='udp',
+              help='How to deliver the data: udp = sensor-board datagrams (default), '
+                   'vars = setVars over the websocket')
+@click.option('--target', '-t', 'targets', multiple=True,
+              help='UDP destination IP (repeatable). Defaults to the Pixelblaze this CLI connects to.')
+@click.option('--broadcast', is_flag=True,
+              help='UDP broadcast to every Pixelblaze on the network at once')
+@click.option('--rebind/--no-rebind', default=True,
+              help='UDP: reload each target\'s active pattern once frames are flowing, '
+                   'so the firmware binds them to the stream (default: on)')
 @click.option('--device', '-d', default='blackhole',
               help='Audio input device name substring (default: blackhole)')
 @click.option('--fps', type=int, default=30,
-              help='How often to push data to PB (default: 30)')
+              help='How often to push data to PB (default: 30; a real sensor board runs at 40)')
 @click.option('--sample-rate', '-r', type=int, default=None,
               help='Sample rate in Hz (default: device native)')
 @click.option('--block-size', '-b', type=int, default=1024,
@@ -2316,15 +2329,38 @@ def sensor_sources(pb: Pixelblaze, preference, sensor_type, no_save):
               help='Auto-gain control: adapts gain so peaks stay consistent')
 @click.option('--list-devices', '-l', is_flag=True,
               help='List available audio input devices and exit')
-def sound(pb: Pixelblaze, device, fps, sample_rate, block_size,
+def sound(ctx, transport, targets, broadcast, rebind, device, fps, sample_rate, block_size,
           gain, noise_gate, log_scale, agc, list_devices):
     """
-    Stream audio FFT to the Pixelblaze as sensor-board-shaped vars.
+    Stream audio FFT to Pixelblazes as sensor-board data.
 
     Captures audio from a system device (mic, loopback, etc.), computes
-    32 frequency bins matching the PB Sensor Board format, and pushes
-    frequencyData, energyAverage, maxFrequency, maxFrequencyMagnitude
-    as pattern variables via setVars.
+    32 frequency bins matching the PB Sensor Board format, and streams
+    frequencyData, energyAverage, maxFrequency and maxFrequencyMagnitude
+    to the device.
+
+    \b
+    Transports:
+        --transport udp     (default) the same UDP datagrams a sync group
+                            leader uses to share its sensor board. The device
+                            does no JSON parsing, so this costs it no pattern
+                            framerate, and one --broadcast feeds every
+                            Pixelblaze on the network at once.
+        --transport vars    setVars over the websocket. Reaches a device
+                            pinned to local sensor sources, and works with any
+                            pattern exporting the variables by name, but the
+                            device parses JSON on its render thread every
+                            frame — expect lost framerate on complex patterns.
+
+    Over UDP a Pixelblaze uses these readings when its sound source preference
+    is "prefer remote" (`pb sensor sources --prefer remote --type sound`), or
+    when it has no local sensor board to prefer.
+
+    The firmware binds a pattern's sensor globals when the pattern loads, so a
+    pattern that was already running keeps simulating and ignores the stream.
+    This reloads the active pattern on each target once frames are flowing;
+    `--no-rebind` leaves it alone, and with `--broadcast` you re-select the
+    pattern yourself.
 
     Requires `sounddevice` and `numpy` on the host. On macOS you'll typically
     also want BlackHole (https://existential.audio/blackhole/) to loopback
@@ -2340,14 +2376,17 @@ def sound(pb: Pixelblaze, device, fps, sample_rate, block_size,
 
     \b
     Examples:
-        pb sensor sound                          # Stream from BlackHole
+        pb sensor sound                          # UDP to the discovered PB
+        pb sensor sound --broadcast              # UDP to every PB on the network
+        pb sensor sound -t 192.168.1.24 -t 192.168.1.25
+        pb sensor sound --transport vars         # old setVars path
         pb sensor sound -d "MacBook"             # Stream from built-in mic
         pb sensor sound --agc                    # Auto-gain (adapts to volume)
         pb sensor sound -g 20 --log              # Boost + compress for mic
-        pb sensor sound --fps 60                 # Push at 60Hz
+        pb sensor sound --fps 40                 # Match the real sensor board
         pb sensor sound -l                       # List input devices
     """
-    from pixelblaze.cli.sensor_bridge import find_device, SoundBridge
+    from pixelblaze.cli.sensor_bridge import find_device, SoundBridge, UdpSink, VarsSink
 
     if list_devices:
         import sounddevice as sd
@@ -2359,6 +2398,11 @@ def sound(pb: Pixelblaze, device, fps, sample_rate, block_size,
                     f"rate={int(dev['default_samplerate'])}){marker}")
         return
 
+    transport = transport.lower()
+    targets = list(targets) + (['255.255.255.255'] if broadcast else [])
+    check(transport == 'udp' or not targets,
+          "--target and --broadcast only apply to --transport udp")
+
     log(f"Looking for audio device matching '{device}'...")
     dev_idx, dev_info = find_device(device)
     sr = sample_rate or int(dev_info['default_samplerate'])
@@ -2369,17 +2413,57 @@ def sound(pb: Pixelblaze, device, fps, sample_rate, block_size,
     if log_scale: scaling.append("log")
     if agc: scaling.append("agc")
 
-    log(f"Device: {dev_info['name']}")
-    log(f"  Sample rate: {sr} Hz, Block: {block_size}, FPS: {fps}")
-    if scaling:
-        log(f"  Scaling: {', '.join(scaling)}")
-    log(f"  Press Ctrl+C to stop\n")
+    def stream(sink, on_flowing=None):
+        log(f"Device: {dev_info['name']}")
+        log(f"  Sample rate: {sr} Hz, Block: {block_size}, FPS: {fps}")
+        log(f"  Sending: {sink.describe()}")
+        if scaling:
+            log(f"  Scaling: {', '.join(scaling)}")
+        log(f"  Press Ctrl+C to stop\n")
+        SoundBridge(sink, dev_idx, sr, block_size, fps, gain=gain,
+                    noise_gate=noise_gate, log_scale=log_scale, agc=agc,
+                    on_flowing=on_flowing).run()
 
-    bridge = SoundBridge(pb, dev_idx, sr, block_size, fps,
-                         gain=gain, noise_gate=noise_gate,
-                         log_scale=log_scale, agc=agc)
-    bridge.run()
-    log("\nStopped. Sensor sentinels reset.")
+    if transport == 'vars':
+        # The websocket has to stay open for the whole run.
+        with get_pixelblaze(ctx) as pb:
+            stream(VarsSink(pb))
+        log("\nStopped. Sensor sentinels reset.")
+        return
+
+    if not targets:
+        # No explicit targets: aim at the Pixelblaze this CLI would talk to
+        # anyway, and use the connection to flag a preference that would keep
+        # the device from listening. Then let it go — UDP needs no websocket,
+        # and an idle open session is one the firmware can hang onto.
+        with get_pixelblaze(ctx) as pb:
+            targets = [pb.ipAddress]
+            if pb.getSensorSources()['sound'] == Pixelblaze.sensorSources.preferLocal:
+                log("Note: this Pixelblaze prefers its LOCAL sound source. With no sensor "
+                    "board attached it falls back to these frames anyway; to be sure, run "
+                    "`pb sensor sources --prefer remote --type sound`.")
+
+    try:
+        sink = UdpSink(targets)
+    except OSError as e:
+        raise click.ClickException(f"Can't send to {', '.join(targets)}: {e}")
+
+    # Addresses we can actually open a websocket to, to reload their pattern.
+    reloadable = [t for t in targets if not t.endswith('.255')]
+
+    def bind_targets():
+        for address in reloadable:
+            try:
+                with Pixelblaze(address) as pb:
+                    pb.reloadActivePattern()
+                log(f"  Reloaded the active pattern on {address} so it reads the stream")
+            except Exception as e:
+                log(f"  Could not reload the pattern on {address}: {e}")
+        if len(reloadable) < len(targets):
+            log("  Broadcasting: re-select the pattern on each Pixelblaze so it reads the stream")
+
+    stream(sink, on_flowing=bind_targets if rebind else None)
+    log("\nStopped. Sent a frame of silence; patterns hold the last frame otherwise.")
 
 
 @cli(pixelblaze, conn=False)
