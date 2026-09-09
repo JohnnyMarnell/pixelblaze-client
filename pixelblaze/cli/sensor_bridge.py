@@ -1,4 +1,4 @@
-"""Virtual Pixelblaze Sensor Board — feed sensor-shaped vars into patterns.
+"""Virtual Pixelblaze Sensor Board — feed sensor-shaped readings into patterns.
 
 The Pixelblaze Sensor Expansion Board publishes a specific set of pattern
 globals (`frequencyData[32]`, `energyAverage`, `maxFrequency`,
@@ -8,31 +8,45 @@ physical SB attached.
 
 Currently implemented: `SoundBridge` — captures audio from a system input
 device (mic, loopback, etc.), computes 32 log-spaced frequency bins on the
-same center-frequency grid the SB uses, and streams them to a Pixelblaze
-via `setActiveVariables` at a configurable frame rate.
+same center-frequency grid the SB uses, and streams them to a Pixelblaze at
+a configurable frame rate over one of two transports:
 
-Future sources can share the same var-push contract:
-  variables = {
-    "frequencyData": [32 floats],   # the WHOLE array — see below
-    "energyAverage": float,
-    "maxFrequency": Hz,
-    "maxFrequencyMagnitude": float,
-    "light": 0,   # sentinel that a real sensor source is active
-  }
+`UdpSink` (the default) sends the same UDP datagrams a sync-group leader
+uses to share its sensor board with the group — see `SensorPacket` in
+`pixelblaze.pixelblaze` for the wire format. The device does no JSON
+parsing, so streaming costs it no pattern framerate, and a single broadcast
+feeds every Pixelblaze on the network at once. Suggested by the library's
+maintainer (zranger1) on PR #30, after his Java testbed for the same
+protocol, https://github.com/zranger1/SoundServerFX.
 
-Arrays must be sent whole. Verified on firmware 3.51 and 3.70 (the same
-device, before and after upgrading, 2026-09-08): `{"setVars":
-{"frequencyData": [..32..]}}` lands in the pattern, while the indexed form
-`{"setVars": {"frequencyData[3]": v}}` is silently dropped on both —
-`light` flips to 0, the bins never move, and the pattern's last simulated
-frame sits there frozen. (`getVars` returns arrays whole too.) The bridge
-sent the indexed form until this note was written.
+`VarsSink` sends the readings as pattern variables over the websocket with
+`setActiveVariables`. It reaches a Pixelblaze whose sensor sources are
+pinned to local, and it works on any pattern that exports the variables by
+name whether or not it is a sensor board pattern — but the device parses
+JSON on its render thread for every frame, which costs framerate on complex
+patterns and gets worse on a marginal wifi link.
+
+Both transports carry the same reading contract:
+  frequencyData: [32 floats]  # magnitudes, nominally 0.0-1.0
+  energyAverage: float        # overall loudness, nominally 0.0-1.0
+  maxFrequency: float         # Hz
+  maxFrequencyMagnitude: float
+
+Notes on the vars transport, verified on firmware 3.51 and 3.70 (the same
+device, before and after upgrading, 2026-09-08): arrays must be sent whole.
+`{"setVars": {"frequencyData": [..32..]}}` lands in the pattern, while the
+indexed form `{"setVars": {"frequencyData[3]": v}}` is silently dropped on
+both — `light` flips to 0, the bins never move, and the pattern's last
+simulated frame sits there frozen. (`getVars` returns arrays whole too.)
+The UDP transport has no such wrinkle; it carries the whole frame always.
 """
 
 import threading
 import time
 import numpy as np
 import sounddevice as sd
+
+from pixelblaze.pixelblaze import SensorSender
 
 # PB sensor board bin center frequencies (from stock pattern source)
 PB_BIN_CENTERS = np.array([
@@ -119,13 +133,93 @@ def fft_to_pb_bins(samples: np.ndarray, sample_rate: int,
     }
 
 
-class SoundBridge:
-    """Captures audio and pushes FFT results to a Pixelblaze."""
+class VarsSink:
+    """Sends sensor readings as pattern variables over the websocket.
 
-    def __init__(self, pb, device_idx: int, sample_rate: int, block_size: int,
+    The original transport for this bridge, kept as an alternative to
+    `UdpSink`: it reaches a Pixelblaze whose sensor sources are pinned to
+    local, and it works with any pattern that exports the variables by name.
+    The cost is that the device parses a JSON frame on its render thread every
+    time, which shows up as lost framerate on complex patterns.
+    """
+
+    def __init__(self, pb):
+        self.pb = pb
+
+    def describe(self) -> str:
+        return f"setVars over websocket → {self.pb.ipAddress}"
+
+    def start(self):
+        # Signal to PB patterns that real sensor data is available
+        self.pb.setActiveVariables({"light": 0})
+
+    def send(self, data: dict):
+        # frequencyData goes as one array: firmware applies whole arrays and
+        # silently ignores "frequencyData[i]" keys (see module docstring).
+        # Round to 6 decimals — finer than the device's 16.16 fixed point, a
+        # third the JSON of a full double at `fps` frames per second.
+        self.pb.setActiveVariables({
+            "frequencyData": [round(v, 6) for v in data["frequencyData"]],
+            "energyAverage": round(data["energyAverage"], 6),
+            "maxFrequency": round(data["maxFrequency"], 6),
+            "maxFrequencyMagnitude": round(data["maxFrequencyMagnitude"], 6),
+            "light": 0,
+        })
+
+    def stop(self):
+        # Reset sentinels so patterns know sensor data stopped and go back to
+        # simulating sound. Nothing expires a variable we set, so we must.
+        self.pb.setActiveVariables({
+            "light": -1,
+            "maxFrequencyMagnitude": -1,
+            "energyAverage": -1,
+        })
+
+
+class UdpSink:
+    """Sends sensor readings as sensor-board UDP datagrams (the default transport).
+
+    This is the protocol a Pixelblaze sync group leader uses to share its own
+    Sensor Expansion Board with the rest of the group, so the readings arrive
+    the way the firmware already expects them: no JSON, no websocket, no
+    parsing on the render thread, and one broadcast feeds every Pixelblaze on
+    the network at once.
+
+    A Pixelblaze only uses the readings if its source preference for them is
+    "prefer remote" (`pb sensor sources --prefer remote`), or if it has no
+    local sensor board to prefer.
+    """
+
+    def __init__(self, targets):
+        self.sender = SensorSender(targets)
+
+    def describe(self) -> str:
+        return f"sensor board UDP → {', '.join(self.sender.targets)}:{self.sender.port}"
+
+    def start(self):
+        pass
+
+    def send(self, data: dict):
+        self.sender.send(
+            frequencyData=data["frequencyData"],
+            energyAverage=data["energyAverage"],
+            maxFrequency=data["maxFrequency"],
+            maxFrequencyMagnitude=data["maxFrequencyMagnitude"],
+        )
+
+    def stop(self):
+        # No sentinels to reset: the firmware ages out remote sensor data on
+        # its own once the frames stop arriving.
+        self.sender.close()
+
+
+class SoundBridge:
+    """Captures audio and pushes FFT results to a Pixelblaze through a transport sink."""
+
+    def __init__(self, sink, device_idx: int, sample_rate: int, block_size: int,
                  fps: int, gain: float = 1.0, noise_gate: float = 0.0,
                  log_scale: bool = False, agc: bool = False):
-        self.pb = pb
+        self.sink = sink
         self.device_idx = device_idx
         self.sample_rate = sample_rate
         self.block_size = block_size
@@ -196,8 +290,7 @@ class SoundBridge:
 
         push_interval = 1.0 / self.fps
 
-        # Signal to PB patterns that real sensor data is available
-        self.pb.setActiveVariables({"light": 0})
+        self.sink.start()
 
         with sd.InputStream(
             samplerate=self.sample_rate,
@@ -215,12 +308,7 @@ class SoundBridge:
                 pass
             finally:
                 self._running = False
-                # Reset sentinel so patterns know sensor data stopped
-                self.pb.setActiveVariables({
-                    "light": -1,
-                    "maxFrequencyMagnitude": -1,
-                    "energyAverage": -1,
-                })
+                self.sink.stop()
 
     def _push_frame(self):
         with self._lock:
@@ -230,20 +318,7 @@ class SoundBridge:
         if data is None:
             return
 
-        # Build setVars payload. frequencyData goes as one array: firmware
-        # applies whole arrays and silently ignores "frequencyData[i]" keys
-        # (see module docstring). Round to 6 decimals — finer than the
-        # device's 16.16 fixed point, a third the JSON of a full double at
-        # `fps` frames per second.
-        variables = {
-            "frequencyData": [round(v, 6) for v in data["frequencyData"]],
-            "energyAverage": round(data["energyAverage"], 6),
-            "maxFrequency": round(data["maxFrequency"], 6),
-            "maxFrequencyMagnitude": round(data["maxFrequencyMagnitude"], 6),
-            "light": 0,
-        }
-
-        self.pb.setActiveVariables(variables)
+        self.sink.send(data)
 
         if data["energyAverage"] > self._peak_energy:
             self._peak_energy = data["energyAverage"]
