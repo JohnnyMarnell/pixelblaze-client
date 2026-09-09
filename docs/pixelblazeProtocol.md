@@ -403,6 +403,10 @@ The remaining 88 bytes are the sensor readings, in the order and at the offsets 
 | 92 | uint16 | `light` | ambient light level, _value_ / 65536 |
 | 94 | uint16[5] | `analogInputs` | five inputs of 12-bit resolution shifted up to 16 bits, _value_ / 65536 |
 
-*Note: the scaling above follows from the sensor board firmware, where the light and analog readings are 12-bit ADC values shifted up to 16 bits and the frequency magnitudes are multiplied by 16 and saturated at 16 bits; a full-scale reading is therefore 65535, not 32768.*
+*Note: a receiving Pixelblaze binds a pattern's sensor globals to their source when the **pattern loads**. A pattern that was already running when the packets started arriving keeps using its own simulated values and ignores them — which looks exactly like the packets being malformed. Send a few frames, then re-select the pattern (`{"activeProgramId": "<the id already running>"}`). Nothing else is required: unicast and broadcast both work, `senderTime` can be any value, the source port is irrelevant, and no sync group or leader relationship is needed.*
+
+*Note: once bound, a pattern keeps the last frame it was sent. On firmware 3.70 it was still displaying it 100 seconds after the stream stopped, and reloading the pattern does not restore simulation — so a sender that is shutting down should send a frame of zeroes rather than simply stopping.*
+
+*Note: the scaling above follows from the sensor board firmware, where the light and analog readings are 12-bit ADC values shifted up to 16 bits and the frequency magnitudes are multiplied by 16 and saturated at 16 bits; a full-scale reading is therefore 65535, not 32768. Confirmed on firmware 3.70 by sending known values and reading the pattern's globals back with `getVars`: `light` 8192 → 0.125, `frequencyData[16]` 16384 → 0.25, `energyAverage` 16384 → 0.25, `maxFrequency` 1170 → 1170.*
 
 *Note: the sensor board itself sends this frame over serial at 115200 baud, wrapped in its `"SB1.0"` header and `"END"` footer; the UDP form drops both and prefixes the discovery header instead. A Pixelblaze whose sensor sources all prefer local, and which has a board attached, ignores these packets entirely.*
