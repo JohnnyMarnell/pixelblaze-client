@@ -731,14 +731,58 @@ class Pixelblaze:
                 self._open()
                 # raise
 
-    def getPeers(self):
-        """A new command, added to the API but not yet implemented as of v2.29/v3.24, that will return a list of all the Pixelblazes visible on the local network segment.
+    def wsSendBinaryChunked(self, binaryMessageType: messageTypes, payload: bytes, *, maxFrameSize: int = 1280, sleepTime: float = 0.02):
+        """Fire-and-forget chunked binary send with no per-chunk ack wait.
+
+        Sibling of `wsSendBinary` for message types where waiting on a
+        per-chunk response is unreliable (e.g. `putSourceCode`). Builds the
+        2-byte frame header internally, filling byte 1 with the continuation
+        flags for each chunk.
+
+        Args:
+            binaryMessageType (messageTypes): The binary message type to send.
+            payload (bytes): The body to send, split at `maxFrameSize`.
+            maxFrameSize (int, optional): Chunk size in bytes. Defaults to 1280.
+            sleepTime (float, optional): Delay between chunks in seconds. Defaults to 0.02.
+        """
+        frameHeader = bytearray(2)
+        frameHeader[0] = binaryMessageType.value
+        for i in range(0, len(payload), maxFrameSize):
+            flags = self.frameTypes.frameNone
+            if i == 0:
+                flags |= self.frameTypes.frameFirst
+            if (len(payload) - i) > maxFrameSize:
+                flags |= self.frameTypes.frameMiddle
+            else:
+                flags |= self.frameTypes.frameLast
+            frameHeader[1] = flags.value
+            self.ws.send_binary(bytes(frameHeader) + payload[i:i + maxFrameSize])
+            time.sleep(sleepTime)
+
+    def getPeers(self) -> list[dict]:
+        """Returns the sync-group peers this Pixelblaze is aware of.
+
+        In group-sync (leader/follower) setups, follower devices do not
+        broadcast LAN beacons on UDP:1889 — so `EnumerateAddresses` misses
+        them. `getPeers` asks the Pixelblaze for its current view of the
+        sync group, which the firmware maintains via peer-to-peer discovery.
+
+        Confirmed working on firmware v3.51.
 
         Returns:
-            TBD: To be defined once @wizard implements the function.
+            list[dict]: One entry per peer, empty list if no peers. Each entry:
+                id (int): chipId of the peer.
+                address (str): IPv4 address.
+                name (str): device name.
+                ver (str): firmware version.
+                isFollowing (int): 1 if this peer is a follower, 0 if leader/solo.
+                nodeId (int): sync-group node id.
+                followerCount (int): number of followers this peer has.
         """
-        self.wsSendJson({"getPeers": True})
-        return self.wsReceive(binaryMessageType=None)
+        response = self.wsSendJson({"getPeers": True}, expectedResponse="peers")
+        if response is None:
+            return []
+        return json.loads(response).get("peers", [])
 
     # --- PIXELBLAZE FILESYSTEM FUNCTIONS:
 
@@ -1122,15 +1166,19 @@ class Pixelblaze:
         """
         return json.loads(self.wsSendJson({"getPlaylist": playlistId}, expectedResponse="playlist"))
 
-    def setSequencerPlaylist(self, playlistContents: dict, playlistId: str = "_defaultplaylist_"):
+    def setSequencerPlaylist(self, playlistContents: dict, playlistId: str = "_defaultplaylist_", *, saveToFlash: bool = False):
         """Replaces the entire contents of the specified playlist.  At the moment, only the default playlist is supported by the Pixelblaze.
 
         Args:
             playlistContents (dict): The new playlist contents.
             playlistId (str, optional): The name of the playlist (for future enhancement; currently only '_defaultplaylist_' is supported). Defaults to "_defaultplaylist_".
+            saveToFlash (bool, optional): If True, adds an outer `save: true` so the firmware writes the playlist to `/l/<playlistId>` (persists across reboots). Defaults to False (RAM-only — lost on reboot).
         """
         self.latestSequencer = None  # clear cache to force refresh
-        ignored = self.wsSendJson(playlistContents, expectedResponse=None)
+        payload = dict(playlistContents)
+        if saveToFlash:
+            payload['save'] = True
+        ignored = self.wsSendJson(payload, expectedResponse=None)
 
     def addToSequencerPlaylist(self, playlistContents: dict, *, patternId: str, duration: int) -> dict:
         """Appends a new entry to the specified playlist.
@@ -2309,6 +2357,95 @@ class Pixelblaze:
         if payload:  # Only send if there's something to set
             self.wsSendJson(payload, expectedResponse=None)
 
+    # --- SETTINGS menu: WIFI settings (HTTP-only, no WebSocket required)
+
+    class wifiModes(IntEnum):
+        """WiFi operating modes reported by the Pixelblaze."""
+        modeClient = 3
+        modeAccessPoint = 6
+        modeSetup = 255
+
+    @staticmethod
+    def getWifiStatus(ipAddress: str, timeout: float = 5.0) -> dict:
+        """Returns the current WiFi status of the Pixelblaze.
+
+        This is an HTTP-only call that works even in ad-hoc/setup mode without a WebSocket connection.
+
+        Args:
+            ipAddress (str): The IP address of the Pixelblaze.
+            timeout (float): Request timeout in seconds. Defaults to 5.0.
+
+        Returns:
+            dict: WiFi status with keys: status (int), ip (str), ssid (str), mac (str).
+        """
+        response = requests.get(f"http://{ipAddress}/wifistatus", timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    @staticmethod
+    def getWifiScan(ipAddress: str, timeout: float = 15.0, poll_interval: float = 1.0) -> list[dict]:
+        """Scans for available WiFi access points.
+
+        This is an HTTP-only call that works even in ad-hoc/setup mode without a WebSocket connection.
+        Polls until the scan completes.
+
+        Args:
+            ipAddress (str): The IP address of the Pixelblaze.
+            timeout (float): Maximum time to wait for scan results in seconds. Defaults to 15.0.
+            poll_interval (float): Time between poll attempts in seconds. Defaults to 1.0.
+
+        Returns:
+            list[dict]: List of access points, each with keys: rssi (int), ssid (str), bssid (str), channel (int), secure (bool).
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            response = requests.get(f"http://{ipAddress}/wifiscan", timeout=5.0)
+            response.raise_for_status()
+            result = response.json()
+            if isinstance(result, list):
+                return result
+            # Still scanning — {"scanning": 1}
+            time.sleep(poll_interval)
+        return []
+
+    @staticmethod
+    def setWifiConfig(ipAddress: str, mode: str, ssid: str = "", passphrase: str = "", discover: bool = True, timeout: float = 5.0) -> dict:
+        """Sets the WiFi configuration on the Pixelblaze.
+
+        This is an HTTP-only call that works even in ad-hoc/setup mode without a WebSocket connection.
+
+        Args:
+            ipAddress (str): The IP address of the Pixelblaze.
+            mode (str): WiFi mode — "CLIENT", "AP", or "SETUP".
+            ssid (str): The SSID of the network to join or create. Defaults to "".
+            passphrase (str): The password for the network. Defaults to "".
+            discover (bool): Whether to enable Electromage discovery. Defaults to True.
+            timeout (float): Request timeout in seconds. Defaults to 5.0.
+
+        Returns:
+            dict: Response from the Pixelblaze, typically {"ack": 1}.
+        """
+        payload = {
+            "mode": mode,
+            "ssid": ssid,
+            "passphrase": passphrase,
+            "discover": "true" if discover else "false",
+        }
+        response = requests.post(
+            f"http://{ipAddress}/wifisave",
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+            timeout=timeout,
+        )
+        if response.status_code == 400:
+            # Return the raw response for debugging
+            raise requests.HTTPError(
+                f"400 Bad Request from /wifisave (body: {response.text!r})",
+                response=response,
+            )
+        response.raise_for_status()
+        return response.json()
+
     # --- SETTINGS menu: UPDATES settings
 
     class updateStates(IntEnum):
@@ -3194,7 +3331,10 @@ class PBP:
         # Send via WebSocket using Packet Type 1 (putSourceCode / SAVEPROGRAMSOURCEFILE)
         # The firmware expects: patternId (17 bytes) + binary blob
         payload = self.__id.encode('utf-8') + self.__binaryData
-        pb.wsSendBinary(pb.messageTypes.putSourceCode, payload, expectedResponse="ack")
+
+        # Pattern binary sending was often failing until we switched to
+        # fire-and-forget chunked send with no per-chunk ack waiting.
+        pb.wsSendBinaryChunked(pb.messageTypes.putSourceCode, payload)
 
     def toEPE(
             self) -> 'EPE':  # 'Quoted' to defer resolution of forward reference; or could use 'from __future__ import annotations'

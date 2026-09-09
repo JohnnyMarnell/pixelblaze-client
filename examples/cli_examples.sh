@@ -64,22 +64,26 @@ pb map --csv
 # =================
 
 # Start the sequencer
-pb seq play
+pb playlist play
 
 # Pause the sequencer
-pb seq pause
+pb playlist pause
 
 # Go to next pattern
-pb seq next
+pb playlist next
 
 # Jump to random pattern
-pb seq rand
+pb playlist rand
 
 # Set all patterns to 10 seconds
-pb seq len 10
+pb playlist len 10
 
 # Set all patterns to 30 seconds and save
-pb seq len 30 --save
+pb playlist len 30 --save
+
+# Save the playlist matching case insensitive CSV pattern name substrings,
+# each 15 seconds, shuffle the supplied order
+pb playlist set 'blink fade,block reflections,honeycom,xorc' --shuffle -d 15
 
 
 # Live Pattern Rendering (Temporary)
