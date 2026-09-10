@@ -216,8 +216,8 @@ class UdpSink:
 
     SILENCE_FRAMES = 3
 
-    def __init__(self, targets):
-        self.sender = SensorSender(targets)
+    def __init__(self, targets, senderId: int = None):
+        self.sender = SensorSender(targets, senderId=senderId)
 
     def describe(self) -> str:
         return f"sensor board UDP → {', '.join(self.sender.targets)}:{self.sender.port}"

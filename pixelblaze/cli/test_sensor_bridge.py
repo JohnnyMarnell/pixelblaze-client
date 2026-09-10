@@ -9,6 +9,8 @@ with a frame of the shape `SoundBridge` produces.
 
 import socket
 
+import pytest
+
 from pixelblaze.pixelblaze import SensorPacket
 from pixelblaze.cli.sensor_bridge import UdpSink, VarsSink
 
@@ -163,3 +165,123 @@ def test_udp_sink_sends_silence_on_stop():
             assert silence["maxFrequency"] == 0.0
     finally:
         receiver.close()
+
+
+# ── --peers target assembly ─────────────────────────────────────────────────
+# `_peer_targets` owns no discovery of its own: it leans on
+# enumerate_pixelblazes (ad-hoc + beacons + each device's peer list) and on
+# getPeers for roles. These stub both, to check the assembly, not the network.
+
+class FakeGroupMember:
+    """Stands in for a connected Pixelblaze during --peers target assembly."""
+
+    unreachable = set()
+    settings = {}
+    peers = []
+
+    def __init__(self, ip):
+        self.ipAddress = ip
+        if ip in FakeGroupMember.unreachable:
+            raise OSError(f"no route to {ip}")
+
+    def __enter__(self): return self
+    def __exit__(self, *exc): return False
+    def getConfigSettings(self): return dict(FakeGroupMember.settings)
+    def getPeers(self): return [dict(p) for p in FakeGroupMember.peers]
+
+
+def withFakeNetwork(found, settings, peers, unreachable=()):
+    """Run _peer_targets against a stubbed network."""
+    from pixelblaze.cli import cli as cli_module
+
+    FakeGroupMember.settings, FakeGroupMember.peers = settings, peers
+    FakeGroupMember.unreachable = set(unreachable)
+
+    real_enum, real_pb = cli_module.enumerate_pixelblazes, cli_module.Pixelblaze
+    cli_module.enumerate_pixelblazes = lambda **kw: [{'ip': ip} for ip in found]
+    cli_module.Pixelblaze = FakeGroupMember
+    try:
+        return cli_module._peer_targets()
+    finally:
+        cli_module.enumerate_pixelblazes, cli_module.Pixelblaze = real_enum, real_pb
+
+
+def test_peer_targets_labels_the_whole_sync_group():
+    """Roles come from one getPeers call — the peer list is a group-wide view."""
+    addresses, roles = withFakeNetwork(
+        found=['192.168.1.86', '192.168.1.90'],
+        settings={'name': 'bike2', 'leaderId': 0, 'nodeId': 2},
+        peers=[{'address': '192.168.1.90', 'name': 'staff', 'isFollowing': 1, 'nodeId': 5}])
+
+    assert addresses == ['192.168.1.86', '192.168.1.90']
+    assert roles['192.168.1.86'] == {'name': 'bike2', 'role': 'leader/solo', 'nodeId': 2}
+    assert roles['192.168.1.90'] == {'name': 'staff', 'role': 'follower', 'nodeId': 5}
+
+
+def test_peer_targets_picks_up_a_follower_the_sweep_missed():
+    """Followers never beacon; the peer list is the only place they appear."""
+    addresses, roles = withFakeNetwork(
+        found=['192.168.1.86'],
+        settings={'name': 'bike2', 'leaderId': 0, 'nodeId': 2},
+        peers=[{'address': '192.168.1.99', 'name': 'hidden', 'isFollowing': 1, 'nodeId': 7}])
+
+    assert '192.168.1.99' in addresses, addresses
+    assert roles['192.168.1.99']['role'] == 'follower'
+
+
+def test_peer_targets_falls_through_to_a_device_that_answers():
+    """A wedged first device must not cost us the group view."""
+    addresses, roles = withFakeNetwork(
+        found=['192.168.1.86', '192.168.1.90'],
+        settings={'name': 'staff', 'leaderId': 12345, 'nodeId': 5},
+        peers=[], unreachable=['192.168.1.86'])
+
+    assert addresses == ['192.168.1.86', '192.168.1.90']
+    assert roles['192.168.1.90']['role'] == 'follower'   # leaderId set => following
+
+
+def test_peer_targets_still_returns_addresses_when_nothing_answers():
+    """Unreachable websockets cost the role labels, not the targets."""
+    addresses, roles = withFakeNetwork(
+        found=['192.168.1.86'], settings={}, peers=[], unreachable=['192.168.1.86'])
+
+    assert addresses == ['192.168.1.86'] and roles == {}
+
+
+def test_sync_group_is_described_for_the_user():
+    """`--peers` prints who it is about to feed, and flags a contending leader."""
+    from pixelblaze.cli.cli import _describe_sync_group
+
+    lines = _describe_sync_group(
+        ['192.168.1.86', '192.168.1.90'],
+        {'192.168.1.86': {'name': 'bike2', 'role': 'leader/solo', 'nodeId': 2},
+         '192.168.1.90': {'name': 'staff', 'role': 'follower', 'nodeId': 5}})
+
+    assert '2 device(s)' in lines[0]
+    assert 'bike2' in lines[1] and 'leader/solo' in lines[1] and 'node 2' in lines[1]
+    assert 'staff' in lines[2] and 'follower' in lines[2]
+    assert 'whichever frame arrives last wins' in lines[-1]
+
+    # An address the peer list never named still gets a row, marked unknown,
+    # and with no leader among the roles there is no contention note.
+    lines = _describe_sync_group(['10.0.0.5'], {'192.168.1.86': {'role': 'follower'}})
+    assert '10.0.0.5' in lines[1] and 'unknown' in lines[1]
+    assert 'arrives last wins' not in ' '.join(lines)
+
+
+def test_sender_id_defaults_to_this_host_and_parses_hex():
+    """A stable id keeps `pb snoop --sensor` readable; random per-run does not."""
+    import socket as _socket, struct
+    import click
+    from pixelblaze.cli.cli import _host_sender_id, _parse_sender_id
+
+    assert len(_socket.inet_ntoa(struct.pack('<I', _host_sender_id())).split('.')) == 4
+    assert _host_sender_id() == _host_sender_id()          # stable across calls
+
+    assert _parse_sender_id('0xD0CAFE') == 0xD0CAFE
+    assert _parse_sender_id('42') == 42
+
+    with pytest.raises(click.ClickException, match="must be a number"):
+        _parse_sender_id('nope')
+    with pytest.raises(click.ClickException, match="32 bits"):
+        _parse_sender_id('0x1FFFFFFFF')
