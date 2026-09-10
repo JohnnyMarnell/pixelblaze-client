@@ -28,11 +28,12 @@ import time
 import re
 import click
 import pathlib
+import socket
 from tqdm import tqdm
 from pixelblaze.pixelblaze import Pixelblaze, PBB
 from pixelblaze.cli.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json, jsons, \
                                      get_cache_dir, check, parse_vars, get_pixelblaze, discover_pixelblaze, \
-                                     enumerate_pixelblazes, cache_ip, _read_cache, _write_cache, \
+                                     enumerate_pixelblazes, cache_ip, _read_cache, _write_cache, get_host_ip, \
                                      _fetch_device_config, update_device_cache, lookup_cached_device
 from pixelblaze.cli.top import register as _register_top
 from pixelblaze.cli.snoop import register as _register_snoop
@@ -1319,6 +1320,28 @@ def setup(ctx):
     log("WiFi reset to setup mode — look for a 'Pixelblaze_*' network")
 
 
+def _sync_group_members(pb: Pixelblaze) -> list:
+    """Every member of this device's sync group, the connected device first.
+
+    `getPeers` reports only the *other* members, so the device's own row is
+    synthesized from its config. One definition, two users: `pb wifi peers`
+    prints it, and `pb sensor sound --peers` streams sensor frames to it.
+    """
+    peers = pb.getPeers()
+    settings = pb.getConfigSettings()
+    self_entry = {
+        'id': settings.get('chipId', 0),
+        'address': pb.ipAddress,
+        'name': settings.get('name', '?'),
+        'ver': settings.get('ver', '?'),
+        'isFollowing': 1 if settings.get('leaderId', 0) else 0,
+        'nodeId': settings.get('nodeId', 0),
+        'followerCount': sum(1 for peer in peers if peer.get('isFollowing')),
+        'self': True,
+    }
+    return [self_entry] + peers
+
+
 @cli(wifi)
 def peers(pb: Pixelblaze):
     """
@@ -1334,22 +1357,7 @@ def peers(pb: Pixelblaze):
         pb wifi peers
         pb wifi peers --ip 192.168.1.230
     """
-    peers = pb.getPeers()
-
-    # getPeers returns only *other* members, not self — synthesize a self row
-    # from the device's own config so users see the whole group.
-    cfg = pb.getConfigSettings()
-    self_entry = {
-        'id': cfg.get('chipId', 0),
-        'address': pb.ipAddress,
-        'name': cfg.get('name', '?'),
-        'ver': cfg.get('ver', '?'),
-        'isFollowing': 1 if cfg.get('leaderId', 0) else 0,
-        'nodeId': cfg.get('nodeId', 0),
-        'followerCount': sum(1 for p in peers if p.get('isFollowing')),
-        'self': True,
-    }
-    all_members = [self_entry] + peers
+    all_members = _sync_group_members(pb)
     jsons(all_members)
 
     log(f"\n    {'NAME':<20} {'ADDRESS':<15} {'CHIPID':>10} {'NODE':>5} {'ROLE':<10} {'VER':<6} {'FOLLOWERS':>9}")
@@ -2243,6 +2251,87 @@ _register_snoop(pixelblaze)
 
 ## ─── Sensor (virtual sensor board sources) ────────────────────────────────────
 
+def _host_sender_id() -> int:
+    """This host's IPv4 as the 32-bit sender id the discovery protocol carries.
+
+    A Pixelblaze puts its own chipId in this field. A host has no chipId, so
+    use the address: stable across runs — a random id per invocation makes
+    `pb snoop --sensor` output impossible to follow — and meaningful in a
+    capture. Falls back to 0 if the host address can't be determined.
+    """
+    try:
+        return int.from_bytes(socket.inet_aton(get_host_ip()), 'little')
+    except Exception:
+        return 0
+
+
+def _parse_sender_id(value: str) -> int:
+    """Accept a decimal or 0x-prefixed sender id and range-check it."""
+    try:
+        parsed = int(value, 0)
+    except ValueError:
+        raise click.ClickException(
+            f"--sender-id must be a number (decimal or 0x hex), got '{value}'")
+    check(0 <= parsed <= 0xFFFFFFFF, f"--sender-id must fit in 32 bits, got {parsed}")
+    return parsed
+
+
+def _describe_sync_group(targets: list, roles: dict) -> list:
+    """Render the `--peers` target list, so it is obvious who is about to be fed."""
+    lines = [f"  Sync group ({len(targets)} device(s)):"]
+    for address in targets:
+        info = roles.get(address, {})
+        node = f", node {info['nodeId']}" if info.get('nodeId') else ""
+        lines.append(f"    {address:<15} {info.get('name', '?'):<20} "
+                     f"{info.get('role', 'unknown')}{node}")
+    # A leader with a real sensor board is broadcasting its own frames at 40Hz;
+    # ours and its interleave, and whichever lands last is what patterns see.
+    if len(targets) > 1 and any(i.get('role') == 'leader/solo' for i in roles.values()):
+        lines.append("    Note: a leader with its own sensor board is broadcasting too — "
+                     "whichever frame arrives last wins.")
+    return lines
+
+
+def _peer_targets(timeout_ms: int = 3000) -> tuple:
+    """Every Pixelblaze we can identify, with sync-group roles where known.
+
+    Deliberately owns no discovery of its own. `enumerate_pixelblazes` already
+    checks the ad-hoc address, listens for beacons, and asks each device it
+    finds for its sync-group peer list — which is the only way a *follower*
+    turns up, since followers never beacon.
+
+    Roles come from `_sync_group_members`, the same helper `pb wifi peers`
+    prints: the peer list is a group-wide view, so the first device that
+    answers describes the whole group.
+
+    Returns:
+        (addresses, roles) — roles maps address -> {name, role, nodeId}.
+    """
+    addresses = [d['ip'] for d in enumerate_pixelblazes(timeout=timeout_ms)]
+
+    roles = {}
+    for address in addresses:
+        try:
+            with Pixelblaze(address) as pb:
+                for member in _sync_group_members(pb):
+                    if member.get('address'):
+                        roles[member['address']] = {
+                            'name': member.get('name', '?'),
+                            'role': 'follower' if member.get('isFollowing') else 'leader/solo',
+                            'nodeId': member.get('nodeId', 0),
+                        }
+            break
+        except Exception:
+            continue   # a wedged device shouldn't cost us the group view
+
+    # A peer list can name a device the sweep never reached directly.
+    for address in roles:
+        if address not in addresses:
+            addresses.append(address)
+
+    return addresses, roles
+
+
 @pixelblaze.group()
 def sensor():
     """
@@ -2308,6 +2397,17 @@ def sensor_sources(pb: Pixelblaze, preference, sensor_type, no_save):
               help='UDP destination IP (repeatable). Defaults to the Pixelblaze this CLI connects to.')
 @click.option('--broadcast', is_flag=True,
               help='UDP broadcast to every Pixelblaze on the network at once')
+@click.option('--peers', 'use_peers', is_flag=True,
+              help='UDP to every Pixelblaze found the way `pb find` finds them: the '
+                   "ad-hoc address, beacons, and each device's sync-group peer list — "
+                   'which is the only way a follower turns up, since followers never '
+                   'beacon. Unicast, so --rebind reloads the pattern on every one of '
+                   'them, which --broadcast cannot do.')
+@click.option('--sender-id', 'sender_id', default=None, metavar='ID',
+              help='Sender id to put in the packet header (decimal, or 0x hex). A real '
+                   'sensor board leader sends its chipId; the default here is this '
+                   "host's IPv4 as a 32-bit int, so a capture identifies who sent a "
+                   'frame. Firmware 3.70 does not check this field — see the full help.')
 @click.option('--rebind/--no-rebind', default=True,
               help='UDP: reload each target\'s active pattern once frames are flowing, '
                    'so the firmware binds them to the stream (default: on)')
@@ -2329,8 +2429,8 @@ def sensor_sources(pb: Pixelblaze, preference, sensor_type, no_save):
               help='Auto-gain control: adapts gain so peaks stay consistent')
 @click.option('--list-devices', '-l', is_flag=True,
               help='List available audio input devices and exit')
-def sound(ctx, transport, targets, broadcast, rebind, device, fps, sample_rate, block_size,
-          gain, noise_gate, log_scale, agc, list_devices):
+def sound(ctx, transport, targets, broadcast, use_peers, sender_id, rebind, device, fps,
+          sample_rate, block_size, gain, noise_gate, log_scale, agc, list_devices):
     """
     Stream audio FFT to Pixelblazes as sensor-board data.
 
@@ -2360,7 +2460,19 @@ def sound(ctx, transport, targets, broadcast, rebind, device, fps, sample_rate, 
     pattern that was already running keeps simulating and ignores the stream.
     This reloads the active pattern on each target once frames are flowing;
     `--no-rebind` leaves it alone, and with `--broadcast` you re-select the
-    pattern yourself.
+    pattern yourself. `--peers` is unicast, so it can rebind every device.
+
+    \b
+    About the sender id (it is not a leader gate):
+        This protocol exists so a sync group's *leader* can share its sensor
+        board with its followers, and the header carries the sender's id — a
+        real leader puts its chipId there. But a receiving Pixelblaze does
+        NOT check it against its own leaderId: measured on firmware 3.70,
+        frames are accepted from any sender, unicast or broadcast, with no
+        sync group, no leader and no FOLLOW subscription; setting a device's
+        leaderId to ours changed nothing. So --sender-id is for identifying
+        yourself in a capture, not for getting frames accepted. To actually
+        put devices into a sync group, use `pb cfg --leader-id / --node-id`.
 
     Requires `sounddevice` and `numpy` on the host. On macOS you'll typically
     also want BlackHole (https://existential.audio/blackhole/) to loopback
@@ -2378,7 +2490,9 @@ def sound(ctx, transport, targets, broadcast, rebind, device, fps, sample_rate, 
     Examples:
         pb sensor sound                          # UDP to the discovered PB
         pb sensor sound --broadcast              # UDP to every PB on the network
+        pb sensor sound --peers                  # unicast to every PB found, followers too
         pb sensor sound -t 192.168.1.24 -t 192.168.1.25
+        pb sensor sound --sender-id 0xD0CAFE     # label the frames in a capture
         pb sensor sound --transport vars         # old setVars path
         pb sensor sound -d "MacBook"             # Stream from built-in mic
         pb sensor sound --agc                    # Auto-gain (adapts to volume)
@@ -2399,9 +2513,17 @@ def sound(ctx, transport, targets, broadcast, rebind, device, fps, sample_rate, 
         return
 
     transport = transport.lower()
+    sender_id = _parse_sender_id(sender_id) if sender_id is not None else _host_sender_id()
+
     targets = list(targets) + (['255.255.255.255'] if broadcast else [])
+    roles = {}
+    if use_peers:
+        found, roles = _peer_targets()
+        check(found, "--peers found no Pixelblazes. Is one powered on and on this network?")
+        targets += [address for address in found if address not in targets]
+
     check(transport == 'udp' or not targets,
-          "--target and --broadcast only apply to --transport udp")
+          "--target, --broadcast and --peers only apply to --transport udp")
 
     log(f"Looking for audio device matching '{device}'...")
     dev_idx, dev_info = find_device(device)
@@ -2444,9 +2566,13 @@ def sound(ctx, transport, targets, broadcast, rebind, device, fps, sample_rate, 
                     "`pb sensor sources --prefer remote --type sound`.")
 
     try:
-        sink = UdpSink(targets)
+        sink = UdpSink(targets, senderId=sender_id)
     except OSError as e:
         raise click.ClickException(f"Can't send to {', '.join(targets)}: {e}")
+
+    if roles:
+        for line in _describe_sync_group(targets, roles):
+            log(line)
 
     # Addresses we can actually open a websocket to, to reload their pattern.
     reloadable = [t for t in targets if not t.endswith('.255')]
