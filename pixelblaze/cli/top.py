@@ -1062,10 +1062,32 @@ def register(cli_group):
 
         # SIGINT / SIGTERM → clean exit that still runs the finally block
         # below, so we always restore the cursor before returning.
+        #
+        # The handler also re-arms SIG_DFL on its way out, so a *second*
+        # interrupt is a hard kill. That matters more than it looks: the
+        # render loop is not the only thing that can keep this process
+        # alive. Discovery runs its tasks on a ThreadPoolExecutor, whose
+        # threads are non-daemon and are joined by an atexit hook — so one
+        # task blocked in a socket read wedges interpreter *finalization*,
+        # long after the loop and the finally block are done. Ctrl-C then
+        # goes to a handler that only sets a flag nobody is reading any
+        # more, and the only way out is SIGKILL from another terminal.
+        # (`pb top` hung exactly this way; see _open()'s handshake timeout
+        # for the specific blocking call that caused it.) With SIG_DFL
+        # armed, a second Ctrl-C always ends the process.
         stop_flag = {"stop": False}
+        cursor_hidden = {"yes": False}
 
         def handle_signal(_signum, _frame):
             stop_flag["stop"] = True
+            # Put the cursor back now, not in the finally — a force-quit
+            # may never reach the finally, and an invisible cursor in the
+            # user's shell outlives this process.
+            if cursor_hidden["yes"]:
+                sys.stdout.write(SHOW_CURSOR)
+                sys.stdout.flush()
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
         signal.signal(signal.SIGINT, handle_signal)
         signal.signal(signal.SIGTERM, handle_signal)
@@ -1089,6 +1111,7 @@ def register(cli_group):
         if color:
             sys.stdout.write(HIDE_CURSOR)
             sys.stdout.flush()
+            cursor_hidden["yes"] = True
 
         try:
             while not stop_flag["stop"]:
@@ -1099,9 +1122,10 @@ def register(cli_group):
                 time.sleep(interval)
         finally:
             monitor.stop()
-            if color:
+            if cursor_hidden["yes"]:
                 sys.stdout.write(SHOW_CURSOR + "\n")
                 sys.stdout.flush()
+                cursor_hidden["yes"] = False
 
     return top
 

@@ -306,6 +306,12 @@ class Pixelblaze:
 
     # --- PRIVATE DATA
     default_recv_timeout = 1
+    # Ceiling on the websocket *handshake* (TCP connect + HTTP upgrade).
+    # Without this, create_connection() inherits socket.getdefaulttimeout()
+    # -- None -- and a Pixelblaze whose websocket server is wedged (accepts
+    # the connection on :81, then never answers the upgrade) blocks the
+    # calling thread forever. See _open().
+    default_open_timeout = 4
     max_open_retries = 5
     ws = None
     connected = False
@@ -537,11 +543,13 @@ class Pixelblaze:
                         url = urlparse(self.proxyUrl)
                         self.ws = websocket.create_connection(uri, sockopt=(
                         (socket.SOL_SOCKET, socket.SO_REUSEADDR, 1), (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)),
+                                                              timeout=self.default_open_timeout,
                                                               proxy_type=url.scheme, http_proxy_host=url.hostname,
                                                               http_proxy_port=url.port)
                     else:
                         self.ws = websocket.create_connection(uri, sockopt=(
-                        (socket.SOL_SOCKET, socket.SO_REUSEADDR, 1), (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),))
+                        (socket.SOL_SOCKET, socket.SO_REUSEADDR, 1), (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),),
+                                                              timeout=self.default_open_timeout)
                     break
                 except (websocket._exceptions.WebSocketConnectionClosedException,
                         websocket._exceptions.WebSocketBadStatusException):

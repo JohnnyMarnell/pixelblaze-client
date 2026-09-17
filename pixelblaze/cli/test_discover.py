@@ -326,6 +326,98 @@ def test_cache_drops_transient_keys():
     print("✓ cache drops transient keys")
 
 
+@contextlib.contextmanager
+def wedged_ws_listener():
+    """A TCP server that accepts a connection and then never says anything.
+
+    This is the real-world failure mode the firmware gets into: port 81
+    accepts, the HTTP upgrade is never answered, and the socket is held
+    open rather than closed. A handshake with no timeout parks in recv()
+    against this forever.
+    """
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind((LOOP, 0))
+    server.listen(4)
+    server.settimeout(0.25)
+    port = server.getsockname()[1]
+    held = []
+    stop = threading.Event()
+
+    def serve():
+        while not stop.is_set():
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            held.append(conn)      # hold it open; send nothing, close nothing
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield port
+    finally:
+        stop.set()
+        for conn in held:
+            with contextlib.suppress(Exception):
+                conn.close()
+        server.close()
+
+
+def test_open_times_out_on_wedged_websocket_server():
+    """`Pixelblaze(ip)` must fail on a wedged websocket server, not block.
+
+    The regression this guards: `_open()` called create_connection() without
+    a `timeout`, so the handshake inherited socket.getdefaulttimeout() --
+    None -- and blocked forever. Discovery runs `Pixelblaze(ip)` on a
+    ThreadPoolExecutor whose threads are non-daemon and are joined by an
+    atexit hook, so one parked handshake made interpreter finalization hang:
+    `pb top` could not be killed with Ctrl-C, only SIGKILL.
+
+    Note this asserts loudly rather than hanging if the timeout is dropped
+    again -- a test that hangs is a test nobody can read the result of.
+    """
+    real_create_connection = lib.websocket.create_connection
+    seen_kwargs = {}
+
+    with wedged_ws_listener() as port:
+        def shim(uri, **kwargs):
+            # Record what _open() actually asked for, then point the real
+            # websocket-client handshake at our never-answering server.
+            seen_kwargs.update(kwargs)
+            return real_create_connection(f'ws://{LOOP}:{port}', **kwargs)
+
+        outcome = {}
+
+        def attempt():
+            started = time.monotonic()
+            try:
+                lib.Pixelblaze(LOOP)
+            except BaseException as e:      # noqa: BLE001 - any failure beats a hang
+                outcome['error'] = e
+            outcome['elapsed'] = time.monotonic() - started
+
+        with patched(lib.websocket, create_connection=shim), \
+                patched(lib.Pixelblaze, default_open_timeout=0.5):
+            worker = threading.Thread(target=attempt, daemon=True)
+            worker.start()
+            worker.join(timeout=10)
+
+        assert not worker.is_alive(), (
+            "Pixelblaze(ip) never returned against a wedged websocket server — "
+            "the handshake is blocking with no timeout again. "
+            f"create_connection kwargs were {seen_kwargs!r}"
+        )
+
+    assert seen_kwargs.get('timeout') == 0.5, (
+        f"_open() must pass its handshake timeout through; got {seen_kwargs!r}")
+    assert 'error' in outcome, "a wedged server must raise, not connect"
+    # 0.5s timeout, and _open() must NOT burn max_open_retries on it.
+    assert outcome['elapsed'] < 3, (
+        f"handshake took {outcome['elapsed']:.1f}s — is it retrying the timeout?")
+    print("✓ handshake times out on a wedged websocket server "
+          f"({outcome['elapsed']:.2f}s, {type(outcome['error']).__name__})")
+
+
 def main():
     test_tcp_probe_is_silent()
     test_beacon_socket_loud_and_shared()
@@ -334,6 +426,7 @@ def main():
     test_discovery_passive_and_silent_explanation()
     test_discovery_fails_loudly_on_bind_error()
     test_cache_drops_transient_keys()
+    test_open_times_out_on_wedged_websocket_server()
     print("\nAll discovery tests passed.")
 
 
