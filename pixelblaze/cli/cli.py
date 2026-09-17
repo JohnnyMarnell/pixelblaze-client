@@ -685,7 +685,7 @@ def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exac
     \b
     Examples:
         # Switch/Render
-        pb pattern rainbow
+        pb pattern rainbow                             # or: pb p rainbow
         pb pattern code.js
         pb pattern abcd123456789012
         pb pattern 'true && hsv(1,1,1) || hsv(0,0,0)'  # Renders as code
@@ -765,6 +765,9 @@ def pattern(pb: Pixelblaze, input, name, write, rm, img, var_args, no_save, exac
              log(f"Warning: Name argument '{name}' ignored because --write was not specified.")
 
         _handle_render_or_switch_mode(pb, input, variables, no_save, exact, lookup, from_stdin=input_from_stdin)
+
+
+pixelblaze.add_command(pattern, name='p')
 
 
 def _looks_like_code(s: str) -> bool:
