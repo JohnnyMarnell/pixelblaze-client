@@ -28,13 +28,16 @@ import time
 import re
 import click
 import pathlib
+import requests
 import socket
+import websocket
 from tqdm import tqdm
 from pixelblaze.pixelblaze import Pixelblaze, PBB
 from pixelblaze.cli.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json, jsons, \
                                      get_cache_dir, check, parse_vars, get_pixelblaze, discover_pixelblaze, \
                                      enumerate_pixelblazes, cache_ip, _read_cache, _write_cache, get_host_ip, \
-                                     _fetch_device_config, update_device_cache, lookup_cached_device
+                                     _fetch_device_config, update_device_cache, lookup_cached_device, \
+                                     _tcp_ports_open, WS_PORT
 from pixelblaze.cli.top import register as _register_top
 
 @click.group()
@@ -220,6 +223,63 @@ def pixels(pb: Pixelblaze, count, no_save):
         log(f"Pixel count {action} to {count}")
 
 
+# Written by `pb off --deep` before it changes anything; `pb on` reads it to undo
+# the deep sleep and removes it. Lives on the device so any host can wake it.
+OFF_MARKER = '/pb-off.json'
+
+# Parked in the renderer by `pb off --deep`, so a stray unpause renders black.
+NOOP_PATTERN = 'export function render(index) { rgb(0, 0, 0) }'
+
+
+def _read_off_marker(pb: Pixelblaze):
+    """The state `pb off --deep` recorded, or None if it isn't deep off."""
+    content = pb.getFile(OFF_MARKER)
+    return None if content is None else jsonlib.loads(content)
+
+
+def _pause_rendering(pb: Pixelblaze):
+    """Stop the render engine (fps drops to 0; WiFi and the websocket stay up).
+
+    LEDs hold the last frame they were sent, so the caller blanks them first.
+    """
+    time.sleep(0.3)  # let a blank frame reach the LEDs
+    log("Pausing renderer...")
+    pb.pauseRenderer(True)
+
+
+def _reboot_and_reconnect(pb: Pixelblaze, timeout: float = 60.0):
+    """Reboot, wait for the device to go down and come back, and reconnect `pb`.
+
+    Watches the websocket port with bare connects (no bytes sent), because a
+    stats read on a half-open session can block indefinitely.
+    """
+    log("Rebooting...")
+    try:
+        pb.reboot()
+    except requests.RequestException:
+        pass  # it may drop the request as it restarts; the down/up wait below is the proof
+    pb._close()
+    deadline = time.monotonic() + timeout
+    went_down = False
+    while time.monotonic() < deadline:
+        if not _tcp_ports_open(pb.ipAddress, (WS_PORT,))[WS_PORT]:
+            went_down = True
+        elif went_down:
+            try:
+                pb._open()
+                pb.getConfigSettings()
+                log("Back online")
+                return
+            except (OSError, websocket.WebSocketException):
+                try:  # its server isn't taking sessions yet; don't leave a half-open one behind
+                    pb._close()
+                except (OSError, websocket.WebSocketException):
+                    pb.connected = False
+        time.sleep(0.5)
+    raise click.ClickException(f"{pb.ipAddress} did not {'come back' if went_down else 'go down'} "
+                               f"within {timeout:.0f}s of the reboot")
+
+
 @cli(pixelblaze)
 @click.argument('brightness', type=float, default=1.0, required=False)
 @click.option(
@@ -230,10 +290,10 @@ def pixels(pb: Pixelblaze, count, no_save):
 @no_save_option
 def on(pb: Pixelblaze, brightness, play_sequencer, no_save):
     """
-    Turn on the Pixelblaze by setting brightness.
+    Turn on the Pixelblaze: resume rendering and set brightness.
 
-    This command sets the brightness to the specified level (default: 1.0).
-    Optionally, you can also start/resume the sequencer.
+    Undoes `pb off`. After `pb off --deep` it also restores the CPU speed and
+    reboots, which brings back the saved pattern and sequencer (~10s).
 
     \b
     Examples:
@@ -243,6 +303,18 @@ def on(pb: Pixelblaze, brightness, play_sequencer, no_save):
         pb on 0.8 --no-save         # Set brightness to 80% (temporary only)
     """
     check(0.0 <= brightness <= 1.0, "Brightness must be between 0.0 and 1.0")
+
+    marker = _read_off_marker(pb)
+    if marker is None:
+        log("Resuming renderer...")
+        pb.pauseRenderer(False)
+    else:
+        cpu_speed = Pixelblaze.cpuSpeeds(str(marker['cpuSpeed']))
+        if pb.getCpuSpeed() != cpu_speed:
+            log(f"Restoring CPU speed to {cpu_speed.value}MHz...")
+            pb.setCpuSpeed(cpu_speed)
+        _reboot_and_reconnect(pb)
+        pb.deleteFile(OFF_MARKER)  # only once the reboot has undone the deep sleep
 
     log(f"Setting brightness to {brightness}...")
     pb.setBrightnessSlider(brightness, saveToFlash=not no_save)
@@ -261,20 +333,37 @@ def on(pb: Pixelblaze, brightness, play_sequencer, no_save):
     is_flag=True,
     help='Also pause the pattern sequencer'
 )
+@click.option(
+    '--deep',
+    is_flag=True,
+    help='Lowest power that keeps WiFi: also CPU to 80MHz, reboot, park a black no-op pattern'
+)
 @no_save_option
-def off(pb: Pixelblaze, pause_sequencer, no_save):
+def off(pb: Pixelblaze, pause_sequencer, deep, no_save):
     """
-    Turn off the Pixelblaze by setting brightness to zero.
+    Turn off the Pixelblaze: brightness to 0, then pause the renderer.
 
-    This command sets the brightness to 0, effectively turning off all LEDs.
-    Optionally, you can also pause the sequencer to stop pattern changes.
+    Brightness 0 alone keeps rendering the pattern at full frame rate; pausing
+    stops that (fps 0) while WiFi and the websocket stay up. A pattern change,
+    the sequencer's included, resumes rendering. So does `pb on`.
+
+    --deep goes as low as possible without disabling WiFi: it records the CPU
+    speed on the device, drops it to 80MHz, and reboots (~10s). Then it
+    pauses the sequencer, loads a black no-op pattern, and pauses rendering.
+    `pb on` restores the CPU speed and reboots again.
+
+    While paused, the web UI's brightness slider shows nothing. Pick a pattern
+    there, or run `pb on`.
 
     \b
     Examples:
-        pb off                      # Set brightness to 0 (saved to flash)
-        pb off --pause-sequencer    # Set brightness to 0 and pause sequencer (saved)
-        pb off --no-save            # Set brightness to 0 (temporary only)
+        pb off                      # Brightness 0 (saved to flash), renderer paused
+        pb off --pause-sequencer    # ...and pause sequencer (saved)
+        pb off --no-save            # Brightness 0 (temporary only), renderer paused
+        pb off --deep               # ...and 80MHz CPU, reboot, no-op pattern
     """
+    check(not (deep and no_save), "--deep reboots, which restores the saved brightness; drop --no-save")
+
     log("Setting brightness to 0...")
     pb.setBrightnessSlider(0.0, saveToFlash=not no_save)
 
@@ -282,8 +371,28 @@ def off(pb: Pixelblaze, pause_sequencer, no_save):
         log("Pausing sequencer...")
         pb.pauseSequencer(saveToFlash=not no_save)
 
+    if deep:
+        settings = pb.getConfigSettings()
+        check(str(settings.get('ver', '')).startswith('3'), "--deep needs v3 firmware (CPU speed is a v3 setting)")
+        if _read_off_marker(pb) is None:  # keep the original record if a previous run was interrupted
+            pb.putFile(OFF_MARKER, jsonlib.dumps({'cpuSpeed': pb.getCpuSpeed(settings).value}).encode())
+        if pb.getCpuSpeed(settings) != Pixelblaze.cpuSpeeds.low:
+            log("Setting CPU speed to 80MHz (takes effect on reboot)...")
+            pb.setCpuSpeed(Pixelblaze.cpuSpeeds.low)
+        _reboot_and_reconnect(pb)
+
+        # The reboot restarted the saved pattern and sequencer; park both until `pb on` reboots again.
+        log("Pausing sequencer...")
+        pb.pauseSequencer()
+        log("Loading a black no-op pattern...")
+        pb.sendPatternToRenderer(pb.compilePattern(NOOP_PATTERN, allow_cache=True))
+
+    _pause_rendering(pb)
+    if deep:
+        check(pb.getCpuSpeed() == Pixelblaze.cpuSpeeds.low, "CPU speed is not 80MHz after the reboot")
+
     action = "turned off" if no_save else "saved and turned off"
-    log(f"Pixelblaze {action}")
+    log(f"Pixelblaze {action}{' (deep: 80MHz, `pb on` reboots to wake it)' if deep else ''}")
 
 
 def _parse_csv_coordinates(content: str) -> list:
