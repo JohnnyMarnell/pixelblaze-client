@@ -2415,7 +2415,8 @@ class Pixelblaze:
         """
         # The "cpuSpeed" setting doesn't exist on v2, so return the default.
         if configSettings is None: configSettings = self.getConfigSettings()
-        return self.cpuSpeeds(configSettings.get('cpuSpeed', 240))
+        # Firmware reports an int (240); the enum values are the strings the webUI sends ("240").
+        return self.cpuSpeeds(str(configSettings.get('cpuSpeed', 240)))
 
     def getNetworkPowerSave(self, configSettings: dict = None) -> bool:
         """Returns whether the "Network Power Saving" mode is enabled (and WiFi is disabled).
