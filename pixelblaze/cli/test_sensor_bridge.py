@@ -285,3 +285,159 @@ def test_sender_id_defaults_to_this_host_and_parses_hex():
         _parse_sender_id('nope')
     with pytest.raises(click.ClickException, match="32 bits"):
         _parse_sender_id('0x1FFFFFFFF')
+
+
+# ── streaming to many devices, and knowing when there is nothing to stream ──
+# The bridge is driven directly here: `--tone` needs no audio hardware, and a
+# source that delivers nothing is the one failure the device side cannot see.
+
+class FakeSink:
+    """Records frames the way a transport would send them."""
+
+    def __init__(self, targets=None):
+        self.targets = ['127.0.0.1'] if targets is None else targets
+        self.frames = []
+        self.started = False
+        self.stopped = False
+
+    def describe(self):
+        return "fake"
+
+    def start(self):
+        self.started = True
+
+    def send(self, data):
+        self.frames.append(data)
+
+    def stop(self):
+        self.stopped = True
+
+
+class NullSource:
+    """An input that opens and then delivers nothing -- an aggregate device
+    with a missing member, an interface unplugged, a device another app holds."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_the_tone_source_drives_the_whole_path_with_no_audio_hardware():
+    """It is also how a headless box can test any of this at all."""
+    import math
+
+    from pixelblaze.cli.sensor_bridge import SoundBridge
+
+    sink = FakeSink()
+    bridge = SoundBridge(sink, None, 48000, 1024, fps=40, tone=1170, seconds=0.6,
+                         channels=2)
+    bridge.run()
+
+    assert bridge.stalled_for is None
+    assert bridge.frames_sent > 10, f"only {bridge.frames_sent} frames in 0.6 s"
+    assert sink.started and sink.stopped
+
+    frame = sink.frames[-1]
+    assert frame["maxFrequency"] == pytest.approx(1170, abs=50)
+    loudest = max(range(32), key=lambda i: frame["frequencyData"][i])
+    assert loudest == 15, "1170 Hz is the centre of bin 15"
+    assert math.isfinite(bridge.loudness.momentary), "the meter ran too"
+    assert not bridge.is_silent
+
+
+def test_a_source_that_delivers_nothing_stops_the_run_and_says_so():
+    """LOUD FAILURE: no frames go out, the pattern sits on its last one, and
+    from the device's side that is indistinguishable from a quiet room."""
+    from pixelblaze.cli.sensor_bridge import SoundBridge
+
+    sink = FakeSink()
+    bridge = SoundBridge(sink, None, 48000, 1024, fps=40, stall_timeout=0.3)
+    bridge._source = NullSource
+    bridge.run()
+
+    assert bridge.stalled_for is not None and bridge.stalled_for >= 0.3
+    assert bridge.frames_sent == 0
+    assert sink.stopped, "the silence frames still go out"
+
+
+def test_digital_silence_is_reported_but_still_sent():
+    """A loopback with nothing playing is the truth about the room, not a
+    failure -- so the frames keep flowing and the display just says so."""
+    import numpy as np
+
+    from pixelblaze.cli.sensor_bridge import SoundBridge
+
+    sink = FakeSink()
+    bridge = SoundBridge(sink, None, 48000, 1024, fps=40, silence_timeout=0.2)
+    zeros = np.zeros((1024, 2), dtype=np.float32)
+
+    bridge._audio_callback(zeros, 1024, None, None)
+    assert not bridge.is_silent, "not until the timeout has passed"
+    bridge._silent_since -= 0.3
+    bridge._audio_callback(zeros, 1024, None, None)
+    assert bridge.is_silent
+
+    bridge._push_frame()
+    assert len(sink.frames) == 1, "silence is a reading, and it is sent"
+    assert bridge.stalled_for is None, "blocks ARE arriving; this is not a stall"
+
+    loud = (0.5 * np.sin(np.arange(1024) / 5)).astype(np.float32)[:, None]
+    bridge._audio_callback(np.repeat(loud, 2, axis=1), 1024, None, None)
+    assert not bridge.is_silent
+
+
+def test_seconds_stops_the_run():
+    import time
+
+    from pixelblaze.cli.sensor_bridge import SoundBridge
+
+    bridge = SoundBridge(FakeSink(), None, 48000, 1024, fps=40, tone=440, seconds=0.4)
+    started = time.monotonic()
+    bridge.run()
+    assert 0.4 <= time.monotonic() - started < 1.5
+
+
+def test_the_frame_rate_asked_for_is_the_frame_rate_sent():
+    """A flat run-loop tick rounds 40 fps down to 30 without anything saying so."""
+    from pixelblaze.cli.sensor_bridge import SoundBridge
+
+    bridge = SoundBridge(FakeSink(), None, 48000, 1024, fps=40, tone=440, seconds=1.0)
+    bridge.run()
+    assert bridge.frames_sent == pytest.approx(40, abs=6)
+
+
+def test_udp_targets_can_be_added_and_dropped_while_streaming():
+    """--rescan feeds whatever turns up later, and a dropped device gets
+    silence rather than being frozen on its last frame."""
+    receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        receiver.bind(("127.0.0.1", 0))
+        receiver.settimeout(5)
+        port = receiver.getsockname()[1]
+
+        sink = UdpSink(["127.0.0.1"])
+        sink.sender.port = port
+        assert sink.targets == ["127.0.0.1"]
+        assert sink.add_target("127.0.0.2") is True
+        assert sink.add_target("127.0.0.2") is False, "already a target"
+        assert sink.targets == ["127.0.0.1", "127.0.0.2"]
+
+        assert sink.remove_target("127.0.0.3") is False
+        assert sink.remove_target("127.0.0.1") is True
+        assert sink.targets == ["127.0.0.2"]
+        for _ in range(UdpSink.SILENCE_FRAMES):
+            silence = SensorPacket.unpack(receiver.recv(256))
+            assert silence["frequencyData"] == [0.0] * 32
+    finally:
+        receiver.close()
+
+
+def test_udp_describe_survives_a_network_full_of_pixelblazes():
+    """The default now feeds everything found, so this line has to stay a line."""
+    sink = UdpSink([f"192.168.1.{n}" for n in range(20, 40)])
+    described = sink.describe()
+    assert "20 device(s)" in described
+    assert "+16 more" in described
+    assert len(described) < 120

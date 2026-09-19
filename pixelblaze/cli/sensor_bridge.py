@@ -35,6 +35,10 @@ name whether or not it is a sensor board pattern — but the device parses
 JSON on its render thread for every frame, which costs framerate on complex
 patterns and gets worse on a marginal wifi link.
 
+It also measures the input's loudness in LUFS (`loudness.py`) and watches for
+the two things a spectrum cannot show you: digital silence, and an input that
+opens and then delivers nothing at all. `spectrum.py` draws both, live.
+
 Both transports carry the same reading contract:
   frequencyData: [32 floats]  # magnitudes, nominally 0.0-1.0
   energyAverage: float        # overall loudness, nominally 0.0-1.0
@@ -52,10 +56,15 @@ The UDP transport has no such wrinkle; it carries the whole frame always.
 
 import threading
 import time
-import numpy as np
-import sounddevice as sd
 
-from pixelblaze.pixelblaze import SensorSender
+import numpy as np
+
+from pixelblaze.cli.loudness import SILENT, LoudnessMeter
+from pixelblaze.pixelblaze import SensorPacket, SensorSender
+
+# `sounddevice` is imported where it is used, not here: it needs PortAudio, and
+# `--tone` is a complete run of this whole module without either. A box with no
+# sound stack at all can still exercise the bridge, the meter and the display.
 
 # PB sensor board bin center frequencies (from stock pattern source)
 PB_BIN_CENTERS = np.array([
@@ -74,6 +83,7 @@ PB_BIN_EDGES[32] = PB_BIN_CENTERS[31] * (PB_BIN_CENTERS[31] / PB_BIN_CENTERS[30]
 
 def find_device(name_substring: str) -> tuple[int, dict]:
     """Find an input device by name substring."""
+    import sounddevice as sd
     devices = sd.query_devices()
     for i, dev in enumerate(devices):
         if name_substring.lower() in dev['name'].lower() and dev['max_input_channels'] > 0:
@@ -169,6 +179,9 @@ class VarsSink:
     def __init__(self, pb):
         self.pb = pb
 
+    targets = None
+    """One websocket, so there is no address list for the display to count."""
+
     def describe(self) -> str:
         return f"setVars over websocket → {self.pb.ipAddress}"
 
@@ -219,8 +232,34 @@ class UdpSink:
     def __init__(self, targets, senderId: int = None):
         self.sender = SensorSender(targets, senderId=senderId)
 
+    @property
+    def targets(self) -> list:
+        """The addresses frames are going to, live: `add_target` while running."""
+        return self.sender.targets
+
+    def add_target(self, address: str) -> bool:
+        """Start sending to one more device. True if it wasn't already a target."""
+        if address in self.sender.targets:
+            return False
+        self.sender.targets.append(address)
+        return True
+
+    def remove_target(self, address: str) -> bool:
+        """Stop sending to a device, after a frame of silence so its pattern
+        doesn't latch whatever was playing (see `stop`)."""
+        if address not in self.sender.targets:
+            return False
+        for _ in range(self.SILENCE_FRAMES):
+            self.sender.socket.sendto(SensorPacket.pack(senderId=self.sender.senderId),
+                                      (address, self.sender.port))
+        self.sender.targets.remove(address)
+        return True
+
     def describe(self) -> str:
-        return f"sensor board UDP → {', '.join(self.sender.targets)}:{self.sender.port}"
+        targets = self.sender.targets
+        shown = ', '.join(targets[:4]) + (f", +{len(targets) - 4} more" if len(targets) > 4 else "")
+        return (f"sensor board UDP → {len(targets)} device(s) on :{self.sender.port} "
+                f"({shown})")
 
     def start(self):
         pass
@@ -244,12 +283,115 @@ class UdpSink:
         self.sender.close()
 
 
+
+
+class MicSource:
+    """A capture from a system input device, as a context manager."""
+
+    def __init__(self, device_idx: int, sample_rate: int, block_size: int,
+                 channels: int, callback):
+        self.device_idx = device_idx
+        self.sample_rate = sample_rate
+        self.block_size = block_size
+        self.channels = channels
+        self.callback = callback
+        self._stream = None
+
+    def __enter__(self):
+        import sounddevice as sd
+        self._stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            blocksize=self.block_size,
+            device=self.device_idx,
+            channels=self.channels,
+            dtype='float32',
+            callback=self.callback,
+        )
+        self._stream.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._stream.__exit__(*exc)
+
+
+class ToneSource:
+    """A generated sine instead of a capture.
+
+    No device, no permission prompt, and no PortAudio -- which makes it the one
+    way to exercise this whole module (bins, loudness, display, datagrams) on a
+    box with no sound stack at all, and a known-good signal to point a
+    Pixelblaze at when the question is whether the *device* is listening.
+    """
+
+    def __init__(self, hz: float, sample_rate: int, block_size: int,
+                 channels: int, callback, amplitude: float = 0.25):
+        self.hz = hz
+        self.sample_rate = sample_rate
+        self.block_size = block_size
+        self.channels = channels
+        self.callback = callback
+        self.amplitude = amplitude
+        self._phase = 0.0
+        self._running = False
+        self._thread = None
+
+    def __enter__(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._generate, name='pb-tone', daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        return False
+
+    def _generate(self):
+        period = self.block_size / self.sample_rate
+        step = 2 * np.pi * self.hz / self.sample_rate
+        due = time.monotonic()
+        while self._running:
+            phases = self._phase + step * np.arange(self.block_size)
+            self._phase = float((phases[-1] + step) % (2 * np.pi))
+            block = (self.amplitude * np.sin(phases)).astype(np.float32)
+            block = np.repeat(block[:, None], self.channels, axis=1)
+            self.callback(block, self.block_size, None, None)
+            due += period
+            time.sleep(max(0.0, due - time.monotonic()))
+
+
 class SoundBridge:
-    """Captures audio and pushes FFT results to a Pixelblaze through a transport sink."""
+    """Captures audio and pushes FFT results to a Pixelblaze through a transport sink.
+
+    Two things here are not about the spectrum at all, and both exist because
+    the failure they catch is otherwise indistinguishable from a quiet room:
+
+    **Silence** is the input delivering blocks of digital zeroes. That is not an
+    error -- it is what a loopback with nothing playing sounds like, and it is
+    the truth about the room, so it is sent. It is reported (`display.silent`)
+    because "is anything playing?" is the first question when the lights don't
+    move.
+
+    **A stall** is no blocks arriving at all for `stall_timeout` seconds while
+    the stream is nominally running: an aggregate device with a missing member,
+    an interface unplugged mid-stream, an input another app holds exclusively.
+    Nothing goes out, the pattern sits on its last frame, and the device side
+    cannot see the difference. So `run()` stops and leaves `stalled_for` set,
+    and the CLI fails loudly rather than sitting there looking busy.
+    """
+
+    #: The longest the run loop will sleep. It wakes sooner when the next frame
+    #: is due; this bounds how late the display's 30 fps and the stall watchdog
+    #: can be when the frame rate itself is slow.
+    TICK = 1.0 / 60
 
     def __init__(self, sink, device_idx: int, sample_rate: int, block_size: int,
                  fps: int, gain: float = 1.0, noise_gate: float = 0.0,
-                 log_scale: bool = False, agc: bool = False, on_flowing=None):
+                 log_scale: bool = False, agc: bool = False, on_flowing=None,
+                 display=None, seconds: float = None, channels: int = 1,
+                 tone: float = None, stall_timeout: float = 3.0,
+                 silence_timeout: float = 2.0):
         self.sink = sink
         # Called once, after a few frames have gone out. The UDP transport
         # needs this: a Pixelblaze binds a pattern's sensor globals when the
@@ -264,6 +406,24 @@ class SoundBridge:
         self.noise_gate = noise_gate
         self.log_scale = log_scale
         self.agc = agc
+        self.channels = channels
+        self.tone = tone
+        self.seconds = seconds
+        self.stall_timeout = stall_timeout
+        self.silence_timeout = silence_timeout
+
+        #: A spectrum / status display (see `pixelblaze.cli.spectrum`), or None.
+        self.display = display
+
+        #: Set when the run ended because no audio arrived -- see the class docs.
+        self.stalled_for = None
+
+        # Loudness is measured on the input as captured: before `gain`, which
+        # scales what the pattern is sent, not the sound. And on the channels as
+        # they came, because BS.1770 sums channel power -- a mono mixdown first
+        # reads up to 3 dB low and cancels out-of-phase content outright.
+        self.meter = LoudnessMeter(sample_rate)
+        self.loudness = SILENT
 
         # Enough frames that the device has certainly seen some, but a small
         # fraction of a second so the pattern reload isn't a visible pause.
@@ -274,11 +434,9 @@ class SoundBridge:
         self._running = False
         self._frame_count = 0
         self._start_time = 0
-
-        # Peak-hold across each log interval so transients (claps) are visible
-        self._peak_energy = 0.0
-        self._peak_mag = 0.0
-        self._peak_freq = 0.0
+        self._last_block_at = 0.0
+        self._silent_since = None
+        self._silent = False
 
         # AGC state
         self._agc_level = 1.0       # current auto-gain multiplier
@@ -286,10 +444,30 @@ class SoundBridge:
         self._agc_attack = 0.3      # how fast gain increases (per second)
         self._agc_release = 2.0     # how fast gain decreases (per second)
 
+    @property
+    def frames_sent(self) -> int:
+        return self._frame_count
+
+    @property
+    def is_silent(self) -> bool:
+        return self._silent
+
+    def _say(self, line: str):
+        """Above the live spectrum, or on its own line."""
+        if self.display is not None:
+            self.display.log(line)
+        else:
+            import sys
+            print(line, file=sys.stderr, flush=True)
+
     def _audio_callback(self, indata, frames, time_info, status):
         if status:
-            import sys
-            print(status, file=sys.stderr)
+            self._say(str(status))
+
+        self._last_block_at = time.monotonic()
+        self.meter.process(indata)
+        self.loudness = self.meter.loudness
+        self._track_silence(indata)
 
         effective_gain = self.gain * (self._agc_level if self.agc else 1.0)
         result = fft_to_pb_bins(indata.copy(), self.sample_rate,
@@ -322,28 +500,83 @@ class SoundBridge:
         with self._lock:
             self._latest = result
 
-    def run(self):
-        """Start capturing and pushing. Blocks until KeyboardInterrupt."""
-        self._running = True
-        self._start_time = time.time()
-        self._frame_count = 0
+    def _track_silence(self, block):
+        """Digital silence -- nothing above -120 dBFS -- for `silence_timeout`."""
+        quiet = bool(np.max(np.abs(block)) < 1e-6) if block.size else True
+        if not quiet:
+            self._silent_since = None
+            self._silent = False
+            return
+        if self._silent_since is None:
+            self._silent_since = time.monotonic()
+        elif time.monotonic() - self._silent_since >= self.silence_timeout:
+            self._silent = True
 
-        push_interval = 1.0 / self.fps
+    def _source(self):
+        if self.tone:
+            return ToneSource(self.tone, self.sample_rate, self.block_size,
+                              self.channels, self._audio_callback)
+        return MicSource(self.device_idx, self.sample_rate, self.block_size,
+                         self.channels, self._audio_callback)
+
+    def stop(self):
+        """Ask `run()` to wind up. Safe from another thread."""
+        self._running = False
+
+    def run(self):
+        """Start capturing and pushing. Blocks until Ctrl-C, `seconds`, a stall
+        or `stop()`. Check `stalled_for` afterwards."""
+        self._running = True
+        self._start_time = time.monotonic()
+        self._last_block_at = self._start_time
+        self._frame_count = 0
+        self.stalled_for = None
+        self.meter.reset()
+
+        push_interval = 1.0 / max(self.fps, 1)
+        next_push = self._start_time
+        fps_at = self._start_time
+        fps_frames = 0
 
         self.sink.start()
+        if self.display is not None:
+            self.display.start()
 
-        with sd.InputStream(
-            samplerate=self.sample_rate,
-            blocksize=self.block_size,
-            device=self.device_idx,
-            channels=1,
-            dtype='float32',
-            callback=self._audio_callback,
-        ):
+        with self._source():
             try:
                 while self._running:
-                    time.sleep(push_interval)
-                    self._push_frame()
+                    now = time.monotonic()
+
+                    if now >= next_push:
+                        # Advance rather than reset, so the rate is the rate;
+                        # but never try to make up a whole backlog at once.
+                        next_push = max(now, next_push) + push_interval
+                        self._push_frame()
+
+                    if self.display is not None:
+                        if now - fps_at >= 1.0:
+                            self.display.fps = self._frame_count - fps_frames
+                            fps_frames = self._frame_count
+                            fps_at = now
+                        self.display.loudness = self.loudness
+                        self.display.silent = self._silent
+                        if self.sink.targets is not None:
+                            self.display.targets = len(self.sink.targets)
+                        self.display.draw()
+
+                    quiet_for = now - self._last_block_at
+                    if quiet_for >= self.stall_timeout:
+                        self.stalled_for = quiet_for
+                        break
+
+                    if self.seconds is not None and now - self._start_time >= self.seconds:
+                        break
+
+                    # Sleep to the *next* thing due, not a fixed tick: a flat
+                    # 1/60 s nap rounds a 40 fps push interval up to 34 ms and
+                    # the frame rate silently reads 30.
+                    deadline = min(next_push, now + self.TICK)
+                    time.sleep(max(0.0, deadline - time.monotonic()))
             except KeyboardInterrupt:
                 pass
             finally:
@@ -359,28 +592,11 @@ class SoundBridge:
             return
 
         self.sink.send(data)
+        self._frame_count += 1
+
+        if self.display is not None:
+            self.display.update(data)
 
         if self.on_flowing is not None and self._frame_count >= self.flowing_after:
             callback, self.on_flowing = self.on_flowing, None
             callback()
-
-        if data["energyAverage"] > self._peak_energy:
-            self._peak_energy = data["energyAverage"]
-        if data["maxFrequencyMagnitude"] > self._peak_mag:
-            self._peak_mag = data["maxFrequencyMagnitude"]
-            self._peak_freq = data["maxFrequency"]
-
-        self._frame_count += 1
-        if self._frame_count % self.fps == 0:
-            elapsed = time.time() - self._start_time
-            actual_fps = self._frame_count / elapsed if elapsed > 0 else 0
-            agc_str = f" agc={self._agc_level:.1f}x" if self.agc else ""
-            import sys
-            print(f"\r  {self._frame_count} frames, {actual_fps:.1f} fps, "
-                  f"energy_peak={self._peak_energy:.4f} "
-                  f"maxFreqMag_peak={self._peak_mag:.4f} "
-                  f"maxFreq={self._peak_freq:.0f}Hz{agc_str}    ",
-                  end="", file=sys.stderr, flush=True)
-            self._peak_energy = 0.0
-            self._peak_mag = 0.0
-            self._peak_freq = 0.0
