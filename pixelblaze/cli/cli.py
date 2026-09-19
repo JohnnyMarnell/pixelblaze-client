@@ -34,18 +34,29 @@ from pixelblaze.pixelblaze import Pixelblaze, PBB
 from pixelblaze.cli.cli_utils import cli, log, no_save_option, input_arg, read_input, parse_json, jsons, \
                                      get_cache_dir, check, parse_vars, get_pixelblaze, discover_pixelblaze, \
                                      enumerate_pixelblazes, cache_ip, _read_cache, _write_cache, get_host_ip, \
-                                     _fetch_device_config, update_device_cache, lookup_cached_device
+                                     _fetch_device_config, update_device_cache, lookup_cached_device, \
+                                     resolve_ip_specs
 from pixelblaze.cli.top import register as _register_top
 
 @click.group()
 @click.option(
     '--ip',
     default='auto',
-    help='Pixelblaze address. Accepts a plain IP (192.168.1.230), a URL pasted from '
-         'a browser (http://192.168.1.230/), a bare host number on this subnet (230), '
-         'or a cached device name fragment of 3+ chars (kitch). Default "auto" '
-         'discovers: checks 192.168.4.1 for Ad Hoc, then scans the network.',
+    help='Pixelblaze address(es). Accepts a plain IP (192.168.1.230), a URL pasted '
+         'from a browser (http://192.168.1.230/), a bare host number on this subnet '
+         '(230), a cached device name fragment of 3+ chars (kitch), "all" for every '
+         'cached device, or a comma-separated list of any of those — which runs the '
+         'command on each, in parallel. Default "auto" discovers: checks 192.168.4.1 '
+         'for Ad Hoc, then scans the network.',
     show_default=True
+)
+@click.option(
+    '--prefix',
+    is_flag=True,
+    help="When --ip names several devices, put the address in front of every "
+         "stdout line too. The device labels go to stderr so pipes stay clean, "
+         "which leaves scalar output (`pb --ip all pixels | ...`) with nothing "
+         "saying which device said what; this is that."
 )
 @click.option(
     '--timeout',
@@ -62,7 +73,7 @@ from pixelblaze.cli.top import register as _register_top
     show_default=True
 )
 @click.pass_context
-def pixelblaze(ctx, ip, timeout, retries):
+def pixelblaze(ctx, ip, prefix, timeout, retries):
     """
     Pixelblaze LED Controller CLI
 
@@ -74,9 +85,30 @@ def pixelblaze(ctx, ip, timeout, retries):
         pb --ip http://192.168.1.230/ ... # pasted from the browser
         pb --ip 230 pixels                # .230 on this machine's subnet
         pb --ip kitch pixels              # cached device name fragment
+
+    \b
+    --ip takes a list, and then the command runs on each in parallel:
+        pb --ip kitch,porch,230 on        # three devices at once
+        pb --ip all off                   # every cached device
+        pb --ip all cfg --brightness 0.4
+      pb --ip all --prefix pixels       # tag each stdout line with its device
+
+        Each device's output is held together and printed the moment that
+        device finishes — so the first to answer appears straight away and a
+        wedged one never holds up the rest, which does mean they arrive in the
+        order they finish. Labels go to stderr, so `pb --ip all ls | jq` still
+        sees only the devices' stdout. Every device is attempted whatever the
+        others do, and the exit code is non-zero if any failed.
+
+    \b
+    When a name matches more than one cached device:
+        The one this machine is most likely to reach wins — same subnet first,
+        then last seen from this machine, then most recently seen — and the
+        runners-up are named. Use a longer fragment, the IP, or a list.
     """
     ctx.ensure_object(dict)
     ctx.obj['ip'] = ip
+    ctx.obj['prefix'] = prefix
     ctx.obj['timeout'] = timeout
     ctx.obj['retries'] = retries
 
@@ -2185,9 +2217,10 @@ def cache_show(query):
 @cache.command(name='refresh')
 @click.argument('query', required=False)
 @click.option('--all', 'all_devices', is_flag=True, help='Refresh every cached device in parallel.')
+@click.pass_context
 @click.option('--timeout', 'conn_timeout', type=float, default=5.0,
               help='Per-device connection timeout in seconds.', show_default=True)
-def cache_refresh(query, all_devices, conn_timeout):
+def cache_refresh(ctx, query, all_devices, conn_timeout):
     """Force-refresh cached config from device(s), bypassing TTL. Always fetches patterns.
 
     \b
@@ -2195,6 +2228,8 @@ def cache_refresh(query, all_devices, conn_timeout):
         pb cache refresh              # refresh lastIp
         pb cache refresh jforb        # refresh by name substring
         pb cache refresh --all        # refresh every cached device (parallel)
+        pb --ip kitch,porch cache refresh     # or name them with --ip
+        pb --ip all cache refresh             # the same set as --all
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -2203,11 +2238,16 @@ def cache_refresh(query, all_devices, conn_timeout):
     if not devices_cached:
         raise click.ClickException("No cached devices. Run `pb find` first.")
 
+    named = resolve_ip_specs(ctx.obj.get('ip', 'auto'))
     if all_devices:
         targets = list(devices_cached.keys())
     elif query:
         ip, _ = lookup_cached_device(query)
         targets = [ip]
+    elif named:
+        # --ip is the one way to name destinations everywhere else; `--all` is
+        # just the spelling this command had first, and `--ip all` is the same set.
+        targets = named
     else:
         last_ip = cache_data.get('lastIp')
         if not last_ip:
@@ -2386,7 +2426,7 @@ def sensor_sources(pb: Pixelblaze, preference, sensor_type, no_save):
     log(f"✓ {', '.join(types)} → prefer {preference} ({action})")
 
 
-@cli(sensor, conn=False)
+@cli(sensor, conn=False, fan_out_ips=False)
 @click.option('--transport', type=click.Choice(['udp', 'vars'], case_sensitive=False),
               default='udp',
               help='How to deliver the data: udp = sensor-board datagrams (default), '
@@ -2550,6 +2590,11 @@ def sound(ctx, transport, targets, broadcast, use_peers, sender_id, rebind, devi
             stream(VarsSink(pb))
         log("\nStopped. Sensor sentinels reset.")
         return
+
+    # One capture feeding many devices is not the same thing as running this
+    # command N times, so `sound` opts out of the fan-out and takes the whole
+    # --ip list as its target list instead: `pb --ip kitch,porch sensor sound`.
+    targets += [address for address in ctx.obj.get('ips') or [] if address not in targets]
 
     if not targets:
         # No explicit targets: aim at the Pixelblaze this CLI would talk to
