@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import os
 import re
 import sys
@@ -13,6 +15,7 @@ import json
 import pathlib
 import datetime
 import errno
+import io
 import select
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
@@ -84,10 +87,23 @@ def _read_cache() -> dict:
     return {'lastIp': None, 'devices': {}}
 
 
+# One process writing cache.json from several threads at once is the normal
+# case now that --ip fans out, and a half-written file reads as "no cached
+# devices" on the next run.
+_CACHE_LOCK = threading.Lock()
+
+
 def _write_cache(cache: dict):
-    """Write cache.json atomically."""
+    """Write cache.json atomically, and one writer at a time."""
     try:
-        (get_cache_dir() / 'cache.json').write_text(json.dumps(cache, indent=2))
+        directory = get_cache_dir()
+        with _CACHE_LOCK:
+            # Same directory, so the rename is on one filesystem and therefore
+            # atomic: a reader sees the old file or the new one, never a
+            # truncated one.
+            temporary = directory / f'cache.json.{os.getpid()}.{threading.get_ident()}'
+            temporary.write_text(json.dumps(cache, indent=2))
+            os.replace(temporary, directory / 'cache.json')
     except Exception:
         pass
 
@@ -809,6 +825,189 @@ def resolve_ip_spec(spec: Optional[str]) -> Optional[str]:
     )
 
 
+def resolve_ip_specs(spec) -> list:
+    """Resolve a --ip value into zero or more concrete addresses.
+
+    A comma-separated list resolves each part exactly the way `resolve_ip_spec`
+    resolves one, so every form mixes freely:
+
+        --ip 192.168.1.5,porch,230,http://10.0.0.4/
+
+    `all` expands to every cached device, ordered by `rank_matches` so the ones
+    this machine can actually reach come first. Duplicates collapse and order is
+    kept, so the answer reads the way it was typed.
+
+    An empty list means "nothing was named" -- the caller discovers, the way it
+    always has.
+    """
+    if spec is None:
+        return []
+    addresses = []
+    for part in [p.strip() for p in str(spec).split(',')]:
+        if not part:
+            continue
+        for address in _resolve_one_spec(part):
+            if address not in addresses:
+                addresses.append(address)
+    return addresses
+
+
+def _resolve_one_spec(part: str) -> list:
+    if part.lower() == 'all':
+        devices = _read_cache().get('devices', {})
+        if not devices:
+            raise click.ClickException(
+                "--ip all: no devices are cached yet. Run `pb find` first.")
+        return [ip for ip, _, _ in rank_matches(list(devices.items()))]
+    resolved = resolve_ip_spec(part)
+    return [resolved] if resolved else []
+
+
+class _ThreadRoutedStream(io.TextIOBase):
+    """A stdout/stderr stand-in that sends each thread's writes to its own buffer.
+
+    Installed for the life of a fan-out. A thread that has not asked for a
+    buffer -- the main one, or anything a library spawns -- writes straight
+    through, so nothing is swallowed by accident.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self._local = threading.local()
+
+    @property
+    def _buffer(self):
+        return getattr(self._local, 'buffer', None)
+
+    def capture(self, buffer):
+        self._local.buffer = buffer
+
+    def release(self):
+        self._local.buffer = None
+
+    def write(self, text):
+        return (self._buffer or self._real).write(text)
+
+    def flush(self):
+        if self._buffer is None:
+            self._real.flush()
+
+    def isatty(self):
+        # Captured output is on its way into a string: colour codes, spinners
+        # and progress bars would be noise in the middle of a grouped block.
+        return self._buffer is None and self._real.isatty()
+
+    def writable(self):
+        return True
+
+    def fileno(self):
+        return self._real.fileno()
+
+    @property
+    def encoding(self):
+        return getattr(self._real, 'encoding', 'utf-8')
+
+
+def run_per_address(addresses: list, run: Callable, workers: int = 8,
+                    out=None, err=None, prefix: bool = False) -> list:
+    """Run `run(address)` once per address, in parallel, output kept together.
+
+    Each worker's stdout and stderr go to buffers of its own, and a worker's
+    whole output is released the instant that worker finishes -- so the first
+    device to answer prints straight away and a wedged one never holds up the
+    rest. That does mean **completion order, not the order given**: staring at
+    nothing because the first address in the list is off is worse than reading
+    the results out of order, and every block is labelled.
+
+    stdout and stderr stay separate all the way through, so
+    `pb --ip all ls | jq` still gets only the devices' stdout. The label goes
+    on stderr for the same reason.
+
+    `prefix` puts the address in front of every stdout line as well, for the
+    case the label on stderr cannot serve: a piped run whose output is scalars
+    (`pb --ip all --prefix pixels | ...`) where nothing else says which device
+    said what.
+
+    `out` / `err` are where the grouped blocks end up, defaulting to this
+    process's own; they are arguments so this is testable without reaching into
+    `sys`, which pytest also owns.
+
+    Returns [(address, result, error)] in the order given. Failures do not stop
+    the others; the caller decides what a partial run means.
+    """
+    out = _ThreadRoutedStream(sys.stdout if out is None else out)
+    err = _ThreadRoutedStream(sys.stderr if err is None else err)
+    emit_lock = threading.Lock()
+    results = {}
+    names = {ip: (entry.get('name') or '')
+             for ip, entry in _read_cache().get('devices', {}).items()}
+
+    def label(address: str) -> str:
+        name = names.get(address)
+        return f"── {address}{f' ({name})' if name else ''} " + "─" * 8
+
+    def worker(address: str):
+        captured_out, captured_err = io.StringIO(), io.StringIO()
+        out.capture(captured_out)
+        err.capture(captured_err)
+        try:
+            return run(address), None
+        except Exception as e:                      # noqa: BLE001 - reported below
+            return None, e
+        finally:
+            out.release()
+            err.release()
+            # One lock around the whole group: two workers finishing together
+            # must not shuffle their lines into each other.
+            with emit_lock:
+                err.write(label(address) + "\n")
+                err.write(captured_err.getvalue())
+                err.flush()
+                written = captured_out.getvalue()
+                if prefix and written:
+                    complete = written.endswith("\n")
+                    body = written[:-1] if complete else written
+                    written = "\n".join(f"{address}\t{line}" for line in body.split("\n"))
+                    written += "\n" if complete else ""
+                out.write(written)
+                out.flush()
+
+    real_out, real_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = out, err
+    try:
+        with ThreadPoolExecutor(max_workers=min(len(addresses), workers),
+                                thread_name_prefix='pb-ip') as pool:
+            futures = {pool.submit(worker, address): address for address in addresses}
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+    finally:
+        sys.stdout, sys.stderr = real_out, real_err
+
+    return [(address,) + results.get(address, (None, None)) for address in addresses]
+
+
+def fan_out(addresses: list, run: Callable, out=None, err=None,
+            prefix: bool = False) -> list:
+    """`run_per_address`, plus the summary and the exit code.
+
+    Every address is attempted whatever the others do -- a fan-out that stopped
+    at the first failure would be a worse version of running the command once.
+    """
+    outcomes = run_per_address(addresses, run, out=out, err=err, prefix=prefix)
+    stream = sys.stderr if err is None else err
+    failed = [(address, error) for address, _, error in outcomes if error is not None]
+    stream.write(f"── {len(addresses) - len(failed)}/{len(addresses)} succeeded "
+                 + ("─" * 8 if not failed else "") + "\n")
+    for address, error in failed:
+        stream.write(f"   ✗ {address}: {type(error).__name__}: {error}\n")
+    stream.flush()
+    if failed:
+        raise click.ClickException(
+            f"{len(failed)} of {len(addresses)} failed: "
+            + ', '.join(address for address, _ in failed))
+    return [result for _, result, _ in outcomes]
+
+
 def discover_pixelblaze(ctx: click.Context) -> str:
     """
     Discovers a Pixelblaze IP address using the specified strategy.
@@ -827,10 +1026,19 @@ def discover_pixelblaze(ctx: click.Context) -> str:
     Raises:
         click.ClickException: If --ip cannot be resolved or no Pixelblaze is found
     """
-    ip_address = resolve_ip_spec(ctx.obj.get('ip', 'auto'))
+    addresses = ctx.obj.get('ips')
+    if addresses is None:
+        addresses = resolve_ip_specs(ctx.obj.get('ip', 'auto'))
 
-    if ip_address:
-        cache_ip(ip_address)  # Cache explicitly provided IP
+    if addresses:
+        # More than one only reaches here from a command that opted out of
+        # fanning out and then asked for a single device anyway; the first is
+        # the one `rank_matches` put first, which is the reachable one.
+        ip_address = addresses[0]
+        # A fan-out worker must not scribble its own address into lastIp --
+        # N workers racing to set "the" default IP is meaningless.
+        if not ctx.obj.get('fanning_out'):
+            cache_ip(ip_address)
         return ip_address
 
     # Try cached IP first
@@ -1068,7 +1276,20 @@ def _run_with_retries(ctx: click.Context, fn, *args, **kwargs):
             time.sleep(delay)
 
 
-def cli(cli_group, conn=True, **click_kwargs) -> Callable:
+def context_for(ctx: click.Context, address: str) -> click.Context:
+    """A copy of `ctx` aimed at exactly one device.
+
+    Shallow, with its own `obj`: every command reads its destination out of
+    `ctx.obj`, so a worker that has one address in there behaves precisely as
+    if that had been the only `--ip` given. Nothing below the fan-out has to
+    know it is inside one.
+    """
+    clone = copy.copy(ctx)
+    clone.obj = dict(ctx.obj, ip=address, ips=[address], fanning_out=True)
+    return clone
+
+
+def cli(cli_group, conn=True, fan_out_ips=True, **click_kwargs) -> Callable:
     """
     Factory function to create a cli decorator bound to a Click CLI group.
 
@@ -1095,6 +1316,12 @@ def cli(cli_group, conn=True, **click_kwargs) -> Callable:
         cli_group: The CLI group to add the command to
         conn: If True (default), automatically connects and passes Pixelblaze instance.
               If False, passes context and lets function handle connection.
+        fan_out_ips: If True (default), a `--ip` naming several devices runs the
+              command once per device, in parallel, with each one's output kept
+              together (see `fan_out`). Set False for a command that means to
+              handle the whole list itself -- `pb sensor sound` streams one
+              capture to all of them at once, which is not the same thing as
+              running it N times.
         **click_kwargs: Additional kwargs to pass to @cli.command()
 
     Returns:
@@ -1103,15 +1330,23 @@ def cli(cli_group, conn=True, **click_kwargs) -> Callable:
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(ctx: click.Context, *args, **kwargs):
-            def _run():
-                if conn:
-                    with get_pixelblaze(ctx) as pb:
-                        result = func(pb, *args, **kwargs)
-                        maybe_refresh_cache(pb, ctx.obj.get('ip', ''))
-                        return result
-                else:
-                    return func(ctx, *args, **kwargs)
-            return _run_with_retries(ctx, _run)
+            def _once(context: click.Context):
+                def _run():
+                    if conn:
+                        with get_pixelblaze(context) as pb:
+                            result = func(pb, *args, **kwargs)
+                            maybe_refresh_cache(pb, context.obj.get('ip', ''))
+                            return result
+                    else:
+                        return func(context, *args, **kwargs)
+                return _run_with_retries(context, _run)
+
+            ctx.obj['ips'] = addresses = resolve_ip_specs(ctx.obj.get('ip', 'auto'))
+            if fan_out_ips and len(addresses) > 1:
+                return fan_out(addresses,
+                               lambda address: _once(context_for(ctx, address)),
+                               prefix=ctx.obj.get('prefix', False))
+            return _once(ctx)
 
         # Apply click.pass_context and cli.command() decorators
         wrapper = click.pass_context(wrapper)
