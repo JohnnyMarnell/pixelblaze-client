@@ -218,7 +218,7 @@ class TerminalSpectrum(QuietStatus):
         lines = [self._status(now), self._loudness_line(24)]
         lines += self._bars(height, bar_w, gap)
         lines.append(self._dim(" -60 └" + "─" * plot_w))
-        lines.append(self._dim(self._axis(gutter, plot_w, bar_w, gap)) + self._dim("Hz"))
+        lines.append(self._dim(self._axis(gutter, plot_w, bar_w, gap) + " Hz"))
 
         # A line wider than the terminal wraps, the next redraw then moves up
         # one line too few, and the whole picture scrolls away frame by frame.
@@ -306,7 +306,9 @@ class TerminalSpectrum(QuietStatus):
                 continue
             axis[column:column + len(label)] = label
             free_from = column + len(label) + 1
-        return "".join(axis)
+        # Trailing padding, and then the unit -- rstripped so "Hz" is not the
+        # thing `fit` truncates on a terminal only just wide enough.
+        return "".join(axis).rstrip()
 
     # -- terminal -----------------------------------------------------------
 

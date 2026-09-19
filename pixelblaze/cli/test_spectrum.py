@@ -130,6 +130,8 @@ def test_the_spectrum_draws_a_bar_per_bin_over_a_labelled_axis(written, monkeypa
     axis = [l for l in lines if l.rstrip().endswith("Hz")][-1]
     for mark in ("50", "100", "1k", "10k"):
         assert mark in axis
+    assert axis.rstrip().endswith("10k Hz"), "the unit survives a narrow terminal"
+
 
 
 def test_a_full_scale_bin_is_a_tall_bar_and_a_quiet_one_is_not(written, monkeypatch):
