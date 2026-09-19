@@ -2214,6 +2214,22 @@ def sensor_sources(pb: Pixelblaze, preference, sensor_type, no_save):
               help='Send a generated sine instead of capturing: no input device, no '
                    'permission prompt, no PortAudio. A known-good signal for asking '
                    'whether the *device* is listening.')
+@click.option('--file', '-F', 'audio_file', default=None, metavar='PATH',
+              type=click.Path(dir_okay=False),
+              help='Beam an audio file instead of capturing, in real time, on a loop. '
+                   'Anything ffmpeg reads.')
+@click.option('--from', 'from_time', default=None, metavar='TIME',
+              help='With --file: start here (seconds, or m:ss / h:mm:ss)')
+@click.option('--to', 'to_time', default=None, metavar='TIME',
+              help='With --file: stop here — --from/--to loop just that section')
+@click.option('--loop/--no-loop', 'loop', default=True,
+              help='With --file: loop (default), or play through once and stop')
+@click.option('--mix', 'mix', is_flag=False, flag_value='', default=None, metavar='DEVICE',
+              help='Also play the audio out of an output device, so you can hear what '
+                   'is being sent. Bare --mix means the OS default output; give a name '
+                   'fragment or index for a specific one. The default with no flag is '
+                   'a guess — see the full help — and --no-mix turns it off.')
+@click.option('--no-mix', is_flag=True, help='Never play the audio out of anything')
 @click.option('--seconds', type=float, default=None, metavar='S',
               help='Stop after S seconds (default: until Ctrl-C)')
 @click.option('--fps', type=int, default=30,
@@ -2236,8 +2252,9 @@ def sensor_sources(pb: Pixelblaze, preference, sensor_type, no_save):
 @click.option('--list-devices', '-l', is_flag=True,
               help='List available audio input devices and exit')
 def sound(ctx, transport, targets, broadcast, use_all, rescan, sender_id, rebind,
-          device, tone, seconds, fps, sample_rate, block_size, gain, noise_gate,
-          log_scale, agc, plain, quiet, list_devices):
+          device, tone, audio_file, from_time, to_time, loop, mix, no_mix, seconds,
+          fps, sample_rate, block_size, gain, noise_gate, log_scale, agc, plain,
+          quiet, list_devices):
     """
     Stream audio FFT to Pixelblazes as sensor-board data.
 
@@ -2245,6 +2262,30 @@ def sound(ctx, transport, targets, broadcast, use_all, rescan, sender_id, rebind
     32 frequency bins matching the PB Sensor Board format, and streams
     frequencyData, energyAverage, maxFrequency and maxFrequencyMagnitude
     to the device.
+
+    \b
+    What it sends:
+        Nothing named — the default input device (--device to pick another,
+        -l to list them). --file PATH beams an audio file in real time
+        instead, on a loop, with --from/--to to loop just a section of it.
+        --tone HZ generates a sine, which needs no audio stack at all.
+
+    \b
+    Whether you hear it (--mix / --no-mix):
+        --mix DEVICE plays it out of that output; bare --mix uses the OS
+        default; --no-mix never does. With neither, it guesses:
+          --file   → the default output. You asked to play a track.
+          --tone   → nothing. A test signal is not something to blast.
+          capture  → the default output, UNLESS the input looks like a
+                     loopback that output already carries. The usual Mac
+                     rig is an aggregate/multi-output device feeding both
+                     BlackHole and the speakers, with this capturing
+                     BlackHole: the sound is already reaching the speakers
+                     and playing it again would double it. That is read
+                     from the system where it can be (macOS aggregate
+                     devices) and guessed from the device names otherwise
+                     ("BlackHole" + "BH Speakers"). Whatever it decides is
+                     printed with its reason — --mix/--no-mix settles it.
 
     \b
     Where it sends, by default:
@@ -2329,6 +2370,10 @@ def sound(ctx, transport, targets, broadcast, use_all, rescan, sender_id, rebind
         pb sensor sound -t 192.168.1.24 -t 192.168.1.25
         pb sensor sound --broadcast              # one datagram to the whole LAN
         pb sensor sound --tone 440 --seconds 10  # no mic needed; is it listening?
+        pb sensor sound --file set.m4a           # beam a track, on a loop
+        pb sensor sound -F set.m4a --from 1:12 --to 1:40   # loop that drop
+        pb sensor sound --no-mix                 # don't play it out of anything
+        pb sensor sound --mix "MacBook Pro Speakers"
         pb sensor sound --sender-id 0xD0CAFE     # label the frames in a capture
         pb sensor sound --transport vars         # old setVars path
         pb sensor sound -d "MacBook"             # Stream from built-in mic
@@ -2337,7 +2382,9 @@ def sound(ctx, transport, targets, broadcast, use_all, rescan, sender_id, rebind
         pb sensor sound --fps 40                 # Match the real sensor board
         pb sensor sound -l                       # List input devices
     """
-    from pixelblaze.cli.sensor_bridge import find_device, SoundBridge, UdpSink, VarsSink
+    from pixelblaze.cli.sensor_bridge import (Monitor, SoundBridge, UdpSink, VarsSink,
+                                              choose_monitor, decode_audio, find_device,
+                                              parse_time)
     from pixelblaze.cli.spectrum import make_display
 
     if list_devices:
@@ -2366,6 +2413,52 @@ def sound(ctx, transport, targets, broadcast, use_all, rescan, sender_id, rebind
         log("Note: --rescan only adds devices that discovery finds, and this run "
             "was given its targets explicitly — nothing will be added.")
 
+    check(sum(1 for x in (tone, audio_file) if x) <= 1,
+          "give one of --tone or --file, not both")
+    check(not ((from_time or to_time) and not audio_file),
+          "--from and --to say where in --file to play; there is no --file here")
+    check(not (mix and no_mix), "give one of --mix or --no-mix, not both")
+
+    # Channels as the source delivers them, capped at a pair: BS.1770 sums
+    # channel POWER, and a mono mixdown first reads up to 3 dB low on a wide mix
+    # and cancels out-of-phase content outright. The FFT mixes to mono itself.
+    samples = None
+    if audio_file:
+        try:
+            start, end = parse_time(from_time), parse_time(to_time)
+        except ValueError as e:
+            raise click.ClickException(str(e))
+        try:
+            samples, sr = decode_audio(audio_file, start=start, end=end,
+                                       sample_rate=sample_rate, channels=2)
+        except RuntimeError as e:
+            raise click.ClickException(str(e))
+        channels = samples.shape[1]
+        dev_idx = None
+        section = f" {from_time or '0'}–{to_time}" if (from_time or to_time) else ""
+        dev_info = {'name': f"{pathlib.Path(audio_file).name}{section} "
+                            f"({len(samples) / sr:.1f}s, {'looping' if loop else 'once'})"}
+    elif tone:
+        dev_idx, dev_info = None, {'name': f"generated {tone:g} Hz tone"}
+        sr, channels = sample_rate or 48000, 2
+    else:
+        log(f"Looking for audio device matching '{device}'...")
+        dev_idx, dev_info = find_device(device)
+        sr = sample_rate or int(dev_info['default_samplerate'])
+        channels = max(1, min(2, int(dev_info.get('max_input_channels') or 1)))
+
+    # Hearing it is a separate question from sending it — see the full help.
+    monitor = None
+    try:
+        mix_device, why_mix = choose_monitor(mix, no_mix, dev_info['name'],
+                                             is_capture=not (tone or audio_file),
+                                             is_tone=bool(tone))
+    except (RuntimeError, ImportError, OSError) as e:
+        check(mix is None, f"--mix: {e}")
+        mix_device, why_mix = None, f"no monitor: {e}"
+    if mix_device is not None:
+        monitor = Monitor(mix_device, sr, min(2, channels))
+
     roles = {}
     if discover:
         found, roles = _peer_targets()
@@ -2373,19 +2466,6 @@ def sound(ctx, transport, targets, broadcast, use_all, rescan, sender_id, rebind
                      "answered the probe, and no known address answered. Name one with "
                      "--target or --ip, or use --broadcast.")
         targets += [address for address in found if address not in targets]
-
-    if tone:
-        dev_idx = None
-        dev_info = {'name': f"generated {tone:g} Hz tone", 'default_samplerate': 48000,
-                    'max_input_channels': 2}
-    else:
-        log(f"Looking for audio device matching '{device}'...")
-        dev_idx, dev_info = find_device(device)
-    sr = sample_rate or int(dev_info['default_samplerate'])
-    # Channels as the device delivers them, capped at a pair: BS.1770 sums
-    # channel POWER, and a mono mixdown first reads up to 3 dB low on a wide mix
-    # and cancels out-of-phase content outright. The FFT mixes to mono itself.
-    channels = max(1, min(2, int(dev_info.get('max_input_channels') or 1)))
 
     display = make_display(quiet=quiet, plain=plain, gain=gain)
     say = display.log
@@ -2397,16 +2477,18 @@ def sound(ctx, transport, targets, broadcast, use_all, rescan, sender_id, rebind
     if agc: scaling.append("agc")
 
     def stream(sink, on_flowing=None, on_running=None):
-        log(f"Device: {dev_info['name']}")
+        log(f"Source: {dev_info['name']}")
         log(f"  Sample rate: {sr} Hz, Block: {block_size}, Channels: {channels}, FPS: {fps}")
         log(f"  Sending: {sink.describe()}")
+        log(f"  {'Playing out of' if monitor else 'Not playing out of anything'}: {why_mix}")
         if scaling:
             log(f"  Scaling: {', '.join(scaling)}")
         log("  Press Ctrl+C to stop\n")
         bridge = SoundBridge(sink, dev_idx, sr, block_size, fps, gain=gain,
                              noise_gate=noise_gate, log_scale=log_scale, agc=agc,
                              on_flowing=on_flowing, display=display, seconds=seconds,
-                             channels=channels, tone=tone)
+                             channels=channels, tone=tone, samples=samples, loop=loop,
+                             monitor=monitor)
         stop_extras = on_running(bridge) if on_running else None
         try:
             bridge.run()

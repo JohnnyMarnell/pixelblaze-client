@@ -54,6 +54,7 @@ simulated frame sits there frozen. (`getVars` returns arrays whole too.)
 The UDP transport has no such wrinkle; it carries the whole frame always.
 """
 
+import contextlib
 import threading
 import time
 
@@ -285,6 +286,399 @@ class UdpSink:
 
 
 
+# ── playing a file, and hearing what is being sent ──────────────────────────
+
+def parse_time(value) -> float:
+    """Seconds, or `m:ss` / `h:mm:ss`, as seconds."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    try:
+        parts = [float(p) for p in text.split(':')]
+    except ValueError:
+        raise ValueError(f"{text!r} is not a time: use seconds (12.5) or m:ss / h:mm:ss")
+    if not 1 <= len(parts) <= 3 or any(p < 0 for p in parts):
+        raise ValueError(f"{text!r} is not a time: use seconds (12.5) or m:ss / h:mm:ss")
+    total = 0.0
+    for part in parts:
+        total = total * 60 + part
+    return total
+
+
+def _ffmpeg(*args) -> bytes:
+    """Run an ffmpeg-family tool, raising its own error text rather than a
+    return code nobody can act on."""
+    import subprocess
+    try:
+        done = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        raise RuntimeError(f"{args[0]} is not installed")
+    if done.returncode != 0:
+        detail = done.stderr.decode('utf-8', 'replace').strip().splitlines()
+        raise RuntimeError(detail[-1] if detail else f"{args[0]} failed ({done.returncode})")
+    return done.stdout
+
+
+def decode_audio(path, start: float = None, end: float = None,
+                 sample_rate: int = None, channels: int = 2):
+    """Decode a file (or a section of one) to (frames, channels) float32.
+
+    ffmpeg if it is installed -- it reads anything, seeks, and resamples.
+    Otherwise the stdlib `wave` module, which is PCM WAV only and cannot
+    resample, so the file's own rate is what you get.
+
+    The section is decoded into memory rather than streamed, because looping it
+    has to be gapless: this is for beaming a passage at an installation over and
+    over, and a hitch at the seam is the thing you would notice. A whole track is
+    a few tens of MB at 48 kHz stereo; that is the cost of the seam being clean.
+
+    Returns (samples, sample_rate).
+    """
+    import pathlib as _pathlib
+
+    path = str(path)
+    if not _pathlib.Path(path).is_file():
+        raise RuntimeError(f"no such file: {path}")
+    if start is not None and end is not None and end <= start:
+        raise RuntimeError(f"--to ({end:g}s) must come after --from ({start:g}s)")
+
+    try:
+        rate = sample_rate or _probe_sample_rate(path)
+        args = ['ffmpeg', '-v', 'error', '-nostdin']
+        if start:
+            args += ['-ss', f"{start:.6f}"]
+        if end is not None:
+            args += ['-t', f"{end - (start or 0):.6f}"]
+        args += ['-i', path, '-f', 'f32le', '-ac', str(channels), '-ar', str(rate), '-']
+        raw = _ffmpeg(*args)
+    except RuntimeError as e:
+        if 'not installed' not in str(e):
+            raise RuntimeError(f"could not decode {path}: {e}")
+        samples, rate = _decode_wav(path, start, end)
+        if sample_rate and sample_rate != rate:
+            raise RuntimeError(
+                f"{path} is {rate} Hz and --sample-rate says {sample_rate}; "
+                f"install ffmpeg to resample")
+        return samples, rate
+
+    samples = np.frombuffer(raw, dtype='<f4')
+    if samples.size == 0:
+        raise RuntimeError(f"{path} decoded to no audio"
+                           + (" in that --from/--to range" if start or end else ""))
+    return samples.reshape(-1, channels).copy(), rate
+
+
+def _probe_sample_rate(path: str) -> int:
+    """The file's own rate, so nothing is resampled unless asked."""
+    out = _ffmpeg('ffprobe', '-v', 'error', '-select_streams', 'a:0',
+                  '-show_entries', 'stream=sample_rate', '-of', 'csv=p=0', path)
+    try:
+        return int(out.decode().strip().splitlines()[0])
+    except (ValueError, IndexError):
+        raise RuntimeError(f"{path} has no audio stream")
+
+
+def _decode_wav(path: str, start: float = None, end: float = None):
+    """The no-ffmpeg fallback: PCM WAV, at whatever rate it already is."""
+    import wave
+
+    try:
+        with wave.open(path, 'rb') as wav:
+            rate, width, channels = wav.getframerate(), wav.getsampwidth(), wav.getnchannels()
+            frames = wav.readframes(wav.getnframes())
+    except wave.Error as e:
+        raise RuntimeError(f"could not decode {path}: {e}. Install ffmpeg to read "
+                           f"anything other than PCM WAV.")
+    dtype = {1: np.uint8, 2: '<i2', 4: '<i4'}.get(width)
+    if dtype is None:
+        raise RuntimeError(f"{path} is {width * 8}-bit WAV; install ffmpeg to read it")
+    data = np.frombuffer(frames, dtype=dtype).reshape(-1, channels).astype(np.float32)
+    data = (data - 128) / 128 if width == 1 else data / float(1 << (width * 8 - 1))
+    lo = int((start or 0) * rate)
+    hi = int(end * rate) if end is not None else len(data)
+    return data[lo:hi].copy(), rate
+
+
+class FileSource:
+    """Decoded audio, delivered in real time, looping.
+
+    Real time on purpose: the point is to beam a track at an installation as it
+    plays, so the blocks arrive at the rate they would from a capture and every
+    meter, silence check and stall check downstream behaves identically.
+    """
+
+    def __init__(self, samples, sample_rate: int, block_size: int, callback,
+                 loop: bool = True, on_end=None):
+        self.samples = samples
+        self.sample_rate = sample_rate
+        self.block_size = block_size
+        self.callback = callback
+        self.loop = loop
+        self.on_end = on_end
+        self._running = False
+        self._thread = None
+
+    @property
+    def duration(self) -> float:
+        return len(self.samples) / float(self.sample_rate)
+
+    def __enter__(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._play, name='pb-file', daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        return False
+
+    def _play(self):
+        period = self.block_size / self.sample_rate
+        due = time.monotonic()
+        total = len(self.samples)
+        pos = 0
+        while self._running:
+            end = pos + self.block_size
+            if end <= total:
+                block = self.samples[pos:end]
+                pos = end if end < total else 0
+            elif self.loop:
+                # Wrap inside the block, so the seam is a sample boundary and
+                # not a gap the length of however long a restart took.
+                block = np.concatenate([self.samples[pos:], self.samples[:end - total]])
+                pos = end - total
+            else:
+                block = self.samples[pos:]
+                self._running = False
+            if len(block):
+                self.callback(block, len(block), None, None)
+            due += period
+            time.sleep(max(0.0, due - time.monotonic()))
+        if not self.loop and self.on_end is not None:
+            self.on_end()
+
+
+class Monitor:
+    """Play what is being sent out of an output device, so you can hear it.
+
+    A queue and a writer thread, never a blocking write from inside the audio
+    callback: a monitor that stalls the capture costs frames, and the frames are
+    the whole point. A full queue drops blocks and counts them instead of
+    backing up -- audio you cannot keep up with is better late-free than
+    in sync.
+    """
+
+    #: Blocks of slack before dropping. At 1024/48 kHz that is about 85 ms.
+    DEPTH = 4
+
+    def __init__(self, device, sample_rate: int, channels: int):
+        self.device = device
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.dropped = 0
+        self._queue = None
+        self._stream = None
+        self._thread = None
+        self._running = False
+
+    def __enter__(self):
+        import queue
+
+        import sounddevice as sd
+        self._queue = queue.Queue(maxsize=self.DEPTH)
+        self._stream = sd.OutputStream(samplerate=self.sample_rate, device=self.device,
+                                       channels=self.channels, dtype='float32')
+        self._stream.start()
+        self._running = True
+        self._thread = threading.Thread(target=self._pump, name='pb-monitor', daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+        return False
+
+    def write(self, block):
+        """From the audio callback. Never blocks."""
+        import queue
+        if not self._running:
+            return
+        if block.ndim == 1:
+            block = block[:, None]
+        if block.shape[1] != self.channels:
+            # Mix down (or fan out) to what the output device took.
+            block = (block.mean(axis=1, keepdims=True) if block.shape[1] > self.channels
+                     else np.repeat(block[:, :1], self.channels, axis=1))
+        try:
+            self._queue.put_nowait(np.ascontiguousarray(block, dtype=np.float32))
+        except queue.Full:
+            self.dropped += 1
+
+    def _pump(self):
+        import queue
+        while self._running:
+            try:
+                block = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._stream.write(block)
+            except Exception:
+                return
+
+
+# ── which output device to monitor on, and whether to at all ───────────────
+#
+# The interesting case is the one you cannot see from inside the process. On a
+# Mac the normal loopback setup is: an aggregate / multi-output device that
+# feeds BOTH a virtual device (BlackHole) and the speakers, selected as the
+# system output, with this bridge capturing the virtual device. The audio is
+# already reaching the speakers that way, so playing it again here would double
+# it. Every other arrangement -- a microphone, a line input, a file we are
+# beaming -- wants a monitor.
+#
+# Nothing in a portable audio API reports "this output routes through that
+# input", so the default is a GUESS, said out loud, and --mix / --no-mix
+# settles it. It is never silently wrong: the reason is logged either way.
+
+#: Inputs that are something else's output coming back around.
+LOOPBACK_HINTS = ('blackhole', 'loopback', 'soundflower', 'vb-audio', 'vb-cable',
+                  'voicemeeter', 'virtual', 'stereo mix', 'what u hear', 'monitor')
+
+
+def is_loopback_name(name: str) -> bool:
+    """Does this input device look like a loopback rather than a microphone?"""
+    lowered = (name or '').lower()
+    return any(hint in lowered for hint in LOOPBACK_HINTS)
+
+
+def find_output_device(query=None):
+    """An output device by index, name fragment, or None for the OS default.
+
+    Returns (index, info). The index is None when the default is wanted and
+    sounddevice's default is fine to leave unset.
+    """
+    import sounddevice as sd
+
+    devices = sd.query_devices()
+    if query in (None, ''):
+        index = sd.default.device[1]
+        if index is None or index < 0:
+            raise RuntimeError("this machine has no default output device")
+        return index, devices[index]
+
+    try:
+        index = int(query)
+    except (TypeError, ValueError):
+        pass
+    else:
+        if not 0 <= index < len(devices) or devices[index]['max_output_channels'] < 1:
+            raise RuntimeError(f"device {index} is not an output")
+        return index, devices[index]
+
+    lowered = str(query).lower()
+    for index, device in enumerate(devices):
+        if lowered in device['name'].lower() and device['max_output_channels'] > 0:
+            return index, device
+    available = "\n".join(f"  [{i}] {d['name']}" for i, d in enumerate(devices)
+                          if d['max_output_channels'] > 0)
+    raise RuntimeError(f"no output device matching '{query}'. Available:\n{available}")
+
+
+def _describes_an_aggregate(name: str) -> bool:
+    """macOS only: ask the system whether this device is an aggregate or
+    multi-output. Anything unexpected -- another OS, no tool, new JSON -- is
+    False, and the name heuristic below gets the question instead."""
+    import json
+    import subprocess
+    import sys as _sys
+
+    if _sys.platform != 'darwin' or not name:
+        return False
+    try:
+        raw = subprocess.run(['system_profiler', 'SPAudioDataType', '-json'],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=10).stdout
+        report = json.loads(raw or b'{}')
+    except Exception:
+        return False
+
+    def walk(node):
+        if isinstance(node, dict):
+            if str(node.get('_name', '')).strip() == name.strip():
+                yield ' '.join(str(v) for v in node.values() if isinstance(v, str)).lower()
+            for value in node.values():
+                yield from walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                yield from walk(item)
+
+    return any('aggregate' in facts or 'multi-output' in facts or 'multioutput' in facts
+               for facts in walk(report))
+
+
+def _name_suggests_routing(input_name: str, output_name: str) -> bool:
+    """Does the OUTPUT's name say it carries this input?
+
+    People name these things after what is in them -- an aggregate of BlackHole
+    and the speakers gets called "BH Speakers" or "BlackHole + Speakers". So:
+    a shared word of four characters or more, or the input's initials as a word
+    of the output's name ("BlackHole" -> "bh").
+    """
+    import re as _re
+
+    output = (output_name or '').lower()
+    input_words = _re.findall(r'[a-z]{4,}', (input_name or '').lower())
+    if any(word in output for word in input_words):
+        return True
+    output_words = set(_re.findall(r'[a-z0-9]+', output))
+    initials = ''.join(part[0] for part in _re.findall(r'[A-Z][a-z]*', input_name or '')).lower()
+    return len(initials) >= 2 and initials in output_words
+
+
+def choose_monitor(mix, no_mix: bool, input_name: str, is_capture: bool,
+                   is_tone: bool = False):
+    """Which output device to play through, and why. Returns (device, reason).
+
+    `device` is None for "don't". See the note at the top of this section --
+    the no-flags answer is a guess, and the reason is meant to be printed.
+    """
+    if no_mix:
+        return None, "--no-mix"
+    if mix:
+        index, info = find_output_device(mix)
+        return index, f"{info['name']} (--mix {mix})"
+    if mix == '':                      # bare --mix: the OS default, no guessing
+        index, info = find_output_device(None)
+        return index, f"{info['name']} (--mix, the default output)"
+    if is_tone:
+        return None, "a generated tone is a test signal, not something to play"
+
+    try:
+        index, info = find_output_device(None)
+    except Exception as e:
+        return None, f"no monitor: {e}"
+
+    if is_capture and is_loopback_name(input_name):
+        if _describes_an_aggregate(info['name']):
+            return None, (f"{info['name']} is an aggregate/multi-output device, so it "
+                          f"already carries {input_name} to your speakers (--mix to "
+                          f"play it again anyway)")
+        if _name_suggests_routing(input_name, info['name']):
+            return None, (f"{info['name']} looks like it already carries {input_name} "
+                          f"to your speakers — guessing from the name (--mix to play "
+                          f"it anyway, --no-mix to make this certain)")
+
+    return index, f"{info['name']} (the default output)"
+
+
 class MicSource:
     """A capture from a system input device, as a context manager."""
 
@@ -390,7 +784,8 @@ class SoundBridge:
                  fps: int, gain: float = 1.0, noise_gate: float = 0.0,
                  log_scale: bool = False, agc: bool = False, on_flowing=None,
                  display=None, seconds: float = None, channels: int = 1,
-                 tone: float = None, stall_timeout: float = 3.0,
+                 tone: float = None, samples=None, loop: bool = True,
+                 monitor=None, stall_timeout: float = 3.0,
                  silence_timeout: float = 2.0):
         self.sink = sink
         # Called once, after a few frames have gone out. The UDP transport
@@ -408,6 +803,11 @@ class SoundBridge:
         self.agc = agc
         self.channels = channels
         self.tone = tone
+        #: Decoded audio to beam instead of capturing -- see `decode_audio`.
+        self.samples = samples
+        self.loop = loop
+        #: A `Monitor`, or None for "don't play it out of anything".
+        self.monitor = monitor
         self.seconds = seconds
         self.stall_timeout = stall_timeout
         self.silence_timeout = silence_timeout
@@ -465,6 +865,8 @@ class SoundBridge:
             self._say(str(status))
 
         self._last_block_at = time.monotonic()
+        if self.monitor is not None:
+            self.monitor.write(indata)
         self.meter.process(indata)
         self.loudness = self.meter.loudness
         self._track_silence(indata)
@@ -513,6 +915,9 @@ class SoundBridge:
             self._silent = True
 
     def _source(self):
+        if self.samples is not None:
+            return FileSource(self.samples, self.sample_rate, self.block_size,
+                              self._audio_callback, loop=self.loop, on_end=self.stop)
         if self.tone:
             return ToneSource(self.tone, self.sample_rate, self.block_size,
                               self.channels, self._audio_callback)
@@ -542,7 +947,10 @@ class SoundBridge:
         if self.display is not None:
             self.display.start()
 
-        with self._source():
+        with contextlib.ExitStack() as stack:
+            if self.monitor is not None:
+                stack.enter_context(self.monitor)
+            stack.enter_context(self._source())
             try:
                 while self._running:
                     now = time.monotonic()
