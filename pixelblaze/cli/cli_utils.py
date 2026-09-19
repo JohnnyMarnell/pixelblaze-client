@@ -313,10 +313,77 @@ def maybe_refresh_cache(pb: Pixelblaze, ip: str, force: bool = False) -> bool:
         return False
 
 
+def _subnet(ip: str) -> str:
+    """The /24 an address is on, or '' if it isn't an address."""
+    return ip.rsplit('.', 1)[0] if is_ipv4(ip) else ''
+
+
+def _last_seen(entry: dict) -> str:
+    """`lastSeenAt` as a sortable string. Missing sorts oldest."""
+    return str(entry.get('lastSeenAt') or '')
+
+
+def rank_matches(matches: list) -> list:
+    """Order (ip, entry) pairs best-first, and say why the winner won.
+
+    Returns [(ip, entry, reason), ...].
+
+    Several cached devices can legitimately answer to one name: the same
+    Pixelblaze moved between networks and left an entry behind on each, two
+    really are called the same thing, or a device was on an ad-hoc AP once and
+    a house network since. Refusing to choose is the wrong answer when exactly
+    one of them is on the subnet this machine is on *right now* and the rest
+    are from another building.
+
+    So, best first:
+      1. On this machine's /24 -- the one a packet can actually reach.
+      2. Last seen from this machine's address (`hostIp`), which is weaker
+         evidence of the same thing and covers a /24 we have since left.
+      3. Most recently seen (`lastSeenAt`), newest first.
+      4. The address, so the answer is stable when nothing else separates them.
+    """
+    host_ip = get_host_ip()
+    here = _subnet(host_ip)
+
+    def reason(ip, entry):
+        if here and _subnet(ip) == here:
+            return f"on this machine's subnet {here}.x"
+        if host_ip and entry.get('hostIp') == host_ip:
+            return "last seen from this machine"
+        if _last_seen(entry):
+            return f"most recently seen ({_last_seen(entry)[:19]})"
+        return "first by address"
+
+    def key(pair):
+        ip, entry = pair
+        return (0 if here and _subnet(ip) == here else 1,
+                0 if host_ip and entry.get('hostIp') == host_ip else 1,
+                # Newest first: strings sort ascending, so invert by negating
+                # the comparison with a reversed sort on this field alone.
+                _invert(_last_seen(entry)),
+                ip)
+
+    ranked = sorted(matches, key=key)
+    return [(ip, entry, reason(ip, entry)) for ip, entry in ranked]
+
+
+def _invert(text: str) -> tuple:
+    """A sort key that orders strings descending inside an ascending sort."""
+    return tuple(-ord(c) for c in text)
+
+
+def _also_matched(chosen_ip: str, ranked: list) -> str:
+    """The runners-up, for the log line -- never silently dropped."""
+    return ', '.join(f"{e.get('name', '?')} ({ip})" for ip, e, _ in ranked if ip != chosen_ip)
+
+
 def lookup_cached_device(query: str) -> tuple[str, dict]:
     """Look up a cached device by exact IP or case-insensitive name substring.
 
-    Raises click.ClickException if not found or ambiguous.
+    When several devices match, the most reachable-looking one wins and the
+    others are logged -- see `rank_matches`.
+
+    Raises click.ClickException if nothing matches.
     """
     devices = _read_cache().get('devices', {})
     if not devices:
@@ -325,12 +392,14 @@ def lookup_cached_device(query: str) -> tuple[str, dict]:
         return query, devices[query]
     q = query.lower()
     matches = [(ip, e) for ip, e in devices.items() if q in (e.get('name') or '').lower()]
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        names = ', '.join(f"{e.get('name', '?')} ({ip})" for ip, e in matches)
-        raise click.ClickException(f"Ambiguous query '{query}': matches {names}")
-    raise click.ClickException(f"No cached device matches '{query}'.")
+    if not matches:
+        raise click.ClickException(f"No cached device matches '{query}'.")
+    ranked = rank_matches(matches)
+    ip, entry, why = ranked[0]
+    if len(ranked) > 1:
+        log(f"'{query}' matched {len(ranked)} devices; using {entry.get('name', '?')} "
+            f"({ip}) — {why}. Also matched: {_also_matched(ip, ranked)}.")
+    return ip, entry
 
 
 def _describe_ports(ports: dict) -> str:
@@ -636,30 +705,33 @@ def _resolve_subnet_octet(octet: int) -> str:
 def _resolve_cached_name(query: str) -> Optional[str]:
     """Find a cached device IP by case-insensitive name match.
 
-    An exact (case-insensitive) name wins outright; otherwise the query must
-    hit exactly one device as a substring. Returns None when nothing matches,
-    so callers can report why the whole --ip value failed to resolve.
+    An exact (case-insensitive) name wins outright; otherwise the query is
+    taken as a substring. Several matches are not an error -- the most
+    reachable-looking one is used and the rest are logged, see `rank_matches`.
+    Returns None when nothing matches, so callers can report why the whole
+    --ip value failed to resolve.
     """
     devices = _read_cache().get('devices', {})
     q = query.lower()
 
-    def _fail_ambiguous(matches):
-        names = ', '.join(f"{e.get('name', '?')} ({ip})" for ip, e in matches)
-        raise click.ClickException(
-            f"Ambiguous --ip '{query}': matches {names}. Use a longer fragment or the IP."
-        )
+    def _choose(matches):
+        ranked = rank_matches(matches)
+        ip, entry, why = ranked[0]
+        if len(ranked) > 1:
+            log(f"--ip '{query}' matched {len(ranked)} devices; using {ip} "
+                f"({entry.get('name', '?')}) — {why}. "
+                f"Also matched: {_also_matched(ip, ranked)}. "
+                f"Give a longer fragment, an IP, or a comma-separated list to "
+                f"reach more than one.")
+        return ip
 
     exact = [(ip, e) for ip, e in devices.items() if (e.get('name') or '').lower() == q]
-    if len(exact) == 1:
-        return exact[0][0]
-    if len(exact) > 1:
-        _fail_ambiguous(exact)
+    if exact:
+        return _choose(exact)
 
     matches = [(ip, e) for ip, e in devices.items() if q in (e.get('name') or '').lower()]
-    if len(matches) == 1:
-        return matches[0][0]
-    if len(matches) > 1:
-        _fail_ambiguous(matches)
+    if matches:
+        return _choose(matches)
     return None
 
 
