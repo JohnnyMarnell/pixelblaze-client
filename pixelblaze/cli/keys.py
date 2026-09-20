@@ -145,9 +145,8 @@ class KeyReader:
             self._fd = self.stream.fileno()
         except (AttributeError, ValueError, OSError):
             return False
-        try:
-            import termios                                     # noqa: F401
-        except ImportError:
+        import importlib.util
+        if importlib.util.find_spec('termios') is None:
             return False                                       # Windows
         try:
             return os.isatty(self._fd)
