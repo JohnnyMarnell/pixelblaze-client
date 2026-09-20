@@ -166,6 +166,196 @@ def test_the_bars_never_out_run_the_terminal(written, monkeypatch):
             assert len(line) <= columns - 1, f"{columns}x{rows}: {line!r}"
 
 
+# ── the transport line, keypress feedback, and the keymap overlay ──────────
+
+class FakeTransport:
+    def __init__(self, paused=False, index=0, count=3, position=83.0,
+                 duration=296.0, loop=True, title="/tmp/set/Phone Down.m4a"):
+        self.paused = paused
+        self.index = index
+        self.count = count
+        self.position = position
+        self.duration = duration
+        self.loop = loop
+        self.title = title
+
+
+def wide(monkeypatch, columns=120, rows=30):
+    monkeypatch.setattr(spectrum.shutil, 'get_terminal_size',
+                        lambda default=None: __import__('os').terminal_size((columns, rows)))
+
+
+@pytest.mark.parametrize("seconds, text", [
+    (0, "0:00"), (7.9, "0:07"), (83, "1:23"), (296, "4:56"), (3723, "1:02:03"),
+    (-1, "0:00"), (float('inf'), "0:00"), (None, "0:00"),
+])
+def test_a_position_reads_as_a_clock(seconds, text):
+    assert spectrum.clock(seconds) == text
+
+
+def test_the_transport_says_where_in_what_of_how_many():
+    line = spectrum.transport_text(FakeTransport())
+    assert line.startswith("▶")
+    assert "1/3" in line, "which track, counting from one like a person does"
+    assert "Phone Down.m4a" in line and "/tmp/set/" not in line
+    assert "1:23 / 4:56" in line
+    assert "↻" in line, "looping"
+
+    paused = spectrum.transport_text(FakeTransport(paused=True, count=1, loop=False))
+    assert paused.startswith("⏸ paused")
+    assert "1/1" not in paused, "one track is not a playlist"
+    assert "↻" not in paused
+
+
+def test_the_spectrum_draws_the_transport_under_the_status(written, monkeypatch):
+    wide(monkeypatch)
+    display = TerminalSpectrum(color=NONE)
+    display.transport = FakeTransport(position=148.0, duration=296.0)
+    display.update(readings())
+    display._last_draw -= 1
+    display.draw()
+
+    lines = plain("".join(written)).split("\n")
+    assert "fps" in lines[0]
+    assert "Phone Down.m4a" in lines[1]
+    # A bar you can watch fill: half way through, half of it is full.
+    bar = lines[1][lines[1].index("▕") + 1:lines[1].index("▏")]
+    assert len(bar) > 8
+    assert bar.count("█") == pytest.approx(len(bar) / 2, abs=1)
+
+
+def test_a_capture_has_no_transport_line_at_all(written, monkeypatch):
+    wide(monkeypatch)
+    display = TerminalSpectrum(color=NONE)
+    display.update(readings())
+    display._last_draw -= 1
+    display.draw()
+
+    assert "▶" not in plain("".join(written))
+
+
+def test_the_status_line_shows_the_gain_as_it_is_turned(written, monkeypatch):
+    """It is a live knob now, so the number has to be the live one -- and AGC
+    is a second gain on top of it, which is why both are named."""
+    wide(monkeypatch)
+    display = TerminalSpectrum(color=NONE)
+    display.update(readings())
+    display.gain = 12.5
+    display._last_draw -= 1
+    display.draw()
+    assert "gain ×12.5" in plain("".join(written))
+    assert "agc" not in plain("".join(written))
+
+    written.clear()
+    display.agc = 8.25
+    display._last_draw -= 1
+    display.draw()
+    assert "gain ×12.5 · agc ×8.25" in plain("".join(written))
+
+
+def test_a_keypress_is_confirmed_in_the_frame_and_then_lets_go(written, monkeypatch):
+    """Logging it instead would push the animation up the screen once per
+    keystroke, and finding a gain is a dozen keystrokes."""
+    wide(monkeypatch)
+    display = TerminalSpectrum(color=NONE)
+    display.update(readings())
+
+    display.notify("gain ×2.25")
+    display._last_draw -= 1
+    display.draw()
+    assert "gain ×2.25" in plain("".join(written))
+
+    written.clear()
+    display._message_until -= display.MESSAGE_SECONDS + 1
+    display._last_draw -= 1
+    display.draw()
+    assert "gain ×2.25" not in plain("".join(written))
+
+
+def test_the_keymap_replaces_the_bars_rather_than_pushing_them_off(written, monkeypatch):
+    wide(monkeypatch, rows=24)
+    display = TerminalSpectrum(color=NONE)
+    display.update(readings(bins=[1.0] * 32))
+    display.help_lines = [("space", "pause / resume"), ("q", "stop")]
+    display._last_draw -= 1
+    display.draw()
+
+    frame = plain("".join(written))
+    assert "pause / resume" in frame and "? to put the spectrum back" in frame
+    assert "-60 └" not in frame, "the plot would not have fitted under it"
+    assert len(frame.split("\n")) <= 24
+
+
+def test_a_frame_never_leaves_the_tail_of_a_taller_one_behind(written, monkeypatch):
+    """Every line erases to its right, but not the lines below it. So any frame
+    that is shorter than the last one has to erase downward, and the transport
+    line, the toast and the overlay all change the height."""
+    wide(monkeypatch)
+    display = TerminalSpectrum(color=NONE)
+    display.update(readings())
+
+    def frame():
+        written.clear()
+        display._last_draw -= 1
+        display.draw()
+        return "".join(written)
+
+    frame()                                   # the first one, nothing above it
+    display.notify("gain ×2.25")
+    taller = frame()
+    assert taller.startswith("\x1b["), "it moved the cursor back up"
+
+    display._message_until -= display.MESSAGE_SECONDS + 1
+    shorter = frame()
+    assert "\x1b[J" in shorter.split("\n")[0], "shorter, and it did not erase down"
+
+
+def test_the_redraw_always_moves_up_by_exactly_what_it_drew(written, monkeypatch):
+    """One line too few and the picture scrolls away a line at a time; one too
+    many and it eats whatever was on the screen before it."""
+    wide(monkeypatch)
+    display = TerminalSpectrum(color=NONE)
+    display.update(readings())
+    display.transport = FakeTransport()
+
+    previous = 0
+    for step in range(6):
+        written.clear()
+        if step == 2:
+            display.notify("seek +30s")
+        if step == 3:
+            display.help_lines = [("q", "stop")]
+        if step == 4:
+            display.help_lines = None
+        display._last_draw -= 1
+        display.draw()
+        frame = "".join(written)
+
+        moved = re.match(r'\x1b\[(\d+)A', frame)
+        assert (int(moved.group(1)) if moved else 0) == previous, f"step {step}"
+        previous = frame.count("\n")
+
+
+def test_the_piped_status_line_carries_the_transport_too(written):
+    """Half of watching a set from a log file is knowing where in it you are."""
+    display = PlainStatus()
+    display.transport = FakeTransport(paused=True)
+    display.update(readings())
+    display._last_at -= 2
+    display.draw()
+
+    line = "".join(written)
+    assert "⏸ paused" in line and "1/3" in line and "1:23 / 4:56" in line
+
+
+def test_a_keypress_on_a_display_with_no_frame_is_simply_printed(written):
+    for display in (QuietStatus(), PlainStatus()):
+        written.clear()
+        display.notify("AGC on")
+        assert "AGC on" in "".join(written)
+        assert not display.draws_help
+
+
 def test_a_log_line_erases_the_animation_first_so_it_does_not_tear(written):
     display = TerminalSpectrum(color=NONE)
     display._lines_on_screen = 7
