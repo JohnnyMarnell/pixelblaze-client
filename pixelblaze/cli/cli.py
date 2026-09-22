@@ -38,7 +38,7 @@ from pixelblaze.cli.cli_utils import cli, log, no_save_option, input_arg, read_i
                                      get_cache_dir, check, parse_vars, get_pixelblaze, discover_pixelblaze, \
                                      enumerate_pixelblazes, cache_ip, _read_cache, _write_cache, get_host_ip, \
                                      _fetch_device_config, update_device_cache, lookup_cached_device, \
-                                     _tcp_ports_open, WS_PORT, resolve_ip_specs
+                                     _tcp_ports_open, WS_PORT, resolve_ip_specs, cached_by_ip
 from pixelblaze.cli.top import register as _register_top
 
 @click.group()
@@ -2285,9 +2285,8 @@ def cache_ls(as_json):
         pb cache ls            # human-readable summary, * marks lastIp
         pb cache ls --json     # JSONL output for piping into jq
     """
-    cache_data = _read_cache()
-    devices = cache_data.get('devices', {})
-    last_ip = cache_data.get('lastIp')
+    last_ip = _read_cache().get('lastIp')
+    devices = cached_by_ip()
     if not devices:
         log("No cached devices. Run `pb find` to discover.")
         return
@@ -2345,8 +2344,7 @@ def cache_refresh(ctx, query, all_devices, conn_timeout):
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    cache_data = _read_cache()
-    devices_cached = cache_data.get('devices', {})
+    devices_cached = cached_by_ip()
     if not devices_cached:
         raise click.ClickException("No cached devices. Run `pb find` first.")
 

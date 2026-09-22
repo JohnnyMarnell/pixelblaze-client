@@ -31,6 +31,7 @@ FAKE_CACHE = {
 
 @pytest.fixture
 def cache(monkeypatch):
+    monkeypatch.setattr(cli_utils, 'cached_by_ip', lambda: FAKE_CACHE['devices'])
     monkeypatch.setattr(cli_utils, '_read_cache', lambda: FAKE_CACHE)
     monkeypatch.setattr(cli_utils, 'get_host_ip', lambda: '192.168.1.55')
 
@@ -63,6 +64,7 @@ def test_all_mixes_with_everything_else_and_still_collapses(cache):
 
 
 def test_all_with_an_empty_cache_says_what_to_run(monkeypatch):
+    monkeypatch.setattr(cli_utils, 'cached_by_ip', lambda: {})
     monkeypatch.setattr(cli_utils, '_read_cache', lambda: {'devices': {}})
     with pytest.raises(click.ClickException, match="pb find"):
         resolve_ip_specs('all')
