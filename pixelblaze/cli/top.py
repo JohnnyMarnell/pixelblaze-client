@@ -24,6 +24,7 @@ from pixelblaze.pixelblaze import Pixelblaze
 from pixelblaze.cli.cli_utils import (
     _fetch_device_config,
     _read_cache,
+    cached_by_ip,
     enumerate_pixelblazes,
     log,
     update_device_cache,
@@ -1051,7 +1052,7 @@ def register(cli_group):
         # Live mode: seed from on-disk cache so the table (or JSON) draws
         # instantly, then let the rediscovery thread find/update everything
         # else in the background.
-        cached = _read_cache().get("devices", {}) or {}
+        cached = cached_by_ip() or {}
         seed = list(cached.values())
         monitor = TopMonitor(seed, rediscover_seconds=rediscover)
 

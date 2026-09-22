@@ -257,10 +257,15 @@ def test_discovery_merges_every_source():
 
     assert set(by_ip) == {'192.168.1.86', '192.168.1.24', '192.168.4.1',
                           '192.168.1.230', '192.168.1.50'}, by_ip
+    # Nothing is known about this one, so it stays anonymous rather than
+    # borrowing a neighbour's name.
     assert by_ip['192.168.1.230'] == {'ip': '192.168.1.230', 'via': 'beacon'}
     assert by_ip['192.168.4.1']['via'] == 'adhoc'
     assert by_ip['192.168.1.50']['via'] == 'peer' and by_ip['192.168.1.50']['ws'] is True
-    assert by_ip['192.168.1.24'] == {'ip': '192.168.1.24', 'via': 'cache', 'http': True, 'ws': False}
+    # The cache remembers who this is, and a fast find says so without
+    # connecting to anything.
+    assert by_ip['192.168.1.24'] == {'ip': '192.168.1.24', 'via': 'cache',
+                                     'http': True, 'ws': False, 'name': 'lightSabre'}
     # The device that answered both ways is listed once; the first answer names the source.
     assert by_ip['192.168.1.86']['via'] in ('cache', 'timeSync')
     assert by_ip['192.168.1.86']['ws'] is True   # port state merged in either way
@@ -288,7 +293,7 @@ def test_discovery_passive_and_silent_explanation():
     assert [d['via'] for d in found] == ['cache'], found
 
     err = io.StringIO()
-    with patched(cli_utils, _read_cache=lambda: cache), contextlib.redirect_stderr(err):
+    with patched(cli_utils, cached_by_ip=lambda: cache['devices']), contextlib.redirect_stderr(err):
         _explain_silent_beacons(found)
     text = err.getvalue()
     assert 'No beacons heard' in text, text
@@ -315,14 +320,30 @@ def test_discovery_fails_loudly_on_bind_error():
 
 
 def test_cache_drops_transient_keys():
-    """via/http/ws describe one run; they must not be written to cache.json."""
-    written = {}
-    with patched(cli_utils, _read_cache=lambda: {'lastIp': None, 'devices': {}},
-                 _write_cache=lambda c: written.update(c), get_host_ip=lambda: '192.168.1.67'):
-        update_device_cache([{'ip': '192.168.1.86', 'name': 'bike2', 'via': 'cache',
-                              'http': True, 'ws': True, 'error': 'x'}])
-    entry = written['devices']['192.168.1.86']
-    assert entry == {'ip': '192.168.1.86', 'name': 'bike2', 'hostIp': '192.168.1.67'}, entry
+    """via/http/ws describe one run; they are never written to either file.
+
+    Both files are keyed by BOARD now: the inventory gets the identity and the
+    sighting, local state gets where it was and when.
+    """
+    state, inventory = {}, {}
+    with patched(cli_utils,
+                 _read_cache=lambda: {'lastIp': None, 'devices': {}},
+                 _read_devices=lambda: {'devices': {}},
+                 _write_cache=lambda c: state.update(c),
+                 _write_devices=lambda d: inventory.update(d),
+                 get_host_ip=lambda: '192.168.1.67'):
+        update_device_cache([{'ip': '192.168.1.86', 'name': 'bike2', 'chipId': 14157732,
+                              'via': 'cache', 'http': True, 'ws': True, 'error': 'x'}])
+
+    board = inventory['devices']['14157732']
+    assert board['name'] == 'bike2'
+    assert [(r['name'], r['ip']) for r in board['seen']] == [('bike2', '192.168.1.86')]
+
+    entry = state['devices']['14157732']
+    assert entry['ip'] == '192.168.1.86'
+    assert entry['hostIp'] == '192.168.1.67'
+    for gone in ('via', 'http', 'ws', 'error'):
+        assert gone not in entry, gone
     print("✓ cache drops transient keys")
 
 

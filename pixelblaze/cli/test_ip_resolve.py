@@ -65,8 +65,8 @@ REJECTS = [
 
 def test_ip_resolve():
     """Check every accepted --ip form, and that bad ones fail clearly."""
-    original_read_cache, original_host_ip = cli_utils._read_cache, cli_utils.get_host_ip
-    cli_utils._read_cache = lambda: FAKE_CACHE
+    original_read_cache, original_host_ip = cli_utils.cached_by_ip, cli_utils.get_host_ip
+    cli_utils.cached_by_ip = lambda: FAKE_CACHE['devices']
     cli_utils.get_host_ip = lambda: FAKE_HOST_IP
     try:
         for spec, expected in RESOLVES:
@@ -82,7 +82,7 @@ def test_ip_resolve():
             else:
                 raise AssertionError(f"--ip {spec!r}: expected failure, got {actual!r}")
     finally:
-        cli_utils._read_cache, cli_utils.get_host_ip = original_read_cache, original_host_ip
+        cli_utils.cached_by_ip, cli_utils.get_host_ip = original_read_cache, original_host_ip
 
     print(f"✓ {len(RESOLVES)} resolved, {len(REJECTS)} rejected")
 
@@ -111,14 +111,14 @@ SAME_NAME_CACHE = {
 
 def _with_cache(cache, host_ip):
     """Swap in a fake cache and host address for one call."""
-    original = cli_utils._read_cache, cli_utils.get_host_ip
-    cli_utils._read_cache = lambda: cache
+    original = cli_utils.cached_by_ip, cli_utils.get_host_ip
+    cli_utils.cached_by_ip = lambda: cache['devices']
     cli_utils.get_host_ip = lambda: host_ip
     return original
 
 
 def _restore(original):
-    cli_utils._read_cache, cli_utils.get_host_ip = original
+    cli_utils.cached_by_ip, cli_utils.get_host_ip = original
 
 
 def test_same_name_picks_the_one_this_machine_can_reach():
