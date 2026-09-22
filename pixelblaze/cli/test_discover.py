@@ -236,12 +236,12 @@ def test_discovery_merges_every_source():
     """Beacons, probe replies, cache, ad-hoc and peers land in one list, once each."""
     cache = {'devices': {
         '192.168.1.86': {'ip': '192.168.1.86', 'name': 'bike2'},
-        '192.168.1.24': {'ip': '192.168.1.24', 'name': 'lightSabre'},
+        '10.1.1.24': {'ip': '10.1.1.24', 'name': 'cascade'},
         '192.168.1.67': {'ip': '192.168.1.67'},           # us — never a device
     }}
     ports = {
         '192.168.1.86': {80: True, 81: True},
-        '192.168.1.24': {80: True, 81: False},             # wedged websocket
+        '10.1.1.24': {80: True, 81: False},             # wedged websocket
         '192.168.4.1': {80: True, 81: True},               # ad-hoc answers too
         '192.168.1.50': {80: True, 81: True},              # only known via a peer
     }
@@ -255,12 +255,12 @@ def test_discovery_merges_every_source():
     found, seen, log = _run_discovery(cache, ports, script, peers=peers)
     by_ip = {d['ip']: d for d in found}
 
-    assert set(by_ip) == {'192.168.1.86', '192.168.1.24', '192.168.4.1',
+    assert set(by_ip) == {'192.168.1.86', '10.1.1.24', '192.168.4.1',
                           '192.168.1.230', '192.168.1.50'}, by_ip
     assert by_ip['192.168.1.230'] == {'ip': '192.168.1.230', 'via': 'beacon'}
     assert by_ip['192.168.4.1']['via'] == 'adhoc'
     assert by_ip['192.168.1.50']['via'] == 'peer' and by_ip['192.168.1.50']['ws'] is True
-    assert by_ip['192.168.1.24'] == {'ip': '192.168.1.24', 'via': 'cache', 'http': True, 'ws': False}
+    assert by_ip['10.1.1.24'] == {'ip': '10.1.1.24', 'via': 'cache', 'http': True, 'ws': False}
     # The device that answered both ways is listed once; the first answer names the source.
     assert by_ip['192.168.1.86']['via'] in ('cache', 'timeSync')
     assert by_ip['192.168.1.86']['ws'] is True   # port state merged in either way
@@ -268,7 +268,7 @@ def test_discovery_merges_every_source():
     # on_ip fired exactly once per device, and never for our own address.
     assert sorted(seen) == sorted(by_ip), seen
     # A device whose websocket port is closed is never opened for a peer query.
-    assert '192.168.1.24' not in FakePixelblaze.opened, FakePixelblaze.opened
+    assert '10.1.1.24' not in FakePixelblaze.opened, FakePixelblaze.opened
     assert 'wedged' in log and 'pb reboot' in log, log
     print("✓ discovery merges every source")
 
