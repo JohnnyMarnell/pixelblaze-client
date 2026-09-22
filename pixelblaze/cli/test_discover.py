@@ -235,13 +235,13 @@ def _run_discovery(cache, ports, script, probe=True, self_ip='192.168.1.67', pee
 def test_discovery_merges_every_source():
     """Beacons, probe replies, cache, ad-hoc and peers land in one list, once each."""
     cache = {'devices': {
-        '192.168.1.86': {'ip': '192.168.1.86', 'name': 'bike2'},
-        '192.168.1.24': {'ip': '192.168.1.24', 'name': 'lightSabre'},
+        '10.1.1.86': {'ip': '10.1.1.86', 'name': 'bike2'},
+        '10.1.1.24': {'ip': '10.1.1.24', 'name': 'cascade'},
         '192.168.1.67': {'ip': '192.168.1.67'},           # us — never a device
     }}
     ports = {
-        '192.168.1.86': {80: True, 81: True},
-        '192.168.1.24': {80: True, 81: False},             # wedged websocket
+        '10.1.1.86': {80: True, 81: True},
+        '10.1.1.24': {80: True, 81: False},             # wedged websocket
         '192.168.4.1': {80: True, 81: True},               # ad-hoc answers too
         '192.168.1.50': {80: True, 81: True},              # only known via a peer
     }
@@ -250,12 +250,12 @@ def test_discovery_merges_every_source():
         {'address': '192.168.1.50'},
         {'address': '192.168.1.67'},                       # phantom: us
     ]}
-    script = [(0.05, '192.168.1.230', 42), (0.05, '192.168.1.86', 43)]
+    script = [(0.05, '192.168.1.230', 42), (0.05, '10.1.1.86', 43)]
 
     found, seen, log = _run_discovery(cache, ports, script, peers=peers)
     by_ip = {d['ip']: d for d in found}
 
-    assert set(by_ip) == {'192.168.1.86', '192.168.1.24', '192.168.4.1',
+    assert set(by_ip) == {'10.1.1.86', '10.1.1.24', '192.168.4.1',
                           '192.168.1.230', '192.168.1.50'}, by_ip
     # Nothing is known about this one, so it stays anonymous rather than
     # borrowing a neighbour's name.
@@ -264,16 +264,16 @@ def test_discovery_merges_every_source():
     assert by_ip['192.168.1.50']['via'] == 'peer' and by_ip['192.168.1.50']['ws'] is True
     # The cache remembers who this is, and a fast find says so without
     # connecting to anything.
-    assert by_ip['192.168.1.24'] == {'ip': '192.168.1.24', 'via': 'cache',
-                                     'http': True, 'ws': False, 'name': 'lightSabre'}
+    assert by_ip['10.1.1.24'] == {'ip': '10.1.1.24', 'via': 'cache',
+                                     'http': True, 'ws': False, 'name': 'cascade'}
     # The device that answered both ways is listed once; the first answer names the source.
-    assert by_ip['192.168.1.86']['via'] in ('cache', 'timeSync')
-    assert by_ip['192.168.1.86']['ws'] is True   # port state merged in either way
+    assert by_ip['10.1.1.86']['via'] in ('cache', 'timeSync')
+    assert by_ip['10.1.1.86']['ws'] is True   # port state merged in either way
 
     # on_ip fired exactly once per device, and never for our own address.
     assert sorted(seen) == sorted(by_ip), seen
     # A device whose websocket port is closed is never opened for a peer query.
-    assert '192.168.1.24' not in FakePixelblaze.opened, FakePixelblaze.opened
+    assert '10.1.1.24' not in FakePixelblaze.opened, FakePixelblaze.opened
     assert 'wedged' in log and 'pb reboot' in log, log
     print("✓ discovery merges every source")
 
@@ -281,13 +281,13 @@ def test_discovery_merges_every_source():
 def test_discovery_passive_and_silent_explanation():
     """Without the probe a follower is only found via cache, and the log says why."""
     cache = {'devices': {
-        '192.168.1.86': {'ip': '192.168.1.86', 'name': 'bike2',
+        '10.1.1.86': {'ip': '10.1.1.86', 'name': 'bike2',
                          'settings': {'leaderId': 9238196, 'chipId': 14157732}},
         '192.168.1.230': {'ip': '192.168.1.230', 'name': 'bike1',
                           'settings': {'chipId': 9238196}},
     }}
-    ports = {'192.168.1.86': {80: True, 81: True}}
-    script = [(0.05, '192.168.1.86', 43)]   # would answer a probe; ignored when passive
+    ports = {'10.1.1.86': {80: True, 81: True}}
+    script = [(0.05, '10.1.1.86', 43)]   # would answer a probe; ignored when passive
 
     found, _, _ = _run_discovery(cache, ports, script, probe=False)
     assert [d['via'] for d in found] == ['cache'], found
@@ -308,8 +308,8 @@ def test_discovery_passive_and_silent_explanation():
 
 def test_discovery_fails_loudly_on_bind_error():
     """A held UDP:1889 surfaces as an error, even though the probes found devices."""
-    cache = {'devices': {'192.168.1.86': {'ip': '192.168.1.86'}}}
-    ports = {'192.168.1.86': {80: True, 81: True}}
+    cache = {'devices': {'10.1.1.86': {'ip': '10.1.1.86'}}}
+    ports = {'10.1.1.86': {80: True, 81: True}}
     try:
         _run_discovery(cache, ports, [], raise_on_start=OSError(48, 'cannot listen for Pixelblaze beacons: in use'))
     except click.ClickException as e:
@@ -332,15 +332,15 @@ def test_cache_drops_transient_keys():
                  _write_cache=lambda c: state.update(c),
                  _write_devices=lambda d: inventory.update(d),
                  get_host_ip=lambda: '192.168.1.67'):
-        update_device_cache([{'ip': '192.168.1.86', 'name': 'bike2', 'chipId': 14157732,
+        update_device_cache([{'ip': '10.1.1.86', 'name': 'bike2', 'chipId': 14157732,
                               'via': 'cache', 'http': True, 'ws': True, 'error': 'x'}])
 
     board = inventory['devices']['14157732']
     assert board['name'] == 'bike2'
-    assert [(r['name'], r['ip']) for r in board['seen']] == [('bike2', '192.168.1.86')]
+    assert [(r['name'], r['ip']) for r in board['seen']] == [('bike2', '10.1.1.86')]
 
     entry = state['devices']['14157732']
-    assert entry['ip'] == '192.168.1.86'
+    assert entry['ip'] == '10.1.1.86'
     assert entry['hostIp'] == '192.168.1.67'
     for gone in ('via', 'http', 'ws', 'error'):
         assert gone not in entry, gone

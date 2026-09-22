@@ -14,8 +14,8 @@ FAKE_CACHE = {
                           'lastSeenAt': '2026-01-01T00:00:00+00:00'},
         '192.168.1.231': {'ip': '192.168.1.231', 'name': 'Kitchen Nook',
                           'lastSeenAt': '2026-06-01T00:00:00+00:00'},
-        '192.168.1.240': {'ip': '192.168.1.240', 'name': 'Porch'},
-        '192.168.1.241': {'ip': '192.168.1.241', 'name': 'Porch Extra'},
+        '10.1.1.240': {'ip': '10.1.1.240', 'name': 'Porch'},
+        '10.1.1.241': {'ip': '10.1.1.241', 'name': 'Porch Extra'},
         '192.168.4.1': {'ip': '192.168.4.1'},  # discovered but never named
     },
 }
@@ -46,8 +46,8 @@ RESOLVES = [
     ('kitchen strip', '192.168.1.230'),  # exact name beats the substring rule
     ('KITCHEN NOOK', '192.168.1.231'),
     ('nook', '192.168.1.231'),
-    ('porch', '192.168.1.240'),  # exact 'Porch' wins over 'Porch Extra'
-    ('porch e', '192.168.1.241'),
+    ('porch', '10.1.1.240'),  # exact 'Porch' wins over 'Porch Extra'
+    ('porch e', '10.1.1.241'),
     # Several matches is not an error: the reachable one wins, the rest are
     # logged. Both Kitchens are on this machine's /24, so the tie falls to the
     # one seen most recently.
@@ -90,8 +90,8 @@ def test_ip_resolve():
 # Several cached devices answering to one name is the normal state of a
 # Pixelblaze that has been on more than one network. The reported case:
 #
-#   $ pb --ip ls2 cfg
-#   Error: Ambiguous --ip 'ls2': matches ls2 (192.168.1.34), ls2 (192.168.4.4), ...
+#   $ pb --ip aurora cfg
+#   Error: Ambiguous --ip 'aurora': matches aurora (10.1.1.34), aurora (10.1.9.4), ...
 #
 # Refusing to choose is wrong when one of them is on the subnet this machine is
 # on right now and the rest are from another building.
@@ -99,11 +99,11 @@ def test_ip_resolve():
 SAME_NAME_CACHE = {
     'lastIp': None,
     'devices': {
-        '192.168.1.34': {'ip': '192.168.1.34', 'name': 'ls2',
+        '10.1.1.34': {'ip': '10.1.1.34', 'name': 'aurora',
                          'lastSeenAt': '2026-09-01T10:00:00+00:00'},
-        '192.168.4.4': {'ip': '192.168.4.4', 'name': 'ls2',
+        '10.1.9.4': {'ip': '10.1.9.4', 'name': 'aurora',
                         'lastSeenAt': '2026-09-18T10:00:00+00:00'},
-        '192.168.4.3': {'ip': '192.168.4.3', 'name': 'ls2',
+        '10.1.9.3': {'ip': '10.1.9.3', 'name': 'aurora',
                         'lastSeenAt': '2026-09-19T10:00:00+00:00'},
     },
 }
@@ -122,12 +122,12 @@ def _restore(original):
 
 
 def test_same_name_picks_the_one_this_machine_can_reach():
-    for host_ip, expected in [('192.168.4.55', '192.168.4.3'),    # newest on my /24
-                              ('192.168.1.55', '192.168.1.34'),   # only one on my /24
-                              ('10.0.0.7', '192.168.4.3')]:       # none: newest wins
+    for host_ip, expected in [('10.1.9.55', '10.1.9.3'),    # newest on my /24
+                              ('10.1.1.55', '10.1.1.34'),      # only one on my /24
+                              ('10.0.0.7', '10.1.9.3')]:       # none: newest wins
         original = _with_cache(SAME_NAME_CACHE, host_ip)
         try:
-            assert resolve_ip_spec('ls2') == expected, f"from {host_ip}"
+            assert resolve_ip_spec('aurora') == expected, f"from {host_ip}"
         finally:
             _restore(original)
 
@@ -135,41 +135,41 @@ def test_same_name_picks_the_one_this_machine_can_reach():
 def test_the_host_address_it_was_last_seen_from_breaks_a_tie():
     """Weaker evidence than the subnet, for a /24 this machine has since left."""
     cache = {'lastIp': None, 'devices': {
-        '10.1.1.9': {'ip': '10.1.1.9', 'name': 'ls2', 'hostIp': '172.16.0.5',
+        '10.1.1.9': {'ip': '10.1.1.9', 'name': 'aurora', 'hostIp': '172.16.0.5',
                      'lastSeenAt': '2026-09-19T10:00:00+00:00'},
-        '10.2.2.9': {'ip': '10.2.2.9', 'name': 'ls2', 'hostIp': '192.168.9.9',
+        '10.2.2.9': {'ip': '10.2.2.9', 'name': 'aurora', 'hostIp': '192.168.9.9',
                      'lastSeenAt': '2026-09-20T10:00:00+00:00'},
     }}
     original = _with_cache(cache, '172.16.0.5')
     try:
-        assert resolve_ip_spec('ls2') == '10.1.1.9', "seen from here beats seen later"
+        assert resolve_ip_spec('aurora') == '10.1.1.9', "seen from here beats seen later"
     finally:
         _restore(original)
 
 
 def test_the_other_matches_are_named_not_silently_dropped(capsys):
-    original = _with_cache(SAME_NAME_CACHE, '192.168.4.55')
+    original = _with_cache(SAME_NAME_CACHE, '10.1.9.55')
     try:
-        resolve_ip_spec('ls2')
+        resolve_ip_spec('aurora')
     finally:
         _restore(original)
     said = capsys.readouterr().err
     assert "matched 3 devices" in said
-    assert "using 192.168.4.3" in said
-    assert "subnet 192.168.4.x" in said
-    assert "192.168.4.4" in said and "192.168.1.34" in said
+    assert "using 10.1.9.3" in said
+    assert "subnet 10.1.9.x" in said
+    assert "10.1.9.4" in said and "10.1.1.34" in said
     assert "comma-separated" in said, "and how to reach all of them"
 
 
 def test_ranking_is_stable_when_nothing_separates_the_matches():
     cache = {'lastIp': None, 'devices': {
-        '10.0.0.9': {'ip': '10.0.0.9', 'name': 'ls2'},
-        '10.0.0.2': {'ip': '10.0.0.2', 'name': 'ls2'},
+        '10.0.0.9': {'ip': '10.0.0.9', 'name': 'aurora'},
+        '10.0.0.2': {'ip': '10.0.0.2', 'name': 'aurora'},
     }}
     original = _with_cache(cache, '')
     try:
-        assert resolve_ip_spec('ls2') == '10.0.0.2'
-        assert resolve_ip_spec('ls2') == '10.0.0.2'
+        assert resolve_ip_spec('aurora') == '10.0.0.2'
+        assert resolve_ip_spec('aurora') == '10.0.0.2'
     finally:
         _restore(original)
 
