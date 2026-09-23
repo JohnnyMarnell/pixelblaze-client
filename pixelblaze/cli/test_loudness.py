@@ -112,6 +112,23 @@ def test_digital_silence_is_minus_infinity_not_a_very_small_number():
     assert lufs(0.0) == -math.inf
 
 
+def test_a_filter_ringing_down_after_the_music_stops_reads_as_silence():
+    """Pause a track and the K-weighting filters decay rather than snapping to
+    zero, so the momentary power spends a second as a denormal. Reported
+    honestly that is `-901.4 LUFS`, which is no use to anybody -- R128's
+    absolute gate is where a reading stops being a number."""
+    rate = 48000
+    meter = LoudnessMeter(rate)
+    meter.process(_sine(1000, 1.0, rate, 10 ** (-23 / 20)))
+    assert meter.loudness.momentary == pytest.approx(-23, abs=0.5)
+
+    meter.process(np.zeros((rate // 2, 2)))
+    assert meter.loudness.momentary == -math.inf, "a decaying tail is not a level"
+
+    assert lufs(10 ** ((-69 + 0.691) / 10)) == pytest.approx(-69, abs=0.01)
+    assert lufs(10 ** ((-71 + 0.691) / 10)) == -math.inf
+
+
 def test_the_gate_keeps_a_long_pause_from_dragging_the_integrated_figure_down():
     """-70 LUFS absolute, then -10 LU relative: EBU R128's whole purpose."""
     rate = 48000

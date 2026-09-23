@@ -79,12 +79,21 @@ def _emit(text: str):
 class QuietStatus:
     """`--quiet`: the readings still flow, nothing is said about them."""
 
+    #: Whether `help_lines` can be shown as an overlay, or has to be printed.
+    draws_help = False
+
     def __init__(self):
         self.gain = 1.0
         self.fps = 0
         self.loudness = SILENT
         self.targets = None
         self.silent = False
+        #: The AGC's current multiplier, or None when AGC is off.
+        self.agc = None
+        #: A `Transport` (see `sensor_bridge`) while a file is playing.
+        self.transport = None
+        #: Set to a list of (keys, label) to show the keymap; None to hide it.
+        self.help_lines = None
 
     def start(self):
         pass
@@ -97,6 +106,11 @@ class QuietStatus:
 
     def log(self, line: str):
         _emit(line + "\n")
+
+    def notify(self, message: str):
+        """A keypress did something. Where there is no frame to hold a
+        transient line, saying it once is the whole of it."""
+        self.log("  " + message)
 
     def finish(self):
         pass
@@ -134,6 +148,8 @@ class PlainStatus(QuietStatus):
                 f"M {Loudness.text(self.loudness.momentary, 5)} "
                 f"S {Loudness.text(self.loudness.shortTerm, 5)} "
                 f"I {Loudness.text(self.loudness.integrated, 5)} LUFS")
+        if self.transport is not None:
+            line += " · " + transport_text(self.transport)
         if self.targets is not None:
             line += f" · → {self.targets}"
         if self.silent:
@@ -141,8 +157,37 @@ class PlainStatus(QuietStatus):
         _emit(line + "\n")
 
 
+def clock(seconds: float) -> str:
+    """m:ss, or h:mm:ss for a set rather than a track."""
+    if seconds is None or not math.isfinite(seconds) or seconds < 0:
+        seconds = 0.0
+    whole = int(seconds)
+    hours, rest = divmod(whole, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+def transport_text(transport) -> str:
+    """`⏸ 2/7 Phone Down.m4a 1:23 / 4:56` -- what a file source is doing, in
+    the one line a piped status or a narrow terminal has for it."""
+    parts = ["⏸ paused" if transport.paused else "▶"]
+    if transport.count > 1:
+        parts.append(f"{transport.index + 1}/{transport.count}")
+    title = os.path.basename(str(transport.title or "")).strip()
+    if title:
+        parts.append(title)
+    parts.append(f"{clock(transport.position)} / {clock(transport.duration)}")
+    if transport.loop:
+        parts.append("↻")
+    return " ".join(parts)
+
+
 class TerminalSpectrum(QuietStatus):
     """The live bars. Only for a terminal -- see `color_mode()`."""
+
+    draws_help = True
+    #: How long a keypress's confirmation stays on screen.
+    MESSAGE_SECONDS = 2.5
 
     FRAME_INTERVAL = 1.0 / 30
     # Bars fall at 90 dB/s rather than snapping to zero between frames; caps
@@ -169,6 +214,16 @@ class TerminalSpectrum(QuietStatus):
         self._last_draw = time.monotonic()
         self._lines_on_screen = 0
         self._last_size = (0, 0)
+        self._message = None
+        self._message_until = 0.0
+
+    def notify(self, message: str):
+        """A keypress's confirmation, held for a couple of seconds in the frame
+        itself. Logging it instead would push the whole animation up the screen
+        once per keystroke, and adjusting a gain is a dozen keystrokes."""
+        import time
+        self._message = message
+        self._message_until = time.monotonic() + self.MESSAGE_SECONDS
 
     def start(self):
         _emit("\x1b[?25l")          # hide the cursor
@@ -206,20 +261,43 @@ class TerminalSpectrum(QuietStatus):
                 self._peak[i] = max(self._shown[i], self._peak[i] - self.CAP_FALL * dt)
 
         size = shutil.get_terminal_size((80, 24))
-        out = self._erase(clear=size != self._last_size)
+        resized = size != self._last_size
         self._last_size = size
 
-        height = max(4, min(14, size.lines - 5))
+        lines = [self._status(now)]
+        if self.transport is not None:
+            lines.append(self._transport_line(size.columns))
+
+        if self.help_lines:
+            # The keymap instead of the bars, not as well as them: a dozen more
+            # lines under a full-height plot scrolls the picture off the screen
+            # on any normal terminal.
+            lines += self._help_block(size.lines - len(lines) - 1)
+            self._flush(lines, size, resized)
+            return
+
+        extra = len(lines) - 1 + (1 if self._message_showing(now) else 0)
+        height = max(4, min(14, size.lines - 5 - extra))
         gutter = 6
         per = max(1, (size.columns - gutter - 1) // BIN_COUNT)
         bar_w, gap = (min(per - 1, 3), 1) if per >= 3 else ((1, 1) if per == 2 else (1, 0))
         plot_w = BIN_COUNT * (bar_w + gap) - gap
 
-        lines = [self._status(now), self._loudness_line(24)]
+        lines.append(self._loudness_line(24))
         lines += self._bars(height, bar_w, gap)
         lines.append(self._dim(" -60 └" + "─" * plot_w))
         lines.append(self._dim(self._axis(gutter, plot_w, bar_w, gap) + " Hz"))
+        if self._message_showing(now):
+            lines.append(self._paint(" " + self._message, (0.5, 0.95, 0.6)))
 
+        self._flush(lines, size, resized)
+
+    def _flush(self, lines: list, size, resized: bool):
+        # A frame with fewer lines than the last one leaves the tail of the old
+        # one on screen -- each line erases itself to the right, but not the
+        # lines below. So any change of height erases downward, and the
+        # transport line, the toast and the help overlay all change it.
+        out = self._erase(clear=resized or len(lines) != self._lines_on_screen)
         # A line wider than the terminal wraps, the next redraw then moves up
         # one line too few, and the whole picture scrolls away frame by frame.
         for line in lines:
@@ -229,16 +307,43 @@ class TerminalSpectrum(QuietStatus):
 
     # -- the pieces ---------------------------------------------------------
 
+    def _message_showing(self, now: float) -> bool:
+        return bool(self._message and now < self._message_until)
+
     def _status(self, now: float) -> str:
         readings = self._latest or {"maxFrequency": 0.0, "energyAverage": 0.0}
         seconds = int(now - self._started)
         to = f" → {self.targets}" if self.targets is not None else ""
+        gain = f"gain ×{self.gain:.3g}"
+        if self.agc is not None:
+            gain += f" · agc ×{self.agc:.3g}"
         status = (f" {self.fps:3d} fps{to} · peak {readings['maxFrequency']:5.0f} Hz · "
-                  f"energy {readings['energyAverage']:.4f} · gain x{self.gain:.1f} · "
+                  f"energy {readings['energyAverage']:.4f} · {gain} · "
                   f"{seconds // 60}:{seconds % 60:02d}")
         if self.silent:
             status += " · " + self._paint("silent — is anything playing?", (1, 0.8, 0.2))
         return status
+
+    def _transport_line(self, columns: int) -> str:
+        """Where the track is, and a bar you can watch fill."""
+        transport = self.transport
+        text = transport_text(transport)
+        width = max(8, min(28, columns - len(text) - 6))
+        done = 0.0
+        if transport.duration > 0:
+            done = min(1.0, max(0.0, transport.position / transport.duration))
+        filled = int(done * width)
+        bar = ("█" * filled).ljust(width, "·")
+        colour = (1, 0.75, 0.25) if transport.paused else (0.4, 0.9, 0.55)
+        return " " + self._paint(text, colour) + "  " + self._dim("▕" + bar + "▏")
+
+    def _help_block(self, room: int) -> list:
+        lines = [self._dim(" keys — any of these, while it runs:")]
+        for keys, label in (self.help_lines or [])[:max(1, room - 2)]:
+            lines.append("   " + self._paint(keys.ljust(20), (0.5, 0.8, 1.0))
+                         + self._dim(label))
+        lines.append(self._dim(" ? to put the spectrum back"))
+        return lines
 
     def _loudness_line(self, width: int) -> str:
         """A bar over -60..0 LUFS for momentary, a tick at short-term, and the

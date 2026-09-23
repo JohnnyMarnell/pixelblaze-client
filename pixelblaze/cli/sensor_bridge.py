@@ -39,6 +39,15 @@ It also measures the input's loudness in LUFS (`loudness.py`) and watches for
 the two things a spectrum cannot show you: digital silence, and an input that
 opens and then delivers nothing at all. `spectrum.py` draws both, live.
 
+The audio can come from a file instead of a device: `Playlist` holds the tracks
+`--file` named and decodes them one at a time, and `FileSource` plays them in
+real time while being steered -- paused, seeked, moved between tracks -- from
+the keyboard (`keys.py` reads it, `controls.py` decides what a key means). The
+same keys turn the gain, AGC, gate and log scaling of a live capture, because
+those are settings you cannot pick in advance: the right gain depends on the
+room, the source and the pattern, and the way to find it is to watch the lights
+while you turn it.
+
 Both transports carry the same reading contract:
   frequencyData: [32 floats]  # magnitudes, nominally 0.0-1.0
   energyAverage: float        # overall loudness, nominally 0.0-1.0
@@ -305,6 +314,49 @@ def parse_time(value) -> float:
     return total
 
 
+#: What counts as a track when `--file` names a directory. ffmpeg will read
+#: more than this; the list is only here to decide what to pick up off a folder
+#: without trying to decode its cover art and its .cue sheet.
+AUDIO_SUFFIXES = ('.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg', '.oga', '.opus',
+                  '.aif', '.aiff', '.alac', '.wma', '.caf', '.mp4', '.m4b', '.webm')
+
+
+def expand_tracks(spec) -> list:
+    """The files `--file` named: a comma-separated list, with any directory in
+    it replaced by the audio files directly inside it, in name order.
+
+    A spec that is itself an existing file is taken whole and never split, so a
+    track called `Hello, Goodbye.mp3` works; a list of them cannot contain a
+    comma, which is the same trade `pb playlist set` makes.
+    """
+    import pathlib as _pathlib
+
+    text = str(spec).strip()
+    if not text:
+        raise RuntimeError("--file needs a path (or several, comma-separated)")
+    whole = _pathlib.Path(text).expanduser()
+    parts = [text] if whole.is_file() else [p.strip() for p in text.split(',')]
+
+    tracks = []
+    for part in parts:
+        if not part:
+            continue
+        path = _pathlib.Path(part).expanduser()
+        if path.is_dir():
+            found = sorted(child for child in path.iterdir()
+                           if child.is_file() and child.suffix.lower() in AUDIO_SUFFIXES)
+            if not found:
+                raise RuntimeError(f"no audio files in {path}")
+            tracks += found
+        elif path.is_file():
+            tracks.append(path)
+        else:
+            raise RuntimeError(f"no such file: {part}")
+    if not tracks:
+        raise RuntimeError(f"--file {spec!r} named nothing to play")
+    return tracks
+
+
 def _ffmpeg(*args) -> bytes:
     """Run an ffmpeg-family tool, raising its own error text rather than a
     return code nobody can act on."""
@@ -399,28 +451,212 @@ def _decode_wav(path: str, start: float = None, end: float = None):
     return data[lo:hi].copy(), rate
 
 
+class Playlist:
+    """The tracks `--file` named, decoded one at a time.
+
+    Decoding is lazy because a decoded track is tens of megabytes (see
+    `decode_audio`) and a playlist can be a folder. One track is in memory, the
+    next one is fetched in the background so that pressing "next" on a set is
+    silent rather than a pause while ffmpeg runs, and nothing else is kept.
+
+    A track that will not decode does not end the run: it is reported and
+    skipped, because losing a set because track 9 of 40 is a corrupt download
+    is not a trade anybody would choose. All of them failing does end it.
+    """
+
+    def __init__(self, tracks, decode, on_error=None):
+        self.tracks = list(tracks)
+        self.decode = decode
+        self.on_error = on_error
+        self.index = 0
+        self._cache = {}
+        self._lock = threading.Lock()
+        self._prefetching = set()
+
+    @property
+    def count(self) -> int:
+        return len(self.tracks)
+
+    @property
+    def track(self):
+        return self.tracks[self.index]
+
+    @property
+    def title(self) -> str:
+        return str(self.tracks[self.index])
+
+    def seed(self, index: int, samples):
+        """Hand over a track that has already been decoded -- the first one is,
+        before the run starts, so that a file that cannot be read fails the
+        command rather than the playlist."""
+        with self._lock:
+            self._cache[index] = samples
+
+    def load(self, index: int = None):
+        """The samples for a track, decoding it if it isn't already in hand."""
+        index = self.index if index is None else index
+        with self._lock:
+            cached = self._cache.get(index)
+        if cached is not None:
+            return cached
+        samples = self.decode(self.tracks[index])
+        with self._lock:
+            self._cache[index] = samples
+        return samples
+
+    def select(self, index: int):
+        """Move to a track, decoding it. Returns its samples, or None if every
+        track from here on refuses to decode."""
+        if not self.count:
+            return None
+        attempts = 0
+        while attempts < self.count:
+            index %= self.count
+            try:
+                samples = self.load(index)
+            except Exception as e:
+                if self.on_error is not None:
+                    self.on_error(self.tracks[index], e)
+                index, attempts = index + 1, attempts + 1
+                continue
+            self.index = index
+            self._evict()
+            self._prefetch(index + 1)
+            return samples
+        return None
+
+    def move(self, delta: int):
+        """Step `delta` tracks, wrapping. Returns the new track's samples."""
+        return self.select(self.index + delta)
+
+    def _evict(self):
+        """Hold the current track and the one being fetched ahead of it; a
+        decoded track is far too big to keep a history of."""
+        keep = {self.index, (self.index + 1) % self.count} | self._prefetching
+        with self._lock:
+            for index in [i for i in self._cache if i not in keep]:
+                del self._cache[index]
+
+    def _prefetch(self, index: int):
+        if self.count < 2:
+            return
+        index %= self.count
+        with self._lock:
+            if index in self._cache or index in self._prefetching:
+                return
+            self._prefetching.add(index)
+
+        def fetch():
+            try:
+                self.load(index)
+            except Exception:
+                # Reported when it is actually needed, not from a thread
+                # nobody asked to hear from.
+                pass
+            finally:
+                with self._lock:
+                    self._prefetching.discard(index)
+
+        threading.Thread(target=fetch, name='pb-prefetch', daemon=True).start()
+
+
+class Transport:
+    """What the file source is doing, for the display to draw. Plain attributes
+    rather than a dataclass so a display can read whatever it likes."""
+
+    def __init__(self, paused, title, index, count, position, duration, loop):
+        self.paused = paused
+        self.title = title
+        self.index = index
+        self.count = count
+        self.position = position
+        self.duration = duration
+        self.loop = loop
+
+
 class FileSource:
-    """Decoded audio, delivered in real time, looping.
+    """Decoded audio, delivered in real time, looping -- and steerable while it
+    runs: pause, seek, and move between the tracks of a `Playlist`.
 
     Real time on purpose: the point is to beam a track at an installation as it
     plays, so the blocks arrive at the rate they would from a capture and every
     meter, silence check and stall check downstream behaves identically.
+
+    That is also why pausing keeps delivering blocks, of digital silence, at
+    exactly the same rate. Stopping the blocks instead would trip the bridge's
+    stall watchdog after three seconds, starve the monitor's output stream, and
+    leave every pattern latched on the last frame it was sent -- a paused track
+    with the lights frozen mid-spectrum. Silence is both true and what a pattern
+    should do about it.
+
+    Every control is a request that the playing thread picks up at the next
+    block boundary, so the cursor is only ever moved by one thread.
     """
 
     def __init__(self, samples, sample_rate: int, block_size: int, callback,
-                 loop: bool = True, on_end=None):
-        self.samples = samples
+                 loop: bool = True, on_end=None, playlist=None, on_track=None):
         self.sample_rate = sample_rate
         self.block_size = block_size
         self.callback = callback
         self.loop = loop
         self.on_end = on_end
+        #: Called with (title, index, count) when the track changes.
+        self.on_track = on_track
+        self.playlist = playlist if playlist is not None else Playlist(
+            [''], decode=lambda _track: samples)
+        self.samples = samples if samples is not None else self.playlist.load()
+        self.paused = False
+        self.finished = False
+        #: True while a track is being decoded, which happens on this thread
+        #: and stops blocks arriving. The bridge watches it, because otherwise
+        #: a slow decode looks exactly like an input that has died.
+        self.switching = False
+
+        self._pos = 0
+        self._seek_to = None
+        self._move_by = 0
         self._running = False
         self._thread = None
 
+    # -- what it is doing ---------------------------------------------------
+
     @property
     def duration(self) -> float:
+        """Of the track playing now."""
         return len(self.samples) / float(self.sample_rate)
+
+    @property
+    def position(self) -> float:
+        return self._pos / float(self.sample_rate)
+
+    @property
+    def title(self) -> str:
+        return self.playlist.title
+
+    def state(self) -> Transport:
+        return Transport(paused=self.paused, title=self.title,
+                         index=self.playlist.index, count=self.playlist.count,
+                         position=self.position, duration=self.duration,
+                         loop=self.loop)
+
+    # -- steering it (from any thread) --------------------------------------
+
+    def toggle_pause(self) -> bool:
+        self.paused = not self.paused
+        return self.paused
+
+    def seek(self, delta: float):
+        """Move `delta` seconds from where the cursor is now."""
+        base = self._seek_to if self._seek_to is not None else self.position
+        self._seek_to = max(0.0, base + delta)
+
+    def seek_to(self, seconds: float):
+        self._seek_to = max(0.0, seconds)
+
+    def move_track(self, delta: int):
+        self._move_by += delta
+
+    # -- playing it ---------------------------------------------------------
 
     def __enter__(self):
         self._running = True
@@ -437,27 +673,85 @@ class FileSource:
     def _play(self):
         period = self.block_size / self.sample_rate
         due = time.monotonic()
-        total = len(self.samples)
-        pos = 0
         while self._running:
-            end = pos + self.block_size
-            if end <= total:
-                block = self.samples[pos:end]
-                pos = end if end < total else 0
-            elif self.loop:
-                # Wrap inside the block, so the seam is a sample boundary and
-                # not a gap the length of however long a restart took.
-                block = np.concatenate([self.samples[pos:], self.samples[:end - total]])
-                pos = end - total
-            else:
-                block = self.samples[pos:]
-                self._running = False
-            if len(block):
+            block = self._next_block()
+            if block is not None and len(block):
                 self.callback(block, len(block), None, None)
+            if self.finished:
+                self._running = False
+                break
             due += period
             time.sleep(max(0.0, due - time.monotonic()))
-        if not self.loop and self.on_end is not None:
+        if self.finished and self.on_end is not None:
             self.on_end()
+
+    def _silence(self):
+        """Shaped exactly like a real block, so nothing downstream can tell the
+        difference between a paused track and a quiet one."""
+        if self.samples.ndim == 1:
+            return np.zeros(self.block_size, dtype=np.float32)
+        return np.zeros((self.block_size, self.samples.shape[1]), dtype=np.float32)
+
+    def _next_block(self):
+        """One block of audio, and everything asked of the transport since the
+        last one. Only ever called from the playing thread."""
+        if self._move_by:
+            delta, self._move_by = self._move_by, 0
+            self._switch(delta)
+        if self._seek_to is not None:
+            target, self._seek_to = self._seek_to, None
+            self._pos = min(len(self.samples), int(target * self.sample_rate))
+
+        if self.paused:
+            return self._silence()
+
+        samples = self.samples
+        total = len(samples)
+        if total == 0:
+            return self._silence()
+
+        pos = min(self._pos, total)
+        end = pos + self.block_size
+        if end < total:
+            self._pos = end
+            return samples[pos:end]
+
+        # The last block of this track. One track on a loop wraps *inside* the
+        # block, so the seam is a sample boundary rather than a gap however long
+        # a restart takes -- this is meant for beaming a passage at an
+        # installation over and over, and a hitch at the seam is the thing you
+        # would notice.
+        if self.loop and self.playlist.count == 1:
+            block = (np.concatenate([samples[pos:], samples[:end - total]])
+                     if end > total else samples[pos:end])
+            self._pos = end - total if end > total else 0
+            return block
+
+        block = samples[pos:end]
+        if self.playlist.count > 1 and (self.loop or self.playlist.index < self.playlist.count - 1):
+            self._switch(1)
+        else:
+            self.finished = True
+        return block
+
+    def _switch(self, delta: int):
+        """Change track. A playlist that cannot decode any of them is the end
+        of the run -- `finished`, which the bridge treats as the file ending."""
+        if self.playlist.count < 2:
+            self._pos = 0
+            return
+        self.switching = True
+        try:
+            samples = self.playlist.move(delta)
+        finally:
+            self.switching = False
+        if samples is None:
+            self.finished = True
+            return
+        self.samples = samples
+        self._pos = 0
+        if self.on_track is not None:
+            self.on_track(self.playlist.title, self.playlist.index, self.playlist.count)
 
 
 class Monitor:
@@ -478,6 +772,10 @@ class Monitor:
         self.sample_rate = sample_rate
         self.channels = channels
         self.dropped = 0
+        #: Silence the speakers without touching what is sent to the lights.
+        #: Zeroes rather than nothing: an output stream with no blocks coming
+        #: underruns, and an underrun clicks.
+        self.muted = False
         self._queue = None
         self._stream = None
         self._thread = None
@@ -516,6 +814,8 @@ class Monitor:
             # Mix down (or fan out) to what the output device took.
             block = (block.mean(axis=1, keepdims=True) if block.shape[1] > self.channels
                      else np.repeat(block[:, :1], self.channels, axis=1))
+        if self.muted:
+            block = np.zeros_like(block)
         try:
             self._queue.put_nowait(np.ascontiguousarray(block, dtype=np.float32))
         except queue.Full:
@@ -786,7 +1086,7 @@ class SoundBridge:
                  display=None, seconds: float = None, channels: int = 1,
                  tone: float = None, samples=None, loop: bool = True,
                  monitor=None, stall_timeout: float = 3.0,
-                 silence_timeout: float = 2.0):
+                 silence_timeout: float = 2.0, playlist=None, controls=None):
         self.sink = sink
         # Called once, after a few frames have gone out. The UDP transport
         # needs this: a Pixelblaze binds a pattern's sensor globals when the
@@ -805,9 +1105,17 @@ class SoundBridge:
         self.tone = tone
         #: Decoded audio to beam instead of capturing -- see `decode_audio`.
         self.samples = samples
+        #: More than one track to beam, decoded as they come up (`Playlist`).
+        self.playlist = playlist
         self.loop = loop
         #: A `Monitor`, or None for "don't play it out of anything".
         self.monitor = monitor
+        #: Keyboard control (`pixelblaze.cli.controls.Controls`), or None. Its
+        #: `poll()` is called on every tick of the run loop, and it is entered
+        #: as a context manager for the run -- it owns the terminal mode.
+        self.controls = controls
+        #: Set by the source when there is one to steer; None for a capture.
+        self.source = None
         self.seconds = seconds
         self.stall_timeout = stall_timeout
         self.silence_timeout = silence_timeout
@@ -840,7 +1148,7 @@ class SoundBridge:
 
         # AGC state
         self._agc_level = 1.0       # current auto-gain multiplier
-        self._agc_target = 0.15     # target peak level for frequency bins
+        self.agc_target = 0.15      # target peak level for frequency bins ([ ] keys)
         self._agc_attack = 0.3      # how fast gain increases (per second)
         self._agc_release = 2.0     # how fast gain decreases (per second)
 
@@ -850,7 +1158,19 @@ class SoundBridge:
 
     @property
     def is_silent(self) -> bool:
-        return self._silent
+        # A paused track is silent on purpose, and saying "is anything playing?"
+        # at someone who just pressed pause is noise.
+        return self._silent and not self.is_paused
+
+    @property
+    def is_paused(self) -> bool:
+        return bool(self.source is not None and getattr(self.source, 'paused', False))
+
+    @property
+    def transport(self):
+        """What the file source is doing (`Transport`), or None for a capture."""
+        state = getattr(self.source, 'state', None)
+        return state() if state is not None else None
 
     def _say(self, line: str):
         """Above the live spectrum, or on its own line."""
@@ -889,7 +1209,7 @@ class SoundBridge:
         if self.agc:
             peak_val = max(result["frequencyData"])
             if peak_val > 0:
-                ratio = self._agc_target / peak_val
+                ratio = self.agc_target / peak_val
                 dt = 1.0 / max(self.fps, 1)
                 if ratio > 1:
                     # Too quiet — increase gain slowly
@@ -914,10 +1234,18 @@ class SoundBridge:
         elif time.monotonic() - self._silent_since >= self.silence_timeout:
             self._silent = True
 
+    def _on_track(self, title, index, count):
+        """A new track is playing. The integrated LUFS figure is reset with it,
+        so `I` answers "how loud is this track" rather than averaging a set."""
+        import os
+        self.meter.reset()
+        self._say(f"  ▸ {index + 1}/{count}  {os.path.basename(str(title))}")
+
     def _source(self):
-        if self.samples is not None:
+        if self.samples is not None or self.playlist is not None:
             return FileSource(self.samples, self.sample_rate, self.block_size,
-                              self._audio_callback, loop=self.loop, on_end=self.stop)
+                              self._audio_callback, loop=self.loop, on_end=self.stop,
+                              playlist=self.playlist, on_track=self._on_track)
         if self.tone:
             return ToneSource(self.tone, self.sample_rate, self.block_size,
                               self.channels, self._audio_callback)
@@ -950,10 +1278,19 @@ class SoundBridge:
         with contextlib.ExitStack() as stack:
             if self.monitor is not None:
                 stack.enter_context(self.monitor)
-            stack.enter_context(self._source())
+            if self.controls is not None:
+                # After the monitor and before the source, so that unwinding
+                # puts the terminal back before closing the output stream: a
+                # PortAudio close that hangs must not be the thing standing
+                # between Ctrl-C and a usable shell.
+                stack.enter_context(self.controls)
+            self.source = stack.enter_context(self._source())
             try:
                 while self._running:
                     now = time.monotonic()
+
+                    if self.controls is not None:
+                        self.controls.poll()
 
                     if now >= next_push:
                         # Advance rather than reset, so the rate is the rate;
@@ -967,10 +1304,19 @@ class SoundBridge:
                             fps_frames = self._frame_count
                             fps_at = now
                         self.display.loudness = self.loudness
-                        self.display.silent = self._silent
+                        self.display.silent = self.is_silent
+                        self.display.gain = self.gain
+                        self.display.agc = self._agc_level if self.agc else None
+                        self.display.transport = self.transport
                         if self.sink.targets is not None:
                             self.display.targets = len(self.sink.targets)
                         self.display.draw()
+
+                    if getattr(self.source, 'switching', False):
+                        # Decoding the next track holds up the playing thread.
+                        # That is work, not a dead input -- and on a long track
+                        # over a slow disk it can outlast the stall timeout.
+                        self._last_block_at = now
 
                     quiet_for = now - self._last_block_at
                     if quiet_for >= self.stall_timeout:

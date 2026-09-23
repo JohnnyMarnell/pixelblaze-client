@@ -541,6 +541,271 @@ def test_not_looping_ends_the_run_when_the_file_does():
     assert bridge.stalled_for is None, "running out of file is not a stall"
 
 
+# ── a playlist, and steering it while it plays ──────────────────────────────
+# The transport is driven a block at a time rather than by waiting on the
+# playing thread: every one of these is a question about which sample comes
+# next, and answering it with sleeps would make the suite slow and flaky both.
+
+def tone(seconds=1.0, rate=8000, value=0.5, channels=2):
+    import numpy as np
+    return np.full((int(seconds * rate), channels), value, dtype=np.float32)
+
+
+def playlistOf(*values, rate=8000, seconds=1.0):
+    """A playlist whose tracks are constant, so which one is playing is
+    readable straight off the samples."""
+    from pixelblaze.cli.sensor_bridge import Playlist
+
+    decoded = []
+
+    def decode(track):
+        decoded.append(track)
+        return tone(seconds=seconds, rate=rate, value=track)
+
+    playlist = Playlist(list(values), decode=decode)
+    playlist.decoded = decoded
+    return playlist
+
+
+def fileSource(playlist, block_size=1000, rate=8000, loop=True, on_track=None):
+    from pixelblaze.cli.sensor_bridge import FileSource
+    return FileSource(playlist.load(0), rate, block_size, callback=lambda *a: None,
+                      loop=loop, playlist=playlist, on_track=on_track)
+
+
+def test_the_file_argument_is_a_list_and_a_folder_is_all_of_it(tmp_path):
+    from pixelblaze.cli.sensor_bridge import expand_tracks
+
+    first = writeWav(tmp_path / "b.wav")
+    second = writeWav(tmp_path / "a.wav")
+    assert expand_tracks(str(first)) == [first]
+    assert expand_tracks(f"{first}, {second}") == [first, second], "order as typed"
+
+    # A folder is its audio files in name order, and nothing else in there.
+    (tmp_path / "cover.jpg").write_bytes(b"not audio")
+    assert expand_tracks(str(tmp_path)) == [second, first], "sorted, and no cover art"
+
+    # A file whose own name has a comma in it is never split apart.
+    awkward = writeWav(tmp_path / "Hello, Goodbye.wav")
+    assert expand_tracks(str(awkward)) == [awkward]
+
+
+def test_a_file_argument_naming_nothing_says_which_part(tmp_path):
+    from pixelblaze.cli.sensor_bridge import expand_tracks
+
+    with pytest.raises(RuntimeError, match="no such file: missing.mp3"):
+        expand_tracks(f"{writeWav(tmp_path / 'a.wav')},missing.mp3")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(RuntimeError, match="no audio files"):
+        expand_tracks(str(empty))
+    with pytest.raises(RuntimeError, match="--file needs a path"):
+        expand_tracks("   ")
+
+
+def test_tracks_are_decoded_when_they_come_up_and_not_before():
+    """A decoded track is tens of megabytes; a playlist can be a folder."""
+    playlist = playlistOf(0.1, 0.2, 0.3, 0.4)
+
+    playlist.select(0)
+    assert playlist.decoded[0] == 0.1
+    assert 0.4 not in playlist.decoded, "the whole folder was decoded up front"
+
+    # The next one is fetched in the background, so moving on is not a pause.
+    deadline = time.monotonic() + 2
+    while 0.2 not in playlist.decoded and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert 0.2 in playlist.decoded, "the next track was never prefetched"
+
+
+def test_a_seeded_track_is_not_decoded_twice():
+    """The first one is decoded before the run starts, so a file that cannot be
+    read fails the command rather than the playlist."""
+    playlist = playlistOf(0.1, 0.2)
+    playlist.seed(0, tone(value=0.1))
+
+    assert playlist.select(0) is not None
+    assert 0.1 not in playlist.decoded
+
+
+def test_a_track_that_will_not_decode_is_reported_and_skipped():
+    """Losing a set because track 9 of 40 is a corrupt download is not a trade
+    anybody would choose -- but it is said out loud, every time."""
+    from pixelblaze.cli.sensor_bridge import Playlist
+
+    def decode(track):
+        if track in ('bad', 'worse'):
+            raise RuntimeError("no audio stream")
+        return tone(value=0.5)
+
+    complained = []
+    playlist = Playlist(['good', 'bad', 'worse', 'fine'], decode=decode,
+                        on_error=lambda track, e: complained.append((track, str(e))))
+
+    assert playlist.select(1) is not None
+    assert playlist.index == 3, "skipped past both bad ones"
+    assert [track for track, _ in complained] == ['bad', 'worse']
+    assert "no audio stream" in complained[0][1]
+
+
+def test_a_playlist_where_nothing_decodes_gives_up_rather_than_spinning():
+    from pixelblaze.cli.sensor_bridge import Playlist
+
+    def refuse(_track):
+        raise RuntimeError("nope")
+
+    playlist = Playlist(['a', 'b'], decode=refuse)
+    assert playlist.select(0) is None
+
+
+def test_pausing_sends_silence_at_the_same_rate_and_holds_its_place():
+    """Stopping the blocks instead would trip the stall watchdog after three
+    seconds, starve the monitor, and leave every pattern latched on the last
+    frame it was sent -- a paused track with the lights frozen mid-spectrum."""
+    import numpy as np
+
+    source = fileSource(playlistOf(0.5))
+
+    first = source._next_block()
+    assert float(np.abs(first).max()) == pytest.approx(0.5)
+    assert source.position == pytest.approx(0.125)     # 1000 of 8000 frames
+
+    source.toggle_pause()
+    for _ in range(5):
+        block = source._next_block()
+        assert len(block) == 1000, "a block still arrives, on time"
+        assert not block.any(), "and it is silence"
+    assert source.position == pytest.approx(0.125), "paused, so it did not move"
+    assert source.state().paused
+
+    source.toggle_pause()
+    assert source._next_block().any()
+    assert source.position == pytest.approx(0.25), "carried on where it was"
+
+
+def test_seeking_moves_by_the_time_asked_for_and_stops_at_the_start():
+    source = fileSource(playlistOf(0.5), block_size=800)
+
+    source.seek(0.5)
+    source._next_block()
+    assert source.position == pytest.approx(0.6)       # 0.5 s + one 0.1 s block
+
+    source.seek(-10)
+    source._next_block()
+    assert source.position == pytest.approx(0.1), "clamped to the start"
+
+    # Held down, the presses add up rather than the last one winning.
+    source.seek(0.1)
+    source.seek(0.1)
+    source.seek(0.1)
+    source._next_block()
+    assert source.position == pytest.approx(0.5)
+
+
+def test_seeking_past_the_end_moves_on_to_the_next_track():
+    source = fileSource(playlistOf(0.1, 0.2, 0.3))
+
+    source.seek(60)
+    source._next_block()                               # the tail, then the switch
+    assert source.playlist.index == 1
+    assert source._next_block()[0][0] == pytest.approx(0.2)
+    assert source.position == pytest.approx(0.125), "from the top of it"
+
+
+def test_the_arrows_move_through_the_playlist_and_wrap():
+    changes = []
+    source = fileSource(playlistOf(0.1, 0.2, 0.3),
+                        on_track=lambda title, i, n: changes.append((i, n)))
+
+    source.move_track(1)
+    assert source._next_block()[0][0] == pytest.approx(0.2)
+    source.move_track(1)
+    assert source._next_block()[0][0] == pytest.approx(0.3)
+    source.move_track(1)
+    assert source._next_block()[0][0] == pytest.approx(0.1), "wrapped to the first"
+
+    source.move_track(-1)
+    assert source._next_block()[0][0] == pytest.approx(0.3), "and backwards too"
+    assert changes == [(1, 3), (2, 3), (0, 3), (2, 3)]
+
+
+def test_a_playlist_runs_on_to_the_next_track_by_itself():
+    source = fileSource(playlistOf(0.1, 0.2), block_size=4000, loop=False)
+
+    assert source._next_block()[0][0] == pytest.approx(0.1)
+    assert source._next_block()[0][0] == pytest.approx(0.1)   # the last of it
+    assert source.playlist.index == 1, "and on to the next"
+    assert source._next_block()[0][0] == pytest.approx(0.2)
+    assert source._next_block()[0][0] == pytest.approx(0.2)
+
+    assert source.finished, "the last track of a playlist that is not looping"
+
+
+def test_a_playlist_on_a_loop_comes_back_round_to_the_first_track():
+    source = fileSource(playlistOf(0.1, 0.2), block_size=4000, loop=True)
+
+    for _ in range(4):
+        source._next_block()
+    assert not source.finished
+    assert source._next_block()[0][0] == pytest.approx(0.1)
+
+
+def test_a_slow_decode_is_not_mistaken_for_an_input_that_has_died():
+    """Decoding the next track happens on the playing thread, so blocks stop
+    arriving while it runs -- which is exactly what a dead input looks like.
+    A big file over a slow disk can outlast the three-second stall timeout."""
+    from pixelblaze.cli.sensor_bridge import Playlist, SoundBridge
+
+    def slowly(track):
+        time.sleep(0.4)
+        return tone(seconds=0.2, value=track)
+
+    playlist = Playlist([0.1, 0.2], decode=slowly)
+    playlist.seed(0, tone(seconds=0.2, value=0.1))
+
+    bridge = SoundBridge(FakeSink(), None, 8000, 256, fps=40, seconds=1.6,
+                         samples=playlist.load(0), playlist=playlist,
+                         stall_timeout=0.3, loop=True)
+    bridge.run()
+
+    assert bridge.stalled_for is None, "the decode was called a stall"
+    assert bridge.frames_sent > 10
+    assert playlist.index == 1, "and it did move on"
+
+
+def test_what_the_transport_reports_is_what_a_display_draws():
+    source = fileSource(playlistOf(0.1, 0.2, 0.3))
+    source._next_block()
+    state = source.state()
+
+    assert (state.index, state.count) == (0, 3)
+    assert state.position == pytest.approx(0.125) and state.duration == pytest.approx(1.0)
+    assert state.loop and not state.paused
+    assert str(state.title) == '0.1'
+
+
+def test_a_paused_track_is_not_nagged_at_for_being_silent():
+    """"silent — is anything playing?" is the right question about a loopback
+    with nothing coming through it, and noise at someone who just hit pause."""
+    import numpy as np
+
+    from pixelblaze.cli.sensor_bridge import SoundBridge
+
+    bridge = SoundBridge(FakeSink(), None, 8000, 512, fps=40,
+                         samples=tone(), silence_timeout=0.2)
+    bridge.source = fileSource(playlistOf(0.5))
+
+    zeros = np.zeros((512, 2), dtype=np.float32)
+    bridge._audio_callback(zeros, 512, None, None)
+    bridge._silent_since -= 0.3
+    bridge._audio_callback(zeros, 512, None, None)
+    assert bridge.is_silent
+
+    bridge.source.toggle_pause()
+    assert bridge.is_paused and not bridge.is_silent
+    assert bridge.transport.paused, "and the display is told which it is"
+
+
 def test_a_loopback_input_is_recognised_by_name():
     from pixelblaze.cli.sensor_bridge import is_loopback_name
 
