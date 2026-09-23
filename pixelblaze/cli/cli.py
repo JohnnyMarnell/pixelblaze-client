@@ -427,6 +427,64 @@ def off(pb: Pixelblaze, pause_sequencer, deep, no_save):
     log(f"Pixelblaze {action}{' (deep: 80MHz, `pb on` reboots to wake it)' if deep else ''}")
 
 
+_AXIS_NAMES = ('x', 'y', 'z')
+
+
+def _parse_axes(spec: str | None, dims: int) -> list:
+    """Which axes --invert flips: "x" / "y,z" / "all", or None for the default.
+
+    The default is y — the vertical — on anything 2D or 3D, because a fixture
+    someone wants flipped is usually one that went up upside down, and x on a
+    1D map, where it is the only axis there is.
+    """
+    if not spec:
+        return [1 if dims >= 2 else 0]
+    want = [w for w in re.split(r'[,\s]+', spec.strip().lower()) if w]
+    if want in (['all'], ['*']):
+        return list(range(dims))
+    axes = []
+    for name in want:
+        if name not in _AXIS_NAMES:
+            raise click.ClickException(
+                f"--axis takes x, y, z or all (comma-separated), not '{name}'")
+        d = _AXIS_NAMES.index(name)
+        if d >= dims:
+            raise click.ClickException(f"--axis {name} but this map is {dims}D — it has no {name}")
+        if d not in axes:
+            axes.append(d)
+    return axes
+
+
+def _invert_coordinates(coords: list, axes: list) -> list:
+    """Reflect [[x,y,z], ...] about the MIDPOINT of each named axis.
+
+    v -> (min + max) - v, per axis, over the map's own extent.
+
+    Midpoint of the extent rather than centre of mass, deliberately. Both are
+    involutions, but reflecting an unevenly distributed fixture about its
+    centroid puts points outside the extent it had — and createMapData
+    rescales each axis by its own min/max on the way to the device, so the
+    fixture would come back a different size than it went in. Reflecting
+    about the midpoint maps min exactly onto max: same extent, same
+    proportions, every LED somewhere the fixture already reached.
+    """
+    if not coords:
+        return coords
+    bounds = {}
+    for d in axes:
+        values = [c[d] for c in coords if d < len(c)]
+        if values:
+            bounds[d] = (min(values), max(values))
+    out = []
+    for c in coords:
+        p = list(c)
+        for d, (lo, hi) in bounds.items():
+            if d < len(p):
+                p[d] = lo + hi - p[d]
+        out.append(p)
+    return out
+
+
 def _parse_csv_coordinates(content: str) -> list:
     """Parse CSV text with x/y/z columns (case-insensitive) into [[x,y,z], ...]."""
     reader = csvlib.DictReader(io.StringIO(content))
@@ -447,7 +505,9 @@ def _parse_csv_coordinates(content: str) -> list:
 @input_arg
 @click.option('--csv', is_flag=True, help='CSV mode: output map as CSV when reading, or parse input CSV (x,y,z columns) when setting')
 @click.option('--clear', is_flag=True, help='Clear/remove the current pixel map from the device')
-def map(pb: Pixelblaze, input, csv, clear):
+@click.option('--invert', is_flag=True, help="Flip the map end for end over one axis (default y), reflecting each coordinate about the midpoint of that axis's extent")
+@click.option('--axis', default=None, metavar='NAME', help='Which axis --invert flips: x, y, z, a comma-separated list, or all. Implies --invert.')
+def map(pb: Pixelblaze, input, csv, clear, invert, axis):
     """
     Get, set, or clear the pixel map function.
 
@@ -462,8 +522,20 @@ def map(pb: Pixelblaze, input, csv, clear):
         pb map < map.js              # Set map from stdin
         pb map --csv < coords.csv    # Set map from CSV with x,y,z columns
         pb map --clear               # Remove the current pixel map
+        pb map --invert              # Flip the map already on the device, over y
+        pb map --axis x map.js       # Set this map, flipped over x
+        pb map --csv --invert        # Print the flipped map, write nothing
+
+    \b
+    --invert reflects each coordinate about the midpoint of its axis's own
+    extent, v -> (min + max) - v, so min lands exactly on max and the fixture
+    keeps the size and proportions it had. With no input it reads the map off
+    the device, flips it and writes it back; with --csv and no input it prints
+    the flipped map instead, changing nothing.
     """
     check(not (clear and csv), "Cannot use --clear and --csv together")
+    check(not (clear and (invert or axis)), "Cannot use --clear and --invert together")
+    invert = invert or axis is not None
 
     if clear:
         # Confirmed working via ack + renderType telemetry:
@@ -490,20 +562,74 @@ def map(pb: Pixelblaze, input, csv, clear):
         return
 
     content, _ = read_input(input, "map", required=False)
-    setting = content is not None
+    # Empty input is NOT a map to set. Run non-interactively — a script, CI, an
+    # agent — stdin is a pipe rather than a tty, so read_input hands back "",
+    # and `pb map` meant as a read went down the setting path and died on
+    # "Invalid JSON: Empty strings are not legal JSON5". There is no case where
+    # setting a map from nothing is the intent.
+    setting = content is not None and content.strip() != ""
+
+    # --invert with nothing to set means "flip what is already on the
+    # device": read its coordinates, reflect them, write them back. The map
+    # function text (if any) is NOT carried over — it would no longer describe
+    # what the device is running, and a mapper tab that lies is worse than one
+    # holding the coordinates it actually has.
+    if invert and not setting and not clear:
+        coords = pb.getMapCoordinates()
+        # getMapCoordinates answers [[x...], [y...], [z...]] — one list per
+        # axis — while everything that sets a map wants one list per pixel.
+        coords = [list(p) for p in zip(*coords)]
+        check(len(coords) > 0, "Device has no pixel map to invert")
+        axes = _parse_axes(axis, len(coords[0]))
+        flipped = _invert_coordinates(coords, axes)
+        names = ', '.join(_AXIS_NAMES[d] for d in axes)
+        if csv:
+            # A read command stays a read command: print it, write nothing.
+            log(f"Map flipped over {names} ({len(flipped)} pixels) — not written")
+            click.echo("index," + ",".join(_AXIS_NAMES[:len(flipped[0])]))
+            for i, p in enumerate(flipped):
+                click.echo(f"{i}," + ",".join(str(v) for v in p))
+            return
+        log(f"Flipping the device's map over {names} ({len(flipped)} pixels, {len(flipped[0])}D)...")
+        pb.setMapCoordinates(flipped)
+        return
 
     if setting:
         if csv:
             coords = _parse_csv_coordinates(content)
+            if invert:
+                axes = _parse_axes(axis, len(coords[0]))
+                coords = _invert_coordinates(coords, axes)
+                log(f"Flipping over {', '.join(_AXIS_NAMES[d] for d in axes)}...")
             log(f"Setting map coordinates from CSV ({len(coords)} pixels, {len(coords[0])}D)...")
             pb.setMapCoordinates(coords)
         elif "function" in content:
+            if invert:
+                # Evaluate the function here, flip the points, and send those.
+                # The alternative — wrapping the text and letting the device's
+                # mapper flip it — would upload a function whose output the
+                # coordinates beside it don't match, since setMapFunction
+                # evaluates it locally anyway.
+                from py_mini_racer import MiniRacer
+                coords = MiniRacer().call(content, pb.getPixelCount())
+                axes = _parse_axes(axis, len(coords[0]))
+                coords = _invert_coordinates(coords, axes)
+                log(f"Setting map from function, flipped over "
+                    f"{', '.join(_AXIS_NAMES[d] for d in axes)} "
+                    f"({len(coords)} pixels, {len(coords[0])}D)...")
+                pb.setMapCoordinates(coords)
+                return
             log(f"Setting map function...")
             pb.setMapFunction(content)
         else:
             # Also supporting numbers as strings
+            coords = parse_json(jsonlib.dumps(parse_json(content)).replace('"', ""))
+            if invert:
+                axes = _parse_axes(axis, len(coords[0]))
+                coords = _invert_coordinates(coords, axes)
+                log(f"Flipping over {', '.join(_AXIS_NAMES[d] for d in axes)}...")
             log(f"Setting map coordinates...")
-            pb.setMapCoordinates(parse_json(jsonlib.dumps(parse_json(content)).replace('"', "")))
+            pb.setMapCoordinates(coords)
     elif csv:
         log(f"Fetching map coordinates as CSV...")
         coords = pb.getMapCoordinates()
