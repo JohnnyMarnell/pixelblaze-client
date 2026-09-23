@@ -38,7 +38,7 @@ from pixelblaze.cli.cli_utils import cli, log, no_save_option, input_arg, read_i
                                      get_cache_dir, check, parse_vars, get_pixelblaze, discover_pixelblaze, \
                                      enumerate_pixelblazes, cache_ip, _read_cache, _write_cache, get_host_ip, \
                                      _fetch_device_config, update_device_cache, lookup_cached_device, \
-                                     _tcp_ports_open, WS_PORT, resolve_ip_specs
+                                     _tcp_ports_open, WS_PORT, resolve_ip_specs, cached_by_ip
 from pixelblaze.cli.top import register as _register_top
 from pixelblaze.cli.snoop import register as _register_snoop
 
@@ -2286,9 +2286,8 @@ def cache_ls(as_json):
         pb cache ls            # human-readable summary, * marks lastIp
         pb cache ls --json     # JSONL output for piping into jq
     """
-    cache_data = _read_cache()
-    devices = cache_data.get('devices', {})
-    last_ip = cache_data.get('lastIp')
+    last_ip = _read_cache().get('lastIp')
+    devices = cached_by_ip()
     if not devices:
         log("No cached devices. Run `pb find` to discover.")
         return
@@ -2346,8 +2345,7 @@ def cache_refresh(ctx, query, all_devices, conn_timeout):
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    cache_data = _read_cache()
-    devices_cached = cache_data.get('devices', {})
+    devices_cached = cached_by_ip()
     if not devices_cached:
         raise click.ClickException("No cached devices. Run `pb find` first.")
 
@@ -2484,6 +2482,27 @@ def _peer_targets(timeout_ms: int = 3000) -> tuple:
     return addresses, roles
 
 
+def _make_controls(bridge, display, use_keys: bool, on_rebind=None):
+    """The keyboard, or None when this run has no terminal to read -- a pipe, a
+    service, a cron job, or `--no-keys`."""
+    if not use_keys:
+        return None
+    from pixelblaze.cli.controls import Controls
+    from pixelblaze.cli.keys import KeyReader
+
+    reader = KeyReader()
+    if not reader.available:
+        return None
+
+    def rebind():
+        # On its own thread: reloading a pattern opens a websocket to every
+        # target, and the run loop that called this has frames to push.
+        threading.Thread(target=on_rebind, name='pb-rebind', daemon=True).start()
+
+    return Controls(bridge, display=display, reader=reader,
+                    on_rebind=rebind if on_rebind is not None else None)
+
+
 @pixelblaze.group()
 def sensor():
     """
@@ -2577,16 +2596,24 @@ def sensor_sources(pb: Pixelblaze, preference, sensor_type, no_save):
               help='Send a generated sine instead of capturing: no input device, no '
                    'permission prompt, no PortAudio. A known-good signal for asking '
                    'whether the *device* is listening.')
-@click.option('--file', '-F', 'audio_file', default=None, metavar='PATH',
-              type=click.Path(dir_okay=False),
-              help='Beam an audio file instead of capturing, in real time, on a loop. '
-                   'Anything ffmpeg reads.')
+@click.option('--file', '-F', 'audio_file', default=None, metavar='PATHS',
+              help='Beam audio files instead of capturing, in real time, on a loop. '
+                   'Anything ffmpeg reads. Several, comma-separated, make a playlist '
+                   '(↑/↓ to move through it while it runs); a directory means the '
+                   'audio files in it.')
 @click.option('--from', 'from_time', default=None, metavar='TIME',
-              help='With --file: start here (seconds, or m:ss / h:mm:ss)')
+              help='With --file: start here (seconds, or m:ss / h:mm:ss). Applies '
+                   'to every track when --file names more than one.')
 @click.option('--to', 'to_time', default=None, metavar='TIME',
               help='With --file: stop here — --from/--to loop just that section')
 @click.option('--loop/--no-loop', 'loop', default=True,
               help='With --file: loop (default), or play through once and stop')
+@click.option('--keys/--no-keys', 'use_keys', default=True,
+              help='Take single keypresses while it runs — pause, seek, change '
+                   'tracks, turn the gain and AGC up and down (default: on, when '
+                   'there is a terminal to read). `--list-keys` prints the lot.')
+@click.option('--list-keys', 'list_keys', is_flag=True,
+              help='Print the keys that work while it runs, and exit')
 @click.option('--mix', 'mix', is_flag=False, flag_value='', default=None, metavar='DEVICE',
               help='Also play the audio out of an output device, so you can hear what '
                    'is being sent. Bare --mix means the OS default output; give a name '
@@ -2615,9 +2642,9 @@ def sensor_sources(pb: Pixelblaze, preference, sensor_type, no_save):
 @click.option('--list-devices', '-l', is_flag=True,
               help='List available audio input devices and exit')
 def sound(ctx, transport, targets, broadcast, use_all, rescan, sender_id, rebind,
-          device, tone, audio_file, from_time, to_time, loop, mix, no_mix, seconds,
-          fps, sample_rate, block_size, gain, noise_gate, log_scale, agc, plain,
-          quiet, list_devices):
+          device, tone, audio_file, from_time, to_time, loop, use_keys, list_keys,
+          mix, no_mix, seconds, fps, sample_rate, block_size, gain, noise_gate,
+          log_scale, agc, plain, quiet, list_devices):
     """
     Stream audio FFT to Pixelblazes as sensor-board data.
 
@@ -2629,9 +2656,31 @@ def sound(ctx, transport, targets, broadcast, use_all, rescan, sender_id, rebind
     \b
     What it sends:
         Nothing named — the default input device (--device to pick another,
-        -l to list them). --file PATH beams an audio file in real time
-        instead, on a loop, with --from/--to to loop just a section of it.
-        --tone HZ generates a sine, which needs no audio stack at all.
+        -l to list them). --file PATHS beams audio files in real time
+        instead, on a loop, with --from/--to to loop just a section of
+        each. Several files, comma-separated, are a playlist, and so is a
+        directory. --tone HZ generates a sine, which needs no audio stack
+        at all.
+
+    \b
+    Steering it while it runs (--list-keys, or ? while it runs):
+        space       pause / resume — the lights go quiet with it, because
+                    pausing sends silence rather than stopping, and a
+                    pattern holds the last frame it was sent forever
+        ← →         seek ∓5s · shift ∓30s · alt/ctrl ∓1s
+        ↑ ↓         previous / next track
+        - +         gain down / up          a    AGC on / off
+        [ ]         AGC target down / up    l    log scaling on / off
+        n N         noise gate down / up    0    gain back to --gain
+        m           mute what you hear      r    reload the patterns
+        ? q         these keys · stop
+    \b
+        The knobs are the ones you cannot pick in advance: the right gain
+        depends on the room, the source and the pattern, and the way to
+        find it is to watch the lights and turn it until they look right.
+        Transport applies to --file; everything else applies to whatever
+        is playing. --no-keys turns this off, and so does having no
+        terminal to read (a pipe, a service, a cron job).
 
     \b
     Whether you hear it (--mix / --no-mix):
@@ -2735,6 +2784,9 @@ def sound(ctx, transport, targets, broadcast, use_all, rescan, sender_id, rebind
         pb sensor sound --tone 440 --seconds 10  # no mic needed; is it listening?
         pb sensor sound --file set.m4a           # beam a track, on a loop
         pb sensor sound -F set.m4a --from 1:12 --to 1:40   # loop that drop
+        pb sensor sound -F a.mp3,b.mp3,c.mp3     # a playlist; ↑↓ moves through it
+        pb sensor sound -F ~/Music/set           # every track in a folder
+        pb sensor sound --list-keys              # what the keyboard does
         pb sensor sound --no-mix                 # don't play it out of anything
         pb sensor sound --mix "MacBook Pro Speakers"
         pb sensor sound --sender-id 0xD0CAFE     # label the frames in a capture
@@ -2745,10 +2797,21 @@ def sound(ctx, transport, targets, broadcast, use_all, rescan, sender_id, rebind
         pb sensor sound --fps 40                 # Match the real sensor board
         pb sensor sound -l                       # List input devices
     """
-    from pixelblaze.cli.sensor_bridge import (Monitor, SoundBridge, UdpSink, VarsSink,
-                                              choose_monitor, decode_audio, find_device,
-                                              parse_time)
+    from pixelblaze.cli.sensor_bridge import (Monitor, Playlist, SoundBridge, UdpSink,
+                                              VarsSink, choose_monitor, decode_audio,
+                                              expand_tracks, find_device, parse_time)
     from pixelblaze.cli.spectrum import make_display
+
+    if list_keys:
+        from pixelblaze.cli.controls import FILE, keymap
+        log("Keys that work while `pb sensor sound` is running:\n")
+        for binding in keymap():
+            if not binding.label:
+                continue
+            scope = "--file" if binding.scope == FILE else ""
+            log(f"  {' / '.join(binding.keys):<22} {scope:<7} {binding.label}")
+        log("\n  --file keys need a file to steer; the rest apply to a capture too.")
+        return
 
     if list_devices:
         import sounddevice as sd
@@ -2785,22 +2848,38 @@ def sound(ctx, transport, targets, broadcast, use_all, rescan, sender_id, rebind
     # Channels as the source delivers them, capped at a pair: BS.1770 sums
     # channel POWER, and a mono mixdown first reads up to 3 dB low on a wide mix
     # and cancels out-of-phase content outright. The FFT mixes to mono itself.
-    samples = None
+    samples, playlist = None, None
     if audio_file:
         try:
             start, end = parse_time(from_time), parse_time(to_time)
         except ValueError as e:
             raise click.ClickException(str(e))
         try:
-            samples, sr = decode_audio(audio_file, start=start, end=end,
+            tracks = expand_tracks(audio_file)
+            # The first track is decoded here rather than by the playlist, so a
+            # file that cannot be read fails the command now, loudly, instead of
+            # being skipped past once the run is under way.
+            samples, sr = decode_audio(tracks[0], start=start, end=end,
                                        sample_rate=sample_rate, channels=2)
         except RuntimeError as e:
             raise click.ClickException(str(e))
         channels = samples.shape[1]
         dev_idx = None
+
+        # Every later track is decoded at the first one's rate: the meter, the
+        # FFT and the output stream are all built around one sample rate, and a
+        # playlist that changed it halfway would have to rebuild all three.
+        playlist = Playlist(
+            tracks,
+            decode=lambda track: decode_audio(track, start=start, end=end,
+                                              sample_rate=sr, channels=2)[0])
+        playlist.seed(0, samples)
+
         section = f" {from_time or '0'}–{to_time}" if (from_time or to_time) else ""
-        dev_info = {'name': f"{pathlib.Path(audio_file).name}{section} "
-                            f"({len(samples) / sr:.1f}s, {'looping' if loop else 'once'})"}
+        first = f"{pathlib.Path(tracks[0]).name}{section}"
+        dev_info = {'name': (f"{first} ({len(samples) / sr:.1f}s"
+                             + (f", +{len(tracks) - 1} more" if len(tracks) > 1 else "")
+                             + f", {'looping' if loop else 'once'})")}
     elif tone:
         dev_idx, dev_info = None, {'name': f"generated {tone:g} Hz tone"}
         sr, channels = sample_rate or 48000, 2
@@ -2833,25 +2912,34 @@ def sound(ctx, transport, targets, broadcast, use_all, rescan, sender_id, rebind
     display = make_display(quiet=quiet, plain=plain, gain=gain)
     say = display.log
 
+    if playlist is not None:
+        # One unreadable track out of forty is not a reason to lose the set —
+        # but it is said out loud, every time, rather than skipped quietly.
+        playlist.on_error = lambda track, e: say(f"  ✗ {pathlib.Path(track).name}: {e}"
+                                                 f" — skipping")
+
     scaling = []
     if gain != 1.0: scaling.append(f"gain={gain}x")
     if noise_gate > 0: scaling.append(f"gate={noise_gate}")
     if log_scale: scaling.append("log")
     if agc: scaling.append("agc")
 
-    def stream(sink, on_flowing=None, on_running=None):
+    def stream(sink, on_flowing=None, on_running=None, on_rebind=None):
         log(f"Source: {dev_info['name']}")
         log(f"  Sample rate: {sr} Hz, Block: {block_size}, Channels: {channels}, FPS: {fps}")
         log(f"  Sending: {sink.describe()}")
         log(f"  {'Playing out of' if monitor else 'Not playing out of anything'}: {why_mix}")
         if scaling:
             log(f"  Scaling: {', '.join(scaling)}")
-        log("  Press Ctrl+C to stop\n")
         bridge = SoundBridge(sink, dev_idx, sr, block_size, fps, gain=gain,
                              noise_gate=noise_gate, log_scale=log_scale, agc=agc,
                              on_flowing=on_flowing, display=display, seconds=seconds,
                              channels=channels, tone=tone, samples=samples, loop=loop,
-                             monitor=monitor)
+                             monitor=monitor, playlist=playlist)
+        bridge.controls = _make_controls(bridge, display, use_keys, on_rebind)
+        if bridge.controls is not None:
+            log(f"  {bridge.controls.hint()}")
+        log("  Press Ctrl+C to stop\n")
         stop_extras = on_running(bridge) if on_running else None
         try:
             bridge.run()
@@ -2946,8 +3034,10 @@ def sound(ctx, transport, targets, broadcast, use_all, rescan, sender_id, rebind
             thread.join(timeout=2.0)
         return stopper
 
+    # `r` rebinds on demand even when --no-rebind turned the automatic one off:
+    # a pattern that is not reacting is exactly when you reach for it.
     bridge = stream(sink, on_flowing=(lambda: bind(sink.targets)) if rebind else None,
-                    on_running=start_rescan)
+                    on_running=start_rescan, on_rebind=lambda: bind(sink.targets))
     log(f"\nStopped after {bridge.frames_sent} frames. Sent a frame of silence to each "
         f"target; patterns hold the last frame otherwise.")
 

@@ -76,36 +76,92 @@ def get_host_ip() -> str:
         return ''
 
 
-def _read_cache() -> dict:
-    """Read cache.json, returning empty structure on missing/corrupt file."""
+# ── What we know about a fleet, in two files ─────────────────────────────
+#
+# `devices.json` is the INVENTORY: which boards exist, what they are called,
+# and every (name, address) pair each has ever been seen at, with the first
+# time it was seen. All of it stable — a new row appears when a device is new,
+# renamed, or has moved — which is exactly what makes it worth keeping in
+# version control and pointing a symlink at.
+#
+# `cache.json` is the LOCAL STATE: where each board was last seen and when,
+# the last device addressed, and the bulky `--full` blobs (settings, the whole
+# pattern list). Volatile by nature — `lastSeenAt` moves on every run and a
+# pattern list is hundreds of ids — so it stays put and stays untracked.
+#
+# BOTH ARE KEYED BY chipId, because an address is not an identity: one board
+# is 192.168.1.24 on the router today and 192.168.4.3 once a fleet is
+# re-formed behind a leader's access point. chipId is a property of the chip.
+# It is NOT globally unique — these are ~23-bit values, not a 48-bit MAC — so
+# it identifies a fleet's devices, not every Pixelblaze ever made, and a
+# collision between two boards you own shows up as one device that keeps
+# changing its name rather than silently doing the wrong thing.
+CACHE_VERSION = 3
+
+
+def devices_path() -> pathlib.Path:
+    """The inventory file. `PB_DEVICES_FILE` moves it — e.g. into a repo."""
+    override = os.environ.get('PB_DEVICES_FILE')
+    return pathlib.Path(override) if override else get_cache_dir() / 'devices.json'
+
+
+def _read_json(path: pathlib.Path, fallback: dict) -> dict:
     try:
-        cache_file = get_cache_dir() / 'cache.json'
-        if cache_file.exists():
-            return json.loads(cache_file.read_text())
+        if path.exists():
+            return json.loads(path.read_text())
     except Exception:
         pass
-    return {'lastIp': None, 'devices': {}}
+    return dict(fallback)
 
 
-# One process writing cache.json from several threads at once is the normal
-# case now that --ip fans out, and a half-written file reads as "no cached
-# devices" on the next run.
+def _read_devices() -> dict:
+    """The tracked inventory: {chipId: {name, seen: [...]}}."""
+    return _read_json(devices_path(), {'version': CACHE_VERSION, 'devices': {}})
+
+
+def _read_cache() -> dict:
+    """Local state: {chipId: {ip, lastSeenAt, settings, ...}} plus lastIp."""
+    return _read_json(get_cache_dir() / 'cache.json',
+                      {'version': CACHE_VERSION, 'lastIp': None, 'lastChip': None, 'devices': {}})
+
+
+# One process writing from several threads at once is the normal case now
+# that --ip fans out, and a half-written file reads as "nothing known".
 _CACHE_LOCK = threading.Lock()
 
 
-def _write_cache(cache: dict):
-    """Write cache.json atomically, and one writer at a time."""
+def _write_json(path: pathlib.Path, data: dict):
+    """Write atomically, one writer at a time, and only if it changed.
+
+    Write-if-changed matters for the inventory: it is a file in a repo, and a
+    run that learned nothing should leave nothing to commit.
+    """
     try:
-        directory = get_cache_dir()
+        rendered = json.dumps(data, indent=2, sort_keys=True) + '\n'
         with _CACHE_LOCK:
-            # Same directory, so the rename is on one filesystem and therefore
-            # atomic: a reader sees the old file or the new one, never a
-            # truncated one.
-            temporary = directory / f'cache.json.{os.getpid()}.{threading.get_ident()}'
-            temporary.write_text(json.dumps(cache, indent=2))
-            os.replace(temporary, directory / 'cache.json')
+            try:
+                if path.exists() and path.read_text() == rendered:
+                    return
+            except Exception:
+                pass
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Beside the real file, so the rename is on one filesystem and
+            # therefore atomic: a reader sees the old file or the new one,
+            # never a truncated one. `os.replace` through a symlink writes the
+            # file it points at, which is how the repo copy gets updated.
+            temporary = path.parent / f'{path.name}.{os.getpid()}.{threading.get_ident()}'
+            temporary.write_text(rendered)
+            os.replace(temporary, path.resolve() if path.is_symlink() else path)
     except Exception:
         pass
+
+
+def _write_devices(data: dict):
+    _write_json(devices_path(), data)
+
+
+def _write_cache(cache: dict):
+    _write_json(get_cache_dir() / 'cache.json', cache)
 
 
 # Per-run discovery facts (how a device was found, which ports answered this
@@ -113,35 +169,183 @@ def _write_cache(cache: dict):
 _TRANSIENT_KEYS = frozenset(('via', 'http', 'ws', 'error'))
 
 
+def chip_of(entry: dict) -> str:
+    """The board an entry is, as a string key, or '' before it has said.
+
+    `chipId` is reported by getConfig and is the only durable identity a
+    Pixelblaze has. An address is not one.
+    """
+    chip = (entry.get('settings') or {}).get('chipId') or entry.get('chipId')
+    return str(chip) if chip not in (None, '') else ''
+
+
+def _now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def record_sighting(inventory: dict, chip: str, name: str, ip: str, when: str = '') -> bool:
+    """Note that `chip` was seen as (`name`, `ip`). True if that was new.
+
+    The list is append-only and `firstSeenAt` NEVER moves: the question it
+    answers is "when did this device first appear under this name at this
+    address", and a device coming back is not a new answer. A device that
+    moves, or is renamed, gets a new row — the old one stays, which is the
+    history.
+    """
+    if not chip:
+        return False
+    entry = inventory.setdefault(chip, {'chipId': chip, 'seen': []})
+    if name and entry.get('name') != name:
+        entry['name'] = name            # the current name; the history keeps the rest
+    seen = entry.setdefault('seen', [])
+    for row in seen:
+        if row.get('ip') == ip and row.get('name', '') == (name or ''):
+            return False
+    seen.append({'name': name or '', 'ip': ip, 'firstSeenAt': when or _now()})
+    seen.sort(key=lambda r: (r.get('firstSeenAt') or '', r.get('ip') or ''))
+    return True
+
+
 def update_device_cache(devices: list[dict]):
-    """Merge device info into cache.json devices map, preserving existing richer data."""
+    """Record what was just seen: identity to the inventory, the rest locally."""
+    inventory = _read_devices()
+    known = inventory.setdefault('devices', {})
     cache = _read_cache()
-    known = cache.setdefault('devices', {})
+    state = cache.setdefault('devices', {})
     host_ip = get_host_ip()
+    when = _now()
+    changed = False
+
     for dev in devices:
         ip = dev.get('ip')
+        chip = chip_of(dev)
         if not ip:
             continue
-        entry = known.setdefault(ip, {'ip': ip})
+        if not chip:
+            # Nothing to file it under. A fast probe that never learned who
+            # answered is not a device record — it is an address, and the
+            # inventory already remembers every address a board has had.
+            continue
+        # A NAME IS PART OF AN IDENTITY, so it only changes on evidence: this
+        # record carries a chipId, so whatever it says about itself is first
+        # hand. Anything that merely believes it knows who lives at an address
+        # has no chipId and never gets here.
+        name = dev.get('name') or (known.get(chip) or {}).get('name') or ''
+        changed |= record_sighting(known, chip, name, ip, when)
+
+        entry = state.setdefault(chip, {'chipId': chip})
         for k, v in dev.items():
-            if v is not None and v != '' and k not in _TRANSIENT_KEYS:
-                entry[k] = v
+            if v is None or v == '' or k in _TRANSIENT_KEYS:
+                continue
+            entry[k] = v
+        entry['ip'] = ip
+        entry['lastSeenAt'] = when
         if host_ip:
             entry['hostIp'] = host_ip
+
+    if changed:
+        inventory['version'] = CACHE_VERSION
+        _write_devices(inventory)
+    cache['version'] = CACHE_VERSION
     _write_cache(cache)
+
+
+def cached_devices() -> list[dict]:
+    """Every board known, newest sighting first, inventory and state merged.
+
+    Each: chipId, name, ip (where it was last seen), ips (everywhere it has
+    ever been, newest first), seen (the history), lastSeenAt, plus whatever
+    `--full` last learned.
+    """
+    inventory = _read_devices().get('devices', {})
+    state = _read_cache().get('devices', {})
+    out = []
+    for chip in set(inventory) | set(state):
+        inv = inventory.get(chip, {})
+        st = state.get(chip, {})
+        rows = sorted(inv.get('seen', []), key=lambda r: r.get('firstSeenAt') or '', reverse=True)
+        ips = []
+        for ip in ([st.get('ip')] if st.get('ip') else []) + [r.get('ip') for r in rows]:
+            if ip and ip not in ips:
+                ips.append(ip)
+        entry = dict(st)
+        entry.update({
+            'chipId': chip,
+            'name': st.get('name') or inv.get('name') or '',
+            'ip': ips[0] if ips else st.get('ip', ''),
+            'ips': ips,
+            'seen': rows,
+        })
+        out.append(entry)
+    out.sort(key=lambda e: e.get('lastSeenAt') or '', reverse=True)
+    return out
+
+
+def cached_by_ip() -> dict:
+    """`{address: entry}` for every address any board has ever answered at.
+
+    The inventory is keyed by board; most of the CLI asks by address. An
+    address a board was seen at MORE RECENTLY wins, so a reused address
+    belongs to whoever has it now.
+    """
+    out: dict = {}
+    claimed: dict = {}
+    for entry in cached_devices():
+        for ip in entry.get('ips', []):
+            when = ''
+            for row in entry.get('seen', []):
+                if row.get('ip') == ip:
+                    when = max(when, row.get('firstSeenAt') or '')
+            if ip not in out or when > claimed.get(ip, ''):
+                out[ip] = entry
+                claimed[ip] = when
+    return out
+
+
+def cached_entry(ip: str) -> dict:
+    """The board at an address, whichever of its addresses that is."""
+    return cached_by_ip().get(ip, {})
+
+
+def cached_names() -> dict:
+    """`{ip: name}` for every address a board has ever answered at.
+
+    `pb find` runs fast by default: it reports which addresses answered and
+    says nothing about who they are, because finding that out means
+    connecting to each one. But the names are already on disk from the last
+    time anything did — free, and the whole reason anyone reads the output.
+    """
+    return {ip: e['name'] for ip, e in cached_by_ip().items() if e.get('name')}
+
+
+def cached_addresses() -> list[str]:
+    """Every address worth probing, most recently seen board first.
+
+    Every address, not just current ones: an AP-mode 192.168.4.x address is
+    exactly the one nothing else will ever tell you about again.
+    """
+    out: list[str] = []
+    for entry in cached_devices():
+        for ip in entry.get('ips', []):
+            if ip not in out:
+                out.append(ip)
+    return out
 
 
 def get_cached_ip():
     """Get the last used IP from cache."""
-    cache = _read_cache()
-    return cache.get('lastIp')
+    return _read_cache().get('lastIp')
 
 
 def cache_ip(ip_address):
-    """Cache the IP address for future use."""
+    """Cache the IP address for future use, and the board it belongs to."""
     cache = _read_cache()
     cache['lastIp'] = ip_address
+    chip = chip_of(cached_entry(ip_address))
+    if chip:
+        cache['lastChip'] = chip
     _write_cache(cache)
+
 
 # Reusable Click options
 no_save_option = click.option(
@@ -292,7 +496,7 @@ def _get_device_info(ip: str) -> dict:
 
 def _cache_is_fresh(ip: str, ttl_seconds: int = CACHE_TTL_SECONDS) -> bool:
     """Return True if cache entry for ip exists, has a config snapshot, and is within ttl."""
-    entry = _read_cache().get('devices', {}).get(ip)
+    entry = cached_entry(ip)
     if not entry or 'settings' not in entry:
         return False
     last_seen = entry.get('lastSeenAt')
@@ -320,7 +524,7 @@ def maybe_refresh_cache(pb: Pixelblaze, ip: str, force: bool = False) -> bool:
             return False
         if not force and _cache_is_fresh(ip):
             return False
-        existing = _read_cache().get('devices', {}).get(ip, {})
+        existing = cached_entry(ip)
         include_patterns = force or 'patterns' not in existing
         info = _fetch_device_config(pb, ip=ip, include_patterns=include_patterns)
         update_device_cache([info])
@@ -383,14 +587,35 @@ def rank_matches(matches: list) -> list:
     return [(ip, entry, reason(ip, entry)) for ip, entry in ranked]
 
 
+def ranked_pairs(ranked: list) -> list:
+    """`rank_matches` output back to (ip, entry) pairs."""
+    return [(ip, entry) for ip, entry, _why in ranked]
+
+
 def _invert(text: str) -> tuple:
     """A sort key that orders strings descending inside an ascending sort."""
     return tuple(-ord(c) for c in text)
 
 
 def _also_matched(chosen_ip: str, ranked: list) -> str:
-    """The runners-up, for the log line -- never silently dropped."""
-    return ', '.join(f"{e.get('name', '?')} ({ip})" for ip, e, _ in ranked if ip != chosen_ip)
+    """The runners-up, for the log line -- never silently dropped.
+
+    One per BOARD: the chosen device's own other addresses are not runners-up,
+    they are the same Pixelblaze.
+    """
+    chosen_chip = ''
+    for ip, entry, _why in ranked:
+        if ip == chosen_ip:
+            chosen_chip = chip_of(entry)
+    out, seen = [], set()
+    for ip, entry, _why in ranked:
+        chip = chip_of(entry)
+        if ip == chosen_ip or (chip and chip == chosen_chip) or chip in seen:
+            continue
+        if chip:
+            seen.add(chip)
+        out.append(f"{entry.get('name', '?')} ({ip})")
+    return ', '.join(out)
 
 
 def lookup_cached_device(query: str) -> tuple[str, dict]:
@@ -401,7 +626,7 @@ def lookup_cached_device(query: str) -> tuple[str, dict]:
 
     Raises click.ClickException if nothing matches.
     """
-    devices = _read_cache().get('devices', {})
+    devices = cached_by_ip()
     if not devices:
         raise click.ClickException("No cached devices. Run `pb find` first.")
     if query in devices:
@@ -412,8 +637,9 @@ def lookup_cached_device(query: str) -> tuple[str, dict]:
         raise click.ClickException(f"No cached device matches '{query}'.")
     ranked = rank_matches(matches)
     ip, entry, why = ranked[0]
-    if len(ranked) > 1:
-        log(f"'{query}' matched {len(ranked)} devices; using {entry.get('name', '?')} "
+    boards = {chip_of(e) or a for a, e in ranked_pairs(ranked)}
+    if len(boards) > 1:
+        log(f"'{query}' matched {len(boards)} devices; using {entry.get('name', '?')} "
             f"({ip}) — {why}. Also matched: {_also_matched(ip, ranked)}.")
     return ip, entry
 
@@ -490,15 +716,25 @@ def _discover_devices(
         except Exception as e:
             log(f"  on_ip callback failed for {ip}: {e}")
 
+    # Names from the last time anything connected. A fast `pb find` never
+    # connects, so this is the only way it can say who answered — and "who"
+    # is the question being asked.
+    known_names = cached_names()
+
     def add(ip: str, via: str, detail: str = '', **ports) -> bool:
         with lock:
             if ip in found:
                 # Already known; just remember port state if this is the probe.
                 found[ip].update(ports)
                 return False
-            found[ip] = {'ip': ip, 'via': via, **ports}
+            record = {'ip': ip, 'via': via, **ports}
+            name = known_names.get(ip)
+            if name:
+                record['name'] = name
+            found[ip] = record
         extra = f"; {_describe_ports(ports)}" if ports else ''
-        log(f"  Found @ {ip} ({detail or via}{extra})")
+        who = f"{name} @ " if name else '@ '
+        log(f"  Found {who}{ip} ({detail or via}{extra})")
         report(ip)
         submit(ask_peers, ip)
         return True
@@ -546,7 +782,7 @@ def _discover_devices(
     # us as a peer for a while, and a stale cache may carry that over.
     self_ip = get_host_ip()
     candidates = [ADHOC_IP]
-    for cached_ip in _read_cache().get('devices', {}):
+    for cached_ip in cached_addresses():
         if cached_ip not in candidates and cached_ip != self_ip:
             candidates.append(cached_ip)
 
@@ -590,12 +826,17 @@ def _explain_silent_beacons(found: list[dict]):
     if not found:
         log("No beacons heard, and no known address answered on ports 80/81.")
         return
-    cache = _read_cache().get('devices', {})
+    cache = cached_by_ip()
     by_chip = {}
     for ip, entry in cache.items():
-        chip = (entry.get('settings') or {}).get('chipId') or entry.get('chipId')
-        if chip:
-            by_chip[chip] = (ip, entry)
+        chip = chip_of(entry)
+        if not chip:
+            continue
+        # A board is in here once per address it has ever had; name it by
+        # where it is now, not by whichever address iterated last.
+        if chip in by_chip and entry.get('ip') != ip:
+            continue
+        by_chip[chip] = (ip, entry)
     found_ips = {d['ip'] for d in found}
     log("No beacons heard; the device(s) above answered a direct probe instead.")
     for d in found:
@@ -604,7 +845,10 @@ def _explain_silent_beacons(found: list[dict]):
         if not leader:
             continue
         name = entry.get('name') or d['ip']
-        leader_ip, leader_entry = by_chip.get(leader, (None, {}))
+        # chipId is a string key everywhere (it is an identity, not a number
+        # to do arithmetic with), and `leaderId` arrives from the wire as an
+        # int — so this lookup has to say which it is.
+        leader_ip, leader_entry = by_chip.get(str(leader), (None, {}))
         who = (f"{leader_entry.get('name') or leader_ip} ({leader_ip})" if leader_ip
                else f"chip {leader}")
         gone = ', which did not answer' if leader_ip and leader_ip not in found_ips else ''
@@ -646,9 +890,12 @@ def enumerate_pixelblazes(
         probe: Broadcast a beacon so followers answer. Default on.
 
     Returns:
-        list[dict]: Device info dicts. Fast mode: ip, via, and (when probed)
-                    http / ws. Slow mode adds: name, pixelCount, brightness,
-                    ver, brandName, hostIp.
+        list[dict]: Device info dicts. Fast mode: ip, via, (when probed)
+                    http / ws, and `name` when the cache remembers one for
+                    that address — REMEMBERED, not fetched: fast mode never
+                    connects, so the name is as true as the last time
+                    something did. Slow mode connects and adds the live name,
+                    pixelCount, brightness, ver, brandName, hostIp.
     """
     found = _discover_devices(timeout=timeout, on_ip=on_ip, probe=probe)
     _explain_silent_beacons(found)
@@ -662,7 +909,12 @@ def enumerate_pixelblazes(
 
     if not slow:
         devices = [dict(d) for d in found]
-        update_device_cache(devices)
+        # A REMEMBERED NAME IS NOT AN OBSERVATION. Fast mode never connected,
+        # so its `name` came out of this very cache — writing it back lets a
+        # stale alias overwrite the stored identity of whatever is actually at
+        # that address, which is how one device ends up wearing another's
+        # name. Report it; never learn from it.
+        update_device_cache([{k: v for k, v in d.items() if k != 'name'} for d in devices])
         return devices
 
     # Slow mode: connect to each device to get full info, in parallel. A
@@ -674,7 +926,7 @@ def enumerate_pixelblazes(
 
     def fetch(ip: str) -> dict:
         if by_ip[ip].get('ws') is False:
-            cached = _read_cache().get('devices', {}).get(ip, {})
+            cached = cached_entry(ip)
             return {'ip': ip, 'name': cached.get('name', ''),
                     'error': 'websocket port 81 not answering; details from cache'}
         return _get_device_info(ip)
@@ -727,14 +979,19 @@ def _resolve_cached_name(query: str) -> Optional[str]:
     Returns None when nothing matches, so callers can report why the whole
     --ip value failed to resolve.
     """
-    devices = _read_cache().get('devices', {})
+    devices = cached_by_ip()
     q = query.lower()
 
     def _choose(matches):
         ranked = rank_matches(matches)
         ip, entry, why = ranked[0]
-        if len(ranked) > 1:
-            log(f"--ip '{query}' matched {len(ranked)} devices; using {ip} "
+        # AMBIGUOUS MEANS SEVERAL BOARDS, not several addresses. One
+        # Pixelblaze that has been on three networks is still one answer, and
+        # saying "matched 3 devices" about it sent people hunting for two
+        # devices they do not own.
+        boards = {chip_of(e) or a for a, e in ranked_pairs(ranked)}
+        if len(boards) > 1:
+            log(f"--ip '{query}' matched {len(boards)} devices; using {ip} "
                 f"({entry.get('name', '?')}) — {why}. "
                 f"Also matched: {_also_matched(ip, ranked)}. "
                 f"Give a longer fragment, an IP, or a comma-separated list to "
@@ -814,7 +1071,7 @@ def resolve_ip_spec(spec: Optional[str]) -> Optional[str]:
 
     resolved = _resolve_cached_name(spec)
     if resolved:
-        name = _read_cache().get('devices', {}).get(resolved, {}).get('name', '')
+        name = cached_entry(resolved).get('name', '')
         log(f"--ip '{spec}' -> {resolved}" + (f" ({name})" if name else "") + " (cached name)")
         return resolved
 
@@ -854,7 +1111,7 @@ def resolve_ip_specs(spec) -> list:
 
 def _resolve_one_spec(part: str) -> list:
     if part.lower() == 'all':
-        devices = _read_cache().get('devices', {})
+        devices = cached_by_ip()
         if not devices:
             raise click.ClickException(
                 "--ip all: no devices are cached yet. Run `pb find` first.")
@@ -939,8 +1196,7 @@ def run_per_address(addresses: list, run: Callable, workers: int = 8,
     err = _ThreadRoutedStream(sys.stderr if err is None else err)
     emit_lock = threading.Lock()
     results = {}
-    names = {ip: (entry.get('name') or '')
-             for ip, entry in _read_cache().get('devices', {}).items()}
+    names = cached_names()
 
     def label(address: str) -> str:
         name = names.get(address)

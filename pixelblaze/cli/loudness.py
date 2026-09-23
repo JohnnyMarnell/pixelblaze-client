@@ -115,9 +115,24 @@ def k_weighting(sample_rate: float) -> tuple[Biquad, Biquad]:
     return pre, rlb
 
 
+#: R128's absolute gate. Below it the standard says the content does not count
+#: as programme at all, so it is where a reading stops being a number.
+ABSOLUTE_GATE_LUFS = -70.0
+
+
 def lufs(power: float) -> float:
-    """Mean square of the K-weighted signal -> LUFS."""
-    return -0.691 + 10 * math.log10(power) if power > 0 else -math.inf
+    """Mean square of the K-weighted signal -> LUFS, or -inf for silence.
+
+    Silence is anything under the absolute gate, not only an exact zero. Stop a
+    track and the K-weighting filters ring down rather than snapping to nothing,
+    so for a second afterwards the momentary power is a denormal and the honest
+    logarithm of it is `-901.4 LUFS` -- a number that is both true and useless.
+    Every R128 meter draws that as nothing, and so does this.
+    """
+    if power <= 0:
+        return -math.inf
+    value = -0.691 + 10 * math.log10(power)
+    return value if value > ABSOLUTE_GATE_LUFS else -math.inf
 
 
 class BiquadFilter:
