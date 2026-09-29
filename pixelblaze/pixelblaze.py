@@ -323,6 +323,16 @@ def sendBeaconProbe(sock: socket.socket) -> "set[str]":
     return sent
 
 
+class PixelblazeProtocolError(Exception):
+    """A Pixelblaze did not say what the protocol requires it to say.
+
+    Raised instead of retrying forever. Every loop that waits on a board now has
+    a way to end that does not depend on the board cooperating, and this is what
+    it ends with -- a message naming the address and what was expected, rather
+    than a command that never returns.
+    """
+
+
 class Pixelblaze:
     """
     The Pixelblaze class presents a simple synchronous interface to a single Pixelblaze's websocket API.
@@ -442,6 +452,13 @@ class Pixelblaze:
     # calling thread forever. See _open().
     default_open_timeout = 4
     max_open_retries = 5
+    # How many times a single exchange may resend before giving up. A Pixelblaze
+    # that answers everything except the one frame being waited for used to mean
+    # an unbounded resend loop; these make it an error instead.
+    max_config_attempts = 3
+    max_reconnect_attempts = 3
+    # Seconds to spend assembling one multi-part config response.
+    default_config_timeout = 5
     ws = None
     connected = False
     ipAddress = None
@@ -741,9 +758,19 @@ class Pixelblaze:
             Union[str, bytes, None]: The message received from the Pixelblaze (of type bytes for binaryMessageTypes, otherwise of type str), or None if a timeout occurred.
         """
         message = None
-        startTime = self._time_in_millis()
+        # The clock that decides when to give up. PROGRESS resets it -- a frame that
+        # is part of what was asked for -- and the stats and sequencer frames a
+        # Pixelblaze pushes unasked do not. That distinction is the whole fix: those
+        # frames reset the SOCKET timeout every time they land, so on a board
+        # chattering faster than default_recv_timeout the WebSocketTimeoutException
+        # below never fires. When the deadline lived only in that handler, it was
+        # therefore never evaluated at all, and this loop ran forever. A long
+        # multi-frame transfer is unaffected: every frame of it is progress.
+        lastProgress = self._time_in_millis()
         # loop until we have all the packets we want or we hit timeout.
         while True:
+            if (self._time_in_millis() - lastProgress) > (1000 * self.default_recv_timeout):
+                return None
             try:
                 frame = self.ws.recv()
                 if type(frame) is str:
@@ -769,14 +796,19 @@ class Pixelblaze:
 
                     # Check the flags to see if we need to read more packets.
                     frameFlags = frame[1]
-                    if message is None and not (
-                            frameFlags & self.frameTypes.frameFirst.value): raise  # The first frame must be a start frame
-                    if message is not None and (
-                            frameFlags & self.frameTypes.frameFirst.value): raise  # We shouldn't get a start frame after we've started
+                    if message is None and not (frameFlags & self.frameTypes.frameFirst.value):
+                        raise PixelblazeProtocolError(
+                            f"{self.ipAddress} sent a continuation frame (type {frameType}) "
+                            f"before any start frame")
+                    if message is not None and (frameFlags & self.frameTypes.frameFirst.value):
+                        raise PixelblazeProtocolError(
+                            f"{self.ipAddress} sent a second start frame (type {frameType}) "
+                            f"part way through a message")
                     if message is None:
                         message = frame[2:]  # Start with the first packet...
                     else:
                         message += frame[2:]  # ...and append the rest until we reach the end.
+                    lastProgress = self._time_in_millis()  # a frame of what we asked for
 
                     # If we've received all the packets, deal with the message.
                     if frameFlags & self.frameTypes.frameLast.value:
@@ -792,10 +824,11 @@ class Pixelblaze:
                             continue  # skip this unwanted binary frame (which shouldn't really happen anyway)
                         return message
 
-            except websocket._exceptions.WebSocketTimeoutException:  # timeout -- we can just ignore this
-                endTime = self._time_in_millis()
-                if (endTime - startTime) > (1000 * self.default_recv_timeout):
-                    return None
+            except websocket._exceptions.WebSocketTimeoutException:
+                # Nothing arrived inside the socket timeout. Whether that is fatal is
+                # the deadline's call, at the top of the loop, where it is reached
+                # however this iteration ended.
+                pass
 
             except websocket._exceptions.WebSocketConnectionClosedException:  # try reopening
                 # print("wsReceive reconnection")
@@ -855,7 +888,11 @@ class Pixelblaze:
             Union[str, bytes, None]: The message received from the Pixelblaze (of type bytes for binaryMessageTypes, otherwise of type str), or None if a timeout occurred.
         """
         self.connectionBroken = False
-        while True:
+        # Reconnect and try again, but a bounded number of times: this used to be a
+        # `while True` whose every exception handler ended in _open() and another lap,
+        # with the `raise` commented out, so a send that could never succeed retried
+        # in silence for as long as the caller was willing to wait.
+        for attempt in range(self.max_reconnect_attempts):
             try:
                 self._open()  # make sure it's open, even if it closed while we were doing other things.
                 self._connection_maint()
@@ -900,12 +937,19 @@ class Pixelblaze:
                     self.connectionBroken = True
                     self._close()
                     self._open()
+                else:
+                    raise  # not a broken pipe, so reopening it cannot help
 
-            except:
+            except Exception:
                 self.connectionBroken = True
                 self._close()
                 self._open()  # try reopening
-                # raise
+                if attempt == self.max_reconnect_attempts - 1:
+                    raise  # out of attempts: say so, rather than go quiet
+        else:
+            raise PixelblazeProtocolError(
+                f"{self.ipAddress} would not accept {next(iter(command), 'a command')} in "
+                f"{self.max_reconnect_attempts} attempts")
 
     def wsSendBinary(self, binaryMessageType: messageTypes, blob: bytes, *, expectedResponse: str = None):
         """Send a binary command to the Pixelblaze, and optionally wait for a suitable response.
@@ -2114,15 +2158,23 @@ class Pixelblaze:
 
         # First the config packet.
         settings = {}
-        while True:
+        for attempt in range(self.max_config_attempts):
             self.wsSendJson({"getConfig": True}, expectedResponse=None)
             response = self.wsReceive(binaryMessageType=None)
             if not response is None:
                 settings = json.loads(response)
                 break
+        else:
+            raise PixelblazeProtocolError(
+                f"{self.ipAddress} did not answer getConfig with a settings frame in "
+                f"{self.max_config_attempts} attempts")
 
-        # Now the others, in any order.
-        while True:
+        # Now the others, in any order. Most boards have no output expander and so
+        # never send an expanderConfig at all, which means the exit that actually
+        # fires is the receive expiring. The deadline is here because that exit is
+        # not the board's to give: it must end even if the board keeps answering.
+        deadline = self._time_in_millis() + (1000 * self.default_config_timeout)
+        while self._time_in_millis() < deadline:
             ignored = self.wsReceive(binaryMessageType=self.messageTypes.specialConfig)
             # If we've got both packets, exit the loop.
             if (not self.latestSequencer is None) and (not self.latestExpander is None): break
@@ -2139,19 +2191,24 @@ class Pixelblaze:
             dict: The sequencer configuration as a dictionary, with settingName as the key and settingValue as the value.
         """
         self.latestSequencer = None
-        while True:
-            if self.latestSequencer is None: ignored = self.getConfigSettings()
-            return json.loads(self.latestSequencer)
+        self.getConfigSettings()  # the sequencer frame arrives as part of that response
+        if self.latestSequencer is None:
+            raise PixelblazeProtocolError(
+                f"{self.ipAddress} answered getConfig without a sequencer frame")
+        return json.loads(self.latestSequencer)
 
-    def getConfigExpander(self) -> dict:
+    def getConfigExpander(self) -> Union[dict, None]:
         """Retrieves the OutputExpander configuration.
 
         Returns:
-            dict: The OutputExpander configuration as a dictionary, with settingName as the key and settingValue as the value.
+            Union[dict, None]: The OutputExpander configuration as a dictionary, with settingName as the key
+            and settingValue as the value; or None if this Pixelblaze has no output expander attached, which
+            is the case for most of them. (It used to re-request the configuration forever waiting for a
+            frame such a board never sends.)
         """
-        while True:
-            if not self.latestExpander is None: return self.latestExpander
-            ignored = self.getConfigSettings()
+        if self.latestExpander is None:
+            self.getConfigSettings()
+        return self.latestExpander
 
     def __decodeExpanderData(self, data: bytes) -> dict:
         """An internal function to convert the OutputExpander from its native binary format into a human-readable JSON representation.
