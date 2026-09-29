@@ -146,6 +146,72 @@ def test_getConfigSettings_returns_on_a_board_with_no_expander():
     assert value['pixelCount'] == 200, f"settings not parsed: {value!r}"
 
 
+class SlowTransferBoard(ChattyBoard):
+    """Sends a multi-frame binary message slowly, chattering between the frames.
+
+    Total transfer time is well past the give-up deadline, which is the point: the
+    deadline is about making no progress, not about taking a while. A board on the
+    far side of a WiFi AP sending a 500-pattern list looks exactly like this.
+    """
+
+    def __init__(self, chunks, gap=0.4, messageType=Pixelblaze.messageTypes.getProgramList):
+        super().__init__(statsInterval=0.05)
+        self.gap = gap
+        self.messageType = messageType
+        self.chunks = list(chunks)
+        self.chunksSent = 0
+
+    def recv(self):
+        if not self.chunks:
+            return super().recv()  # nothing left to send; back to chattering
+        # A stats frame between every chunk, as hardware does.
+        if self.chunksSent and self.chunksSent % 2:
+            time.sleep(self.statsInterval)
+            self.chunksSent += 1
+            self.statsSent += 1
+            return self.STATS
+        time.sleep(self.gap)
+        chunk = self.chunks.pop(0)
+        flags = Pixelblaze.frameTypes.frameFirst.value if self.chunksSent == 0 else 0
+        if not self.chunks:
+            flags |= Pixelblaze.frameTypes.frameLast.value
+        self.chunksSent += 1
+        return bytes([int(self.messageType), flags]) + chunk
+
+
+def test_a_slow_multi_frame_transfer_still_completes():
+    """Progress resets the clock, so a transfer longer than the deadline survives."""
+    chunks = [b'{"aaa":"one"', b',"bbb":"two"', b',"ccc":"three"', b'}']
+    board = SlowTransferBoard(chunks, gap=0.4)
+    pb = connectedTo(board)
+
+    started = time.monotonic()
+    returned, value, error = runBounded(
+        lambda: pb.wsReceive(binaryMessageType=Pixelblaze.messageTypes.getProgramList))
+    elapsed = time.monotonic() - started
+
+    assert returned, f"a slow transfer was abandoned after {elapsed:.1f}s"
+    assert error is None, f"wsReceive raised {error!r}"
+    assert value == b''.join(chunks), f"message not reassembled: {value!r}"
+    assert elapsed > 1.0, (
+        f"transfer finished in {elapsed:.1f}s, too fast to prove anything -- it must "
+        f"outlast the {Pixelblaze.default_recv_timeout}s deadline for this to be a test")
+
+
+def test_getConfigExpander_says_no_instead_of_asking_forever():
+    """No expander attached is an answer, not a reason to re-request config forever."""
+    board = ChattyBoard()
+    pb = connectedTo(board)
+
+    returned, value, error = runBounded(lambda: pb.getConfigExpander())
+
+    assert returned, (
+        f"getConfigExpander never returned after {GRACE_SECONDS}s "
+        f"({board.statsSent} stats frames read).")
+    assert error is None, f"getConfigExpander raised {error!r}"
+    assert value is None, f"expected None for a board with no expander, got {value!r}"
+
+
 def test_getConfigSequencer_returns_on_a_board_with_no_expander():
     """`pb reload` and `pb p` both land here, via the post-command cache refresh."""
     board = ChattyBoard()
