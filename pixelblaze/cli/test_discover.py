@@ -656,3 +656,78 @@ def test_find_defaults_to_no_websocket_and_still_finds_everything(tmp_path):
     assert '--peers' in help_text
     assert 'off by default' in help_text
     print("✓ default find opens no websocket and still finds a board")
+
+
+# ── the sweep's width is a file-descriptor question ──────────────────────────
+
+def test_sweep_never_asks_for_more_file_descriptors_than_it_has(monkeypatch):
+    """`pb find` died with `[Errno 24] Too many open files` on a plain Mac.
+
+    The sweep holds one socket per probed port for the length of a connect
+    timeout, so at a fixed 128 workers it wants 256 at once -- and macOS hands
+    every launchd-started shell (iTerm, Terminal) a soft limit of exactly 256
+    (`launchctl limit maxfiles`). It failed *after* printing the devices it had
+    already found, so it read as a bug in discovery rather than a per-shell
+    limit. Reproduced byte-for-byte with `ulimit -n 256`.
+
+    Nothing here touches this process's real limits: lowering a hard limit is
+    irreversible and would follow the rest of the suite around.
+    """
+    import resource
+
+    # The shape of the original bug, so the numbers above stay honest: the
+    # fixed width wants the entire 256 for itself, leaving none for stdio, the
+    # beacon sockets or the discovery pool -- which is why it died rather than
+    # merely came close.
+    assert cli_utils.SWEEP_WORKERS * cli_utils._SWEEP_FDS_PER_WORKER >= 256, \
+        "if the fixed width now fits well inside 256 fds, this test has lost its point"
+
+    refused = []
+
+    def refuse(_resource, limits):
+        refused.append(limits)
+        raise OSError('refused')
+
+    # A limit that cannot be raised at all: the sweep has to narrow to fit it.
+    for hard in (192, 256, 512):
+        monkeypatch.setattr(resource, 'getrlimit', lambda _r, h=hard: (h, h))
+        monkeypatch.setattr(resource, 'setrlimit', refuse)
+        width = cli_utils.sweep_width()
+        assert width >= 8, f"hard={hard} narrowed the sweep to {width}, too thin to be useful"
+        assert width <= cli_utils.SWEEP_WORKERS, f"hard={hard} widened past the ceiling"
+        assert width * cli_utils._SWEEP_FDS_PER_WORKER <= hard - cli_utils._FD_HEADROOM, \
+            f"hard={hard} -> width {width} still wants more fds than the process may open"
+    assert not refused, \
+        "hard == soft leaves nothing to raise; sweep_width should not have tried"
+
+    # A sandbox that reports room to grow and then refuses: the ladder runs
+    # out, and the sweep must narrow to the limit it actually kept rather
+    # than trust the headroom it was promised.
+    refused.clear()
+    monkeypatch.setattr(resource, 'getrlimit', lambda _r: (256, 4096))
+    monkeypatch.setattr(resource, 'setrlimit', refuse)
+    assert cli_utils.raise_fd_limit() == 256, "a refused raise must report the old limit"
+    assert len(refused) == 3, f"expected the full descending ladder, got {refused}"
+    assert cli_utils.sweep_width() * cli_utils._SWEEP_FDS_PER_WORKER <= 256 - cli_utils._FD_HEADROOM
+    print("✓ an unraisable fd limit narrows the sweep instead of killing the command")
+
+
+def test_a_low_soft_limit_is_raised_so_the_sweep_stays_full_width(monkeypatch):
+    """The soft limit is ours to raise, and the macOS default is only soft.
+
+    So the common case costs nothing: 256 soft with an unlimited hard limit
+    becomes a real budget and the sweep keeps its full width, rather than
+    running eight-at-a-time across a /24.
+    """
+    import resource
+
+    applied = []
+    monkeypatch.setattr(resource, 'getrlimit',
+                        lambda _r: (256, resource.RLIM_INFINITY))
+    monkeypatch.setattr(resource, 'setrlimit',
+                        lambda _r, limits: applied.append(limits))
+
+    assert cli_utils.raise_fd_limit() == cli_utils._FD_TARGET
+    assert applied and applied[0][0] == cli_utils._FD_TARGET, applied
+    assert cli_utils.sweep_width() == cli_utils.SWEEP_WORKERS
+    print("✓ a soft-only limit is raised and the sweep keeps full width")
