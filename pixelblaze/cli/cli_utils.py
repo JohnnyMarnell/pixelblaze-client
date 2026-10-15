@@ -77,7 +77,62 @@ def get_host_ip() -> str:
 
 
 SWEEP_MAX_HOSTS = 256        # a /24. Anything wider is not worth scanning blind.
-SWEEP_WORKERS = 128
+SWEEP_WORKERS = 128          # ceiling only; the real width is `sweep_width()`.
+_SWEEP_FDS_PER_WORKER = 2    # one socket per probed port, all held at once.
+_FD_HEADROOM = 96            # stdio, beacon sockets, the discovery pool, imports.
+_FD_TARGET = 4096            # plenty for any sweep; well under kern.maxfilesperproc.
+
+
+def raise_fd_limit(target: int = _FD_TARGET) -> int:
+    """Raise this process's open-file soft limit toward `target`.
+
+    macOS hands a launchd-started shell -- which is every shell in iTerm or
+    Terminal -- a soft limit of **256** (`launchctl limit maxfiles`) with an
+    effectively unlimited hard one. A 128-wide sweep holds 256 sockets by
+    itself, so `pb find` died with a bare `[Errno 24] Too many open files`
+    *after* printing the devices it had already found, which reads as a bug in
+    discovery rather than as a per-shell limit. The soft limit is ours to
+    raise; the hard limit is not, and on macOS the kernel caps any process at
+    `kern.maxfilesperproc` (10240) however high RLIMIT_NOFILE goes.
+
+    Returns the soft limit in force afterwards, so a caller can size itself to
+    what it actually got. Never raises: a platform that refuses keeps the limit
+    it had and the sweep narrows to fit.
+    """
+    try:
+        import resource
+    except ImportError:          # not POSIX (Windows)
+        return target
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY:
+        return target
+    if soft >= target:
+        return soft
+    ceiling = target if hard == resource.RLIM_INFINITY else min(target, hard)
+    # Descending ladder: a sandbox can refuse the ceiling but allow less, and
+    # any raise at all is worth having.
+    for candidate in (ceiling, 1024, 512):
+        if candidate <= soft:
+            break
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (candidate, hard))
+            return candidate
+        except (ValueError, OSError):
+            continue
+    return soft
+
+
+def sweep_width() -> int:
+    """How many hosts to probe at once, given the fds we are actually allowed.
+
+    Each worker holds one socket per port for the length of a connect timeout,
+    so the sweep's own ceiling is (fd budget) / ports-per-host. Computed at run
+    time, not hardcoded, because the budget is a property of the shell that
+    launched us -- see `raise_fd_limit`. Narrowing makes the sweep slower; it
+    does not make it miss anything.
+    """
+    budget = raise_fd_limit() - _FD_HEADROOM
+    return max(8, min(SWEEP_WORKERS, budget // _SWEEP_FDS_PER_WORKER))
 
 
 def sweepable_subnets() -> "list[tuple[str, list[str]]]":
@@ -827,10 +882,12 @@ def _discover_devices(
 
     def sweep_subnet(label: str, hosts: "list[str]"):
         # Its own pool: 254 connects at the discovery pool's 16 workers would
-        # outlast the beacon listen and make `find` feel slow. At this width
-        # the whole /24 lands well inside the listen window.
+        # outlast the beacon listen and make `find` feel slow. At full width
+        # the whole /24 lands well inside the listen window -- but the width is
+        # capped by the fd budget, because two sockets per worker is what
+        # exhausted macOS's default 256 and killed the whole command.
         targets = [ip for ip in hosts if ip not in self_ips]
-        with ThreadPoolExecutor(max_workers=SWEEP_WORKERS,
+        with ThreadPoolExecutor(max_workers=sweep_width(),
                                 thread_name_prefix='pb-sweep') as sweeper:
             for ip, ports in zip(targets, sweeper.map(_tcp_ports_open, targets)):
                 if ports[HTTP_PORT] or ports[WS_PORT]:
@@ -895,6 +952,12 @@ def _discover_devices(
     for future in pending:
         exc = future.exception()
         if exc is not None:
+            if isinstance(exc, OSError) and exc.errno == errno.EMFILE:
+                raise click.ClickException(
+                    f"{exc} -- ran out of file descriptors mid-discovery. The sweep "
+                    f"sizes itself to this process's limit (now {raise_fd_limit()}), so "
+                    f"this should not happen; raise it with `ulimit -n 4096` and please "
+                    f"report it.")
             raise click.ClickException(str(exc))
 
     return list(found.values())
