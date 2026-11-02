@@ -297,7 +297,8 @@ def _run_discovery(cache, ports, script, probe=True, self_ip='192.168.1.67', pee
     with patched(cli_utils,
                  _read_cache=lambda: cache,
                  get_host_ip=lambda: self_ip,
-                 sweepable_subnets=lambda: subnets or [],
+                 # `extra` is additive, so the stand-in takes whatever it is handed
+                 sweepable_subnets=lambda *a, **k: subnets or [],
                  _tcp_ports_open=lambda ip, ports_=(80, 81), timeout=1.0: ports.get(ip, {80: False, 81: False}),
                  Pixelblaze=type('PBShim', (), {
                      'EnumerateAddresses': PB.EnumerateAddresses,

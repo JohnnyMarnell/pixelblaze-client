@@ -135,18 +135,116 @@ def sweep_width() -> int:
     return max(8, min(SWEEP_WORKERS, budget // _SWEEP_FDS_PER_WORKER))
 
 
-def sweepable_subnets() -> "list[tuple[str, list[str]]]":
-    """Local /24-or-smaller subnets, as (label, hosts-to-probe) pairs.
+def _private_24(spec: str) -> "Optional[str]":
+    """The `a.b.c` prefix of a private /24 named by `spec`, or None.
+
+    Accepts `192.168.1.0/24`, `192.168.1.0`, `192.168.1.9` (any host on it) and
+    `192.168.1`. Anything wider than a /24 is refused, and so is anything
+    outside RFC1918 — a sweep is 254 TCP connects, and pointing that at a
+    public range (or a carrier's) is the accident this whole function is
+    bounded to avoid.
+    """
+    text = str(spec or '').strip()
+    if not text:
+        return None
+    if '/' in text:
+        net, _, bits = text.partition('/')
+        try:
+            if int(bits) < 24:
+                return None              # wider than a /24
+        except ValueError:
+            return None
+        text = net
+    parts = text.split('.')
+    if len(parts) == 3:
+        parts.append('0')
+    if len(parts) != 4:
+        return None
+    try:
+        octets = [int(p) for p in parts]
+    except ValueError:
+        return None
+    if any(o < 0 or o > 255 for o in octets):
+        return None
+    a, b = octets[0], octets[1]
+    private = (a == 10) or (a == 192 and b == 168) or (a == 172 and 16 <= b <= 31)
+    if not private:
+        return None
+    return '.'.join(str(o) for o in octets[:3])
+
+
+def routable_sweep_prefixes(extra=(), use_cache: bool = False) -> "list[str]":
+    """Private /24s worth sweeping that this machine has no address on.
+
+    The local sweep below finds a board on a subnet we are *on*. It cannot find
+    one that is merely **reachable** — a board on the laptop's LAN while we sit
+    behind that laptop's NAT, say, which is the ordinary shape of a rig plugged
+    into someone's machine for the evening. There is no way to derive such a
+    range from the routing table (the default route names one gateway, not the
+    networks behind it), so it comes from two places instead:
+
+      * `extra` — named outright by whoever knows: a flag, or the rig's config.
+      * with `use_cache`, the /24 around any address a board has *actually been
+        seen at*. That is evidence rather than guesswork, and it keeps working
+        when a board's lease moves it within the same subnet, which is the
+        common way a cached address goes stale.
+
+    `use_cache` is off by default, and deliberately: reading the cache makes
+    the answer depend on global on-disk state, which is a surprising thing for
+    a caller asking a question about network geometry. `_discover_devices` turns
+    it on, because the cache is already one of its inputs — it probes every
+    cached address regardless of subnet.
+
+    Deliberately NOT guessed from a list of likely ranges: a blind sweep of
+    somebody else's network is the thing to avoid, and "192.168.0.0/16 is
+    usually just home wifi" is exactly how you end up doing it.
+    """
+    out: list[str] = []
+    local = set()
+    for address, _ in localIPv4Interfaces():
+        prefix = _private_24(address)
+        if prefix:
+            local.add(prefix)
+
+    for spec in list(extra or ()):
+        prefix = _private_24(spec)
+        if prefix and prefix not in local and prefix not in out:
+            out.append(prefix)
+
+    if use_cache:
+        for address in cached_addresses():
+            prefix = _private_24(address)
+            if prefix and prefix not in local and prefix not in out:
+                out.append(prefix)
+
+    return out
+
+
+def sweepable_subnets(extra=()) -> "list[tuple[str, list[str]]]":
+    """/24-or-smaller subnets to probe, as (label, hosts-to-probe) pairs.
 
     Discovery is otherwise blind to a device that never beacons and was never
     cached — which is exactly a sync-group follower whose leader is off. Its
-    web UI works fine and `pb find` cannot see it. A connect sweep of our own
-    subnet is the only source that needs no prior knowledge of the device.
+    web UI works fine and `pb find` cannot see it. A connect sweep of a subnet
+    is the only source that needs no prior knowledge of the device.
+
+    Every local subnet, plus any routable-but-not-local /24 named in `extra`
+    (see `routable_sweep_prefixes` for what counts as one). Called with no
+    `extra` this is exactly the local sweep and reads nothing but the interface
+    list — no cache, no disk.
 
     Bounded at a /24 on purpose: a blind scan of a /16 is 65k connects and a
     thing you do to a corporate network by accident, not a discovery strategy.
     """
     out = []
+    seen = set()
+
+    def add(prefix: str):
+        if prefix in seen:
+            return
+        seen.add(prefix)
+        out.append((f'{prefix}.0/24', [f'{prefix}.{n}' for n in range(1, 255)]))
+
     for address, broadcast in localIPv4Interfaces():
         try:
             octets = [int(o) for o in address.split('.')]
@@ -159,9 +257,11 @@ def sweepable_subnets() -> "list[tuple[str, list[str]]]":
             size *= (b - a) + 1 if b >= a else 1
         if size <= 1 or size > SWEEP_MAX_HOSTS:
             continue
-        prefix = '.'.join(str(o) for o in octets[:3])
-        hosts = [f'{prefix}.{n}' for n in range(1, 255)]
-        out.append((f'{prefix}.0/24', hosts))
+        add('.'.join(str(o) for o in octets[:3]))
+
+    for prefix in routable_sweep_prefixes(extra):
+        add(prefix)
+
     return out
 
 
@@ -768,6 +868,7 @@ def _discover_devices(
     probe: bool = True,
     sweep: bool = True,
     peers: bool = False,
+    sweep_extra=(),
 ) -> list[dict]:
     """
     Find every Pixelblaze on the network, using every source at once.
@@ -786,10 +887,12 @@ def _discover_devices(
       * Sync-group peers — each device found, from any source, is asked for
         its peer list; new addresses are probed the same way.
       * Subnet sweep — with `sweep`, a TCP connect to every host on each
-        local /24. The only source that needs no prior knowledge of a
-        device, and the only one that finds a *follower that was never
-        cached*: followers never beacon, so with their leader off they are
-        invisible to every other source while their web UI works fine.
+        local /24, plus any routable-but-not-local /24 named in `sweep_extra`
+        or implied by a cached address (`routable_sweep_prefixes`). The only
+        source that needs no prior knowledge of a device, and the only one
+        that finds a *follower that was never cached*: followers never beacon,
+        so with their leader off they are invisible to every other source
+        while their web UI works fine.
 
     Args:
         timeout: Beacon listen timeout in milliseconds.
@@ -800,6 +903,10 @@ def _discover_devices(
         probe: Broadcast a beacon to solicit timeSync replies. Default on.
         sweep: TCP-sweep each local /24. Default on; costs nothing in
             wall-clock because it runs inside the beacon listen.
+        sweep_extra: Extra private /24s to sweep that this machine has no
+            address on — a board reachable through a NAT, say. Accepts
+            `192.168.1.0/24`, `192.168.1` or any host on it. Anything public
+            or wider than a /24 is ignored.
         peers: Ask each device found for its sync-group peer list. This is
             the only part of discovery that opens a **websocket**, and the
             firmware has few connection slots and leaks them when a session
@@ -925,7 +1032,10 @@ def _discover_devices(
         if cached_ip not in candidates and cached_ip not in self_ips:
             candidates.append(cached_ip)
 
-    subnets = sweepable_subnets() if sweep else []
+    # The cache is already an input here — every cached address gets probed
+    # below, whatever subnet it is on — so the /24 around one is folded in too.
+    sweep_ranges = routable_sweep_prefixes(sweep_extra, use_cache=True) if sweep else []
+    subnets = sweepable_subnets(sweep_ranges) if sweep else []
     swept = f", sweeping {', '.join(label for label, _ in subnets)}" if subnets else ""
     log(f"Listening for beacons ({timeout}ms){' + probing' if probe else ''}, "
         f"checking {len(candidates)} known address(es){swept}...")
@@ -1023,13 +1133,14 @@ def enumerate_pixelblazes(
     probe: bool = True,
     sweep: bool = True,
     peers: bool = False,
+    sweep_extra=(),
 ) -> list[dict]:
     """
     Discover all Pixelblazes on the network.
 
     Beacons, a probe broadcast, the ad-hoc address, every cached address, a
-    sweep of each local /24 and sync-group peer lists are all tried in
-    parallel — see `_discover_devices`.
+    sweep of each local /24 (plus any routable range given or cached) and
+    sync-group peer lists are all tried in parallel — see `_discover_devices`.
     In fast mode (default), returns minimal dicts: the IP, how it was found,
     and which ports answered. In slow mode, also connects to each device in
     parallel to fetch name, config, version, etc.
@@ -1050,7 +1161,7 @@ def enumerate_pixelblazes(
                     pixelCount, brightness, ver, brandName, hostIp.
     """
     found = _discover_devices(timeout=timeout, on_ip=on_ip, probe=probe, sweep=sweep,
-                              peers=peers)
+                              peers=peers, sweep_extra=sweep_extra)
     _explain_silent_beacons(found)
 
     if not found:
