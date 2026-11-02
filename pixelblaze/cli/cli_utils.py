@@ -182,7 +182,12 @@ _UPSTREAM_PROBE_DEST = '8.8.8.8'
 _IP_RECVERR = 11                 # Linux: deliver ICMP errors on the error queue
 _SO_EE_OFFENDER = 16             # sizeof(struct sock_extended_err), then a sockaddr
 # Topology does not move while a sweep timer ticks, and each probe costs a
-# round trip, so the answer is kept for the life of the process.
+# round trip, so a useful answer is kept for the life of the process. An EMPTY
+# answer is never cached: at boot the tap can easily probe before the default
+# route exists (the rig starts its own network, and the laptop it is plugged
+# into may not be sharing yet), and caching that would leave discovery blind to
+# the upstream range until the process restarted — which on the rig means until
+# the next reboot.
 _upstream_cache: "Optional[list[str]]" = None
 
 
@@ -262,7 +267,7 @@ def upstream_private_prefixes(max_hops: int = UPSTREAM_MAX_HOPS,
         if prefix not in out:
             out.append(prefix)
 
-    if probe is _next_hop:
+    if probe is _next_hop and out:
         _upstream_cache = list(out)
     return out
 

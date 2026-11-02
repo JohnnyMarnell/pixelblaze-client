@@ -298,3 +298,41 @@ def test_routable_prefixes_folds_upstream_in_behind_its_own_flag(fake_net, monke
 def test_a_hop_that_is_not_an_address_is_ignored():
     assert cli_utils.upstream_private_prefixes(probe=hops('', '192.168.1.1')) \
         == ['192.168.1']
+
+
+def test_a_failed_probe_is_not_cached(monkeypatch):
+    """A reboot is exactly when this matters.
+
+    At boot the tap can probe before the default route exists — the rig brings
+    up its own network, and the laptop it is plugged into may not be sharing
+    yet. Caching that empty answer would leave discovery blind to the upstream
+    range for the life of the process, which on the rig means until the next
+    reboot.
+    """
+    monkeypatch.setattr(cli_utils, '_upstream_cache', None)
+    calls = []
+
+    def flaky(ttl):
+        calls.append(ttl)
+        # Nothing answers until the third attempt at the whole walk.
+        return '192.168.1.1' if len(calls) > 4 else None
+
+    monkeypatch.setattr(cli_utils, '_next_hop', flaky)
+
+    assert cli_utils.upstream_private_prefixes(max_hops=2) == []
+    assert cli_utils._upstream_cache is None, 'an empty answer must not stick'
+    assert cli_utils.upstream_private_prefixes(max_hops=2) == []
+    got = cli_utils.upstream_private_prefixes(max_hops=2)
+    assert got == ['192.168.1'], 'it must keep trying until the network is up'
+    assert cli_utils._upstream_cache == ['192.168.1'], 'a useful answer is kept'
+
+
+def test_a_useful_answer_is_probed_only_once(monkeypatch):
+    monkeypatch.setattr(cli_utils, '_upstream_cache', None)
+    calls = []
+    monkeypatch.setattr(cli_utils, '_next_hop',
+                        lambda ttl: calls.append(ttl) or '192.168.1.1')
+    assert cli_utils.upstream_private_prefixes(max_hops=1) == ['192.168.1']
+    before = len(calls)
+    assert cli_utils.upstream_private_prefixes(max_hops=1) == ['192.168.1']
+    assert len(calls) == before, 'the second call must not probe again'
