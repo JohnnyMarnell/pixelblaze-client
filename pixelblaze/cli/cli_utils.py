@@ -173,7 +173,102 @@ def _private_24(spec: str) -> "Optional[str]":
     return '.'.join(str(o) for o in octets[:3])
 
 
-def routable_sweep_prefixes(extra=(), use_cache: bool = False) -> "list[str]":
+# How far up our own path to look for a private network, and how long to wait
+# for each hop. Two is enough for the ordinary case (the machine we are plugged
+# into, then its router); the walk stops at the first public hop anyway.
+UPSTREAM_MAX_HOPS = 3
+UPSTREAM_HOP_TIMEOUT = 0.6
+_UPSTREAM_PROBE_DEST = '8.8.8.8'
+_IP_RECVERR = 11                 # Linux: deliver ICMP errors on the error queue
+_SO_EE_OFFENDER = 16             # sizeof(struct sock_extended_err), then a sockaddr
+# Topology does not move while a sweep timer ticks, and each probe costs a
+# round trip, so the answer is kept for the life of the process.
+_upstream_cache: "Optional[list[str]]" = None
+
+
+def _next_hop(ttl: int, dest: str = _UPSTREAM_PROBE_DEST,
+              timeout: float = UPSTREAM_HOP_TIMEOUT) -> "Optional[str]":
+    """The router `ttl` hops away, or None.
+
+    The same trick `traceroute` uses without root: a UDP datagram with a short
+    TTL draws an ICMP time-exceeded, and Linux's `IP_RECVERR` puts that on the
+    socket's error queue where an unprivileged process can read it. No raw
+    socket, no capability, nothing to install.
+
+    Returns None anywhere this does not work — notably macOS and Windows, which
+    have no `IP_RECVERR`. That is a silent no-op by design: the caller loses an
+    extra range, not its discovery.
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError:
+        return None
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
+        sock.setsockopt(socket.IPPROTO_IP, _IP_RECVERR, 1)
+        sock.settimeout(timeout)
+        # Port 33434+ is traceroute's own range: unlikely to be listening, so
+        # the far end answers "port unreachable" rather than accepting data.
+        sock.sendto(b'\x00' * 12, (dest, 33434 + ttl))
+        try:
+            sock.recv(1024)
+        except OSError:
+            pass
+        try:
+            _, ancillary, _, _ = sock.recvmsg(1024, 1024, socket.MSG_ERRQUEUE)
+        except OSError:
+            return None
+        for level, kind, data in ancillary:
+            if level != socket.IPPROTO_IP or kind != _IP_RECVERR:
+                continue
+            offender = data[_SO_EE_OFFENDER:]
+            if len(offender) >= 8:
+                return socket.inet_ntoa(offender[4:8])
+    except (OSError, AttributeError):
+        return None
+    finally:
+        sock.close()
+    return None
+
+
+def upstream_private_prefixes(max_hops: int = UPSTREAM_MAX_HOPS,
+                              probe=None) -> "list[str]":
+    """Private /24s on our own route out, nearest first.
+
+    The routing table names one gateway, not the networks behind it — but the
+    path itself will say, if asked. A rig plugged into a laptop that shares its
+    internet sees the laptop as hop 1 and the laptop's own router as hop 2, and
+    that second hop *is* the LAN the boards are on.
+
+    Evidence, not guesswork: every prefix here is a network this machine
+    demonstrably routes through. The walk stops at the first public hop, so it
+    never wanders past the edge of the private network it is standing in, and
+    each hop contributes at most its own /24.
+    """
+    global _upstream_cache
+    if probe is None:
+        if _upstream_cache is not None:
+            return list(_upstream_cache)
+        probe = _next_hop
+
+    out: list[str] = []
+    for ttl in range(1, max(1, max_hops) + 1):
+        hop = probe(ttl)
+        if not hop:
+            continue                 # a hop that will not answer is not the end
+        prefix = _private_24(hop)
+        if prefix is None:
+            break                    # left the private network; go no further
+        if prefix not in out:
+            out.append(prefix)
+
+    if probe is _next_hop:
+        _upstream_cache = list(out)
+    return out
+
+
+def routable_sweep_prefixes(extra=(), use_cache: bool = False,
+                            use_upstream: bool = False) -> "list[str]":
     """Private /24s worth sweeping that this machine has no address on.
 
     The local sweep below finds a board on a subnet we are *on*. It cannot find
@@ -184,6 +279,9 @@ def routable_sweep_prefixes(extra=(), use_cache: bool = False) -> "list[str]":
     networks behind it), so it comes from two places instead:
 
       * `extra` — named outright by whoever knows: a flag, or the rig's config.
+      * with `use_upstream`, the private /24 of each hop on our own route out
+        (`upstream_private_prefixes`) — which is what makes the laptop-sharing
+        case need no configuration at all.
       * with `use_cache`, the /24 around any address a board has *actually been
         seen at*. That is evidence rather than guesswork, and it keeps working
         when a board's lease moves it within the same subnet, which is the
@@ -215,6 +313,11 @@ def routable_sweep_prefixes(extra=(), use_cache: bool = False) -> "list[str]":
         for address in cached_addresses():
             prefix = _private_24(address)
             if prefix and prefix not in local and prefix not in out:
+                out.append(prefix)
+
+    if use_upstream:
+        for prefix in upstream_private_prefixes():
+            if prefix not in local and prefix not in out:
                 out.append(prefix)
 
     return out
@@ -1034,7 +1137,8 @@ def _discover_devices(
 
     # The cache is already an input here — every cached address gets probed
     # below, whatever subnet it is on — so the /24 around one is folded in too.
-    sweep_ranges = routable_sweep_prefixes(sweep_extra, use_cache=True) if sweep else []
+    sweep_ranges = (routable_sweep_prefixes(sweep_extra, use_cache=True, use_upstream=True)
+                    if sweep else [])
     subnets = sweepable_subnets(sweep_ranges) if sweep else []
     swept = f", sweeping {', '.join(label for label, _ in subnets)}" if subnets else ""
     log(f"Listening for beacons ({timeout}ms){' + probing' if probe else ''}, "

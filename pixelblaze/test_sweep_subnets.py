@@ -226,3 +226,75 @@ def test_discovery_with_sweep_off_asks_for_no_ranges(fake_net, monkeypatch):
 
     cli_utils._discover_devices(timeout=1, probe=False, sweep=False)
     assert called == [], 'sweep=False must not even compute a range'
+
+
+# ── deriving the range from our own route out, with no configuration ─────
+
+def hops(*addresses):
+    """A fake TTL probe: hop N is addresses[N-1], None past the end."""
+    def probe(ttl):
+        return addresses[ttl - 1] if 1 <= ttl <= len(addresses) else None
+    return probe
+
+
+def test_the_laptop_sharing_case_needs_no_configuration():
+    """hop 1 is the laptop we are plugged into, hop 2 is its router — and that
+    second hop IS the LAN the boards are on. Measured on the rig:
+    192.168.2.1, then 192.168.1.1, then a public address.
+    """
+    got = cli_utils.upstream_private_prefixes(
+        probe=hops('192.168.2.1', '192.168.1.1', '24.193.216.1'))
+    assert got == ['192.168.2', '192.168.1']
+
+
+def test_the_walk_stops_at_the_first_public_hop():
+    """Past the edge of the private network there is nothing for us, and
+    probing onward is just poking at the internet."""
+    got = cli_utils.upstream_private_prefixes(
+        probe=hops('192.168.2.1', '24.193.216.1', '192.168.50.1'))
+    assert got == ['192.168.2'], 'a private hop beyond a public one is not ours'
+
+
+def test_a_silent_hop_does_not_end_the_walk():
+    """Plenty of routers drop the probe rather than answering it. That is not
+    the edge of the private network, so keep going."""
+    got = cli_utils.upstream_private_prefixes(
+        probe=hops('192.168.2.1', None, '10.9.9.1'))
+    assert got == ['192.168.2', '10.9.9']
+
+
+def test_no_hops_answer_at_all():
+    assert cli_utils.upstream_private_prefixes(probe=hops()) == []
+
+
+def test_each_hop_contributes_its_24_once():
+    got = cli_utils.upstream_private_prefixes(
+        probe=hops('192.168.2.1', '192.168.2.254', '192.168.1.1'))
+    assert got == ['192.168.2', '192.168.1']
+
+
+def test_upstream_is_bounded_by_max_hops():
+    probe_calls = []
+
+    def counting(ttl):
+        probe_calls.append(ttl)
+        return '192.168.%d.1' % ttl
+
+    cli_utils.upstream_private_prefixes(max_hops=2, probe=counting)
+    assert probe_calls == [1, 2], 'it must not walk further than asked'
+
+
+def test_routable_prefixes_folds_upstream_in_behind_its_own_flag(fake_net, monkeypatch):
+    """Off unless asked, like the cache — and never duplicating a local subnet."""
+    fake_net['ifaces'] = [('192.168.2.4', '192.168.2.255')]
+    monkeypatch.setattr(cli_utils, 'upstream_private_prefixes',
+                        lambda *a, **k: ['192.168.2', '192.168.1'])
+
+    assert cli_utils.routable_sweep_prefixes() == [], 'no probing unless asked'
+    got = cli_utils.routable_sweep_prefixes(use_upstream=True)
+    assert got == ['192.168.1'], '192.168.2 is ours already'
+
+
+def test_a_hop_that_is_not_an_address_is_ignored():
+    assert cli_utils.upstream_private_prefixes(probe=hops('', '192.168.1.1')) \
+        == ['192.168.1']
