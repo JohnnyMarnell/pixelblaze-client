@@ -314,8 +314,11 @@ def test_a_failed_probe_is_not_cached(monkeypatch):
 
     def flaky(ttl):
         calls.append(ttl)
-        # Nothing answers until the third attempt at the whole walk.
-        return '192.168.1.1' if len(calls) > 4 else None
+        # Nothing answers until the third attempt at the whole walk; after that
+        # hop 1 is private and hop 2 is public, so the walk completes.
+        if len(calls) <= 4:
+            return None
+        return '192.168.1.1' if ttl == 1 else '8.8.8.8'
 
     monkeypatch.setattr(cli_utils, '_next_hop', flaky)
 
@@ -324,15 +327,68 @@ def test_a_failed_probe_is_not_cached(monkeypatch):
     assert cli_utils.upstream_private_prefixes(max_hops=2) == []
     got = cli_utils.upstream_private_prefixes(max_hops=2)
     assert got == ['192.168.1'], 'it must keep trying until the network is up'
-    assert cli_utils._upstream_cache == ['192.168.1'], 'a useful answer is kept'
+    assert cli_utils._upstream_cache == ['192.168.1'], 'a complete walk is kept'
 
 
-def test_a_useful_answer_is_probed_only_once(monkeypatch):
+def test_a_complete_answer_is_probed_only_once(monkeypatch):
+    """Complete means the walk reached the public internet — see the cache rule."""
     monkeypatch.setattr(cli_utils, '_upstream_cache', None)
     calls = []
-    monkeypatch.setattr(cli_utils, '_next_hop',
-                        lambda ttl: calls.append(ttl) or '192.168.1.1')
-    assert cli_utils.upstream_private_prefixes(max_hops=1) == ['192.168.1']
+
+    def probe(ttl):
+        calls.append(ttl)
+        return '192.168.1.1' if ttl == 1 else '8.8.8.8'
+
+    monkeypatch.setattr(cli_utils, '_next_hop', probe)
+    assert cli_utils.upstream_private_prefixes(max_hops=2) == ['192.168.1']
     before = len(calls)
-    assert cli_utils.upstream_private_prefixes(max_hops=1) == ['192.168.1']
+    assert cli_utils.upstream_private_prefixes(max_hops=2) == ['192.168.1']
     assert len(calls) == before, 'the second call must not probe again'
+
+
+def test_an_incomplete_walk_is_not_cached(monkeypatch):
+    """The venue case, and the reason the first cache rule was wrong.
+
+    Hop 1 is the laptop we are plugged into and answers even when that laptop
+    has no route onward — so "we got a non-empty answer" is NOT evidence the
+    path was observed. Caching it would leave the rig blind to everything past
+    hop 1 for the life of the process: arrive at a venue, tap starts before the
+    laptop has joined the wifi, and the venue's own subnet is never found.
+    """
+    monkeypatch.setattr(cli_utils, '_upstream_cache', None)
+    stage = {'uplink': False}
+
+    def probe(ttl):
+        if ttl == 1:
+            return '192.168.2.1'          # the laptop: always there
+        if not stage['uplink']:
+            return None                   # no route onward yet
+        return '192.168.9.1' if ttl == 2 else '24.193.216.1'
+
+    monkeypatch.setattr(cli_utils, '_next_hop', probe)
+
+    # Before the uplink: hop 1 only, and nothing may be remembered.
+    assert cli_utils.upstream_private_prefixes() == ['192.168.2']
+    assert cli_utils._upstream_cache is None, \
+        'hop 1 alone is not a complete walk — it must be retried'
+
+    # Uplink arrives; the next sweep must actually look again.
+    stage['uplink'] = True
+    assert cli_utils.upstream_private_prefixes() == ['192.168.2', '192.168.9']
+    assert cli_utils._upstream_cache == ['192.168.2', '192.168.9'], \
+        'a walk that reached the public internet is worth keeping'
+
+
+def test_a_walk_that_reaches_a_public_hop_is_cached(monkeypatch):
+    monkeypatch.setattr(cli_utils, '_upstream_cache', None)
+    calls = []
+
+    def probe(ttl):
+        calls.append(ttl)
+        return {1: '192.168.2.1', 2: '8.8.8.8'}.get(ttl)
+
+    monkeypatch.setattr(cli_utils, '_next_hop', probe)
+    assert cli_utils.upstream_private_prefixes() == ['192.168.2']
+    before = len(calls)
+    assert cli_utils.upstream_private_prefixes() == ['192.168.2']
+    assert len(calls) == before, 'a complete walk is probed once'

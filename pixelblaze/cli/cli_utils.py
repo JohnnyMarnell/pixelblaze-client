@@ -257,17 +257,25 @@ def upstream_private_prefixes(max_hops: int = UPSTREAM_MAX_HOPS,
         probe = _next_hop
 
     out: list[str] = []
+    complete = False
     for ttl in range(1, max(1, max_hops) + 1):
         hop = probe(ttl)
         if not hop:
             continue                 # a hop that will not answer is not the end
         prefix = _private_24(hop)
         if prefix is None:
-            break                    # left the private network; go no further
+            complete = True          # reached the public internet: path fully seen
+            break
         if prefix not in out:
             out.append(prefix)
 
-    if probe is _next_hop and out:
+    # Only a COMPLETE walk is worth keeping. Hop 1 is the machine we are
+    # plugged into and answers even with no route beyond it, so "we got
+    # something" is not evidence the path was observed — and caching that is
+    # how a rig that probed before its uplink was ready would stay blind to
+    # everything past hop 1 for the life of the process. Seeing a public hop is
+    # the unambiguous signal that there was nothing private left to find.
+    if probe is _next_hop and complete:
         _upstream_cache = list(out)
     return out
 
